@@ -1,0 +1,178 @@
+use crate::scheduler;
+use crate::sysinfo;
+use crate::vfs::EntryType;
+use crate::vga::Writer;
+use core::cmp;
+
+#[cfg(debug_assertions)]
+fn dbg(msg: &str) {
+    let ticks = crate::scheduler::ticks();
+    for b in msg.bytes() {
+        crate::vga::serial_putchar(b);
+    }
+    for b in alloc::format!(" [{:?}]\n", ticks).bytes() {
+        crate::vga::serial_putchar(b);
+    }
+}
+
+/// Готовит адресное пространство .bin-программы и запускает её в ring 3:
+/// маппит код на `paging::USER_START`, выделяет user-стек и создаёт задачу.
+/// `rdi_val` передаётся в rdi при первом входе (vga_offset для foreground).
+/// Возвращает PID или None (нет свободного слота / кончилась память).
+pub fn launch_user(name: &str, data: &[u8], rdi_val: u64) -> Option<usize> {
+    if !crate::scheduler::slot_free() {
+        return None;
+    }
+    let mut space = crate::paging::create_address_space()?;
+    if crate::paging::map_user_image(&mut space, data).is_err()
+        || crate::paging::map_user_stack(&mut space).is_err()
+    {
+        crate::paging::destroy_address_space(&mut space);
+        return None;
+    }
+    crate::scheduler::spawn_user(
+        name,
+        space,
+        crate::paging::USER_START,
+        crate::paging::USER_STACK_TOP,
+        rdi_val,
+    )
+}
+
+/// Запускает .bin-программу в foreground (ring 3, собственное адресное
+/// пространство).
+///
+/// VFS_LOCK берётся только на время собственных операций ядра (чтение файла,
+/// подготовка shared memory для vita/help, сохранение vita). Сама программа
+/// исполняется БЕЗ лока: она может обращаться к VFS через ABI-функции
+/// (with_vfs), а лок нереентерабельный. Вызывается из шелла без удержания
+/// VFS_LOCK (шелль освобождает его перед запуском программы).
+pub fn run_program(writer: &mut Writer, args: &[&str], mem: sysinfo::MemInfo) -> bool {
+    if args.is_empty() {
+        return false;
+    }
+
+    let path = args[0];
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let binpath = if path.starts_with('/') {
+        alloc::string::String::from(path)
+    } else {
+        alloc::format!("/bin/{}", path)
+    };
+
+    let data = scheduler::with_vfs(|vfs| vfs.cat(&binpath).map(|d| d.to_vec()));
+    if let Some(data) = data {
+        let cpu = sysinfo::CpuInfo::detect();
+        sysinfo::SysInfo::write_to_memory(&cpu, mem);
+
+        if name == "vita" {
+            let filename = args.get(1).copied().unwrap_or("untitled");
+            let file_data: alloc::vec::Vec<u8> =
+                scheduler::with_vfs(|vfs| vfs.cat(filename).map(|d| d.to_vec()))
+                    .unwrap_or_default();
+            let len = cmp::min(file_data.len(), 4096);
+            unsafe {
+                core::ptr::write_volatile(0x6000 as *mut u32, 0u32);
+                core::ptr::write_volatile(0x6004 as *mut u32, len as u32);
+                core::ptr::write_volatile(0x6008 as *mut u32, 4096u32);
+                let fn_bytes = filename.as_bytes();
+                let fn_max = 128;
+                for i in 0..cmp::min(fn_bytes.len(), fn_max) {
+                    core::ptr::write_volatile((0x600C + i) as *mut u8, fn_bytes[i]);
+                }
+                if fn_bytes.len() < fn_max {
+                    core::ptr::write_volatile((0x600C + fn_bytes.len()) as *mut u8, 0u8);
+                }
+                core::ptr::copy_nonoverlapping(file_data.as_ptr(), 0x608C as *mut u8, len);
+            }
+        }
+
+        if name == "help" {
+            // Передаём в help список установленных программ через shared memory.
+            let mut names: alloc::vec::Vec<alloc::string::String> = scheduler::with_vfs(|vfs| {
+                let mut v: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+                if let Some(entries) = vfs.ls("/bin") {
+                    for (prog_name, entry_type, _) in entries {
+                        if entry_type == EntryType::File {
+                            v.push(prog_name);
+                        }
+                    }
+                }
+                v
+            });
+            names.sort();
+            let mut list: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+            for n in &names {
+                list.extend_from_slice(n.as_bytes());
+                list.push(b'\n');
+            }
+            list.push(0);
+            let len = cmp::min(list.len(), 4095);
+            unsafe {
+                core::ptr::copy_nonoverlapping(list.as_ptr(), 0x608C as *mut u8, len);
+                core::ptr::write_volatile((0x608C + len) as *mut u8, 0u8);
+            }
+        }
+
+        // Общий протокол: программа может сообщить ядру, куда поставить курсор
+        // после выхода (EXIT_ROW < 0 - не трогать позицию).
+        unsafe {
+            core::ptr::write_volatile(0x708C as *mut i32, -1);
+            core::ptr::write_volatile(0x7090 as *mut i32, 0);
+        }
+
+        crate::progabi::install();
+
+        let vga_offset = writer.vga_offset() as u64;
+        let pid = match launch_user(name, &data, vga_offset) {
+            Some(pid) => pid,
+            None => {
+                writer.write_string("exec: cannot load (no free task slot or out of memory)\n");
+                return true;
+            }
+        };
+
+        dbg("exec: spawned, waiting");
+        scheduler::wait_for(pid);
+        dbg("exec: wait done");
+
+        let exit_row = unsafe { core::ptr::read_volatile(0x708C as *const i32) };
+        if exit_row >= 0 {
+            let exit_col = unsafe { core::ptr::read_volatile(0x7090 as *const i32) };
+            writer.set_cursor(exit_row as usize, exit_col as usize);
+        }
+
+        if name == "vita" {
+            let dirty = unsafe { core::ptr::read_volatile(0x6000 as *mut u32) };
+            if dirty != 0 {
+                let new_size = unsafe { core::ptr::read_volatile(0x6004 as *mut u32) };
+                let new_size = cmp::min(new_size, 4096) as usize;
+                let fn_ptr = 0x600C as *const u8;
+                let fn_len = (0..128)
+                    .find(|&i| unsafe { core::ptr::read_volatile(fn_ptr.add(i)) } == 0)
+                    .unwrap_or(128);
+                let fn_slice = unsafe { core::slice::from_raw_parts(fn_ptr, fn_len) };
+                let fname = core::str::from_utf8(fn_slice).unwrap_or("untitled");
+                if new_size > 0 {
+                    let mut new_data = alloc::vec![0u8; new_size];
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            0x608C as *const u8,
+                            new_data.as_mut_ptr(),
+                            new_size,
+                        );
+                    }
+                    scheduler::with_vfs(|vfs| {
+                        let _ = vfs.write_file(fname, &new_data);
+                    });
+                }
+            }
+        }
+
+        scheduler::reap(pid);
+        writer.write_string("\n");
+        true
+    } else {
+        false
+    }
+}

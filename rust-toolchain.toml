@@ -1,0 +1,10 @@
+[toolchain]
+# bootloader = "0.9.x" зашивает в себя x86_64-bootloader.json со СТАРЫМ форматом
+# таргет-спеки (числа записаны как строки). Современные nightly (конец 2022+)
+# стали строже парсить этот JSON и требуют числа, а не строки - отсюда ошибка
+# "target-pointer-width: invalid type: string "64", expected u16".
+# Пока Cargo.toml пинует bootloader = "0.9.23", здесь ОБЯЗАН быть именно этот
+# старый nightly - на свежем сборка bootloader снова сломается.
+channel = "nightly-2022-11-01"
+components = ["rust-src", "llvm-tools-preview"]
+targets = ["x86_64-unknown-none"]

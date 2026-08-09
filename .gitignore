@@ -1,0 +1,11 @@
+/target/
+**/target/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.idea/
+.vscode/
