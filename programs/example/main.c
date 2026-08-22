@@ -1,4 +1,6 @@
-void _start(unsigned int vga_offset) {
+void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
+    (void)argc;
+    (void)argv;
     volatile char *vga = (volatile char *)0xB8000;
     unsigned int offset = vga_offset;
     const char *msg = "Hello from C! (example program)";

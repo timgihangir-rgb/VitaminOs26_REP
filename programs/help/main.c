@@ -38,7 +38,9 @@ static int c;
 static char prog_names[MAX_PROGS][PROG_NAME_LEN];
 static int prog_count;
 
-void _start(unsigned int vga_offset) {
+void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
+    (void)argc;
+    (void)argv;
     (void)vga_offset;
 
     clear_screen();

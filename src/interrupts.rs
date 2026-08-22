@@ -61,6 +61,33 @@ pub fn set_tss_rsp0(addr: u64) {
 }
 
 fn exception_handler(frame: InterruptStackFrame, index: u8, _err: Option<u64>) {
+    // Полный дамп в serial ДО VGA-печати (VGA не видно в headless-прогонax).
+    crate::vga::serial_write_atomic("\n[exc] v=0x");
+    serial_hex_u64(index as u64);
+    crate::vga::serial_write_atomic(" cs=");
+    serial_hex_u64(frame.code_segment);
+    crate::vga::serial_write_atomic(" rip=");
+    serial_hex_u64(frame.instruction_pointer.as_u64());
+    crate::vga::serial_write_atomic(" rsp=");
+    serial_hex_u64(frame.stack_pointer.as_u64());
+    crate::vga::serial_write_atomic(" flg=");
+    serial_hex_u64(frame.cpu_flags);
+    if let Some(err) = _err {
+        crate::vga::serial_write_atomic(" err=");
+        serial_hex_u64(err);
+    }
+    let cr2 = x86_64::registers::control::Cr2::read().as_u64();
+    crate::vga::serial_write_atomic(" cr2=");
+    serial_hex_u64(cr2);
+    crate::vga::serial_write_atomic(" task=");
+    let tname = crate::scheduler::current_name();
+    let mut tn = 0usize;
+    for &c in tname.iter() {
+        if c == 0 { break; }
+        tn += 1;
+    }
+    crate::vga::serial_write_atomic(core::str::from_utf8(&tname[..tn]).unwrap_or("?"));
+    crate::vga::serial_write_atomic("\n");
     let mut w = crate::vga::Writer::new();
     w.write_string("EXCEPTION vector 0x");
     write_hex(&mut w, index as u64);
@@ -91,9 +118,14 @@ fn exception_handler(frame: InterruptStackFrame, index: u8, _err: Option<u64>) {
     halt_loop();
 }
 
-extern "x86-interrupt" fn double_fault_handler(_frame: InterruptStackFrame, _err: u64) -> ! {
+extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, _err: u64) -> ! {
     let mut w = crate::vga::Writer::new();
     w.write_string("DOUBLE FAULT\n");
+    crate::vga::serial_write_atomic("[df] RIP=");
+    serial_hex_u64(frame.instruction_pointer.as_u64());
+    crate::vga::serial_write_atomic(" RSP=");
+    serial_hex_u64(frame.stack_pointer.as_u64());
+    crate::vga::serial_write_atomic("\n");
     halt_loop()
 }
 
@@ -185,5 +217,27 @@ fn write_bytes(w: &mut crate::vga::Writer, b: &[u8]) {
             break;
         }
         w.write_byte(c);
+    }
+}
+
+/// Временная диагностика 3.2: hex u64 в serial.
+fn serial_hex_u64(v: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        buf[2 + i] = HEX[((v >> (60 - i * 4)) & 0xf) as usize];
+    }
+    core::str::from_utf8(&buf).map(|s| crate::vga::serial_write_atomic(s));
+}
+
+/// Диагностика: байты (имя задачи) в serial, останавливаясь на NUL.
+fn serial_write_bytes(b: &[u8]) {
+    for &c in b {
+        if c == 0 {
+            break;
+        }
+        crate::vga::serial_putchar(c);
     }
 }

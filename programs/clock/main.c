@@ -70,7 +70,9 @@ static void fmt_time_of_day(char *out, long total);
 static int read_state(long *prev, long *delta);
 static void save_state(long prev, long delta);
 
-void _start(unsigned int vga_offset) {
+void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
+    (void)argc;
+    (void)argv;
     if (vga_offset == 0)
         daemon_mode();
     else

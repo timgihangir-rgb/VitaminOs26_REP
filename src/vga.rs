@@ -156,6 +156,7 @@ impl Writer {
                 self.column_position += 1;
             }
         }
+        self.update_hw_cursor();
     }
 
     pub fn backspace(&mut self) {
@@ -168,6 +169,7 @@ impl Writer {
                 *VGA_BUFFER.add(offset) = b' ';
                 *VGA_BUFFER.add(offset + 1) = self.color_code;
             }
+            self.update_hw_cursor();
         }
     }
 
@@ -220,6 +222,7 @@ impl Writer {
         }
         self.row_position = 0;
         self.column_position = 0;
+        self.update_hw_cursor();
     }
 
     pub fn ensure_lines_available(&mut self, needed: usize) {
@@ -229,6 +232,7 @@ impl Writer {
             }
             self.row_position = 0;
             self.column_position = 0;
+            self.update_hw_cursor();
             return;
         }
 
@@ -238,6 +242,7 @@ impl Writer {
                 self.row_position -= 1;
             }
         }
+        self.update_hw_cursor();
     }
 
     pub fn row(&self) -> usize {
@@ -261,7 +266,38 @@ impl Writer {
         // "случайных" крэшей/порчи памяти. Зажимаем в границы экрана.
         self.row_position = row.min(SCREEN_HEIGHT - 1);
         self.column_position = col.min(SCREEN_WIDTH - 1);
+        self.update_hw_cursor();
     }
+
+    /// Синхронизирует аппаратный CRTC-курсор с позицией Writer.
+    fn update_hw_cursor(&self) {
+        crate::cursor::set_position(self.row_position, self.column_position);
+    }
+
+    /// Writer, продолжающий вывод с текущей аппаратной позиции курсора.
+    /// Так ядро может печатать на экран без доступа к writer'у шелла
+    /// (устройства /dev/tty, /dev/vga).
+    pub fn at_hw_cursor() -> Writer {
+        let pos = crate::cursor::get_position() as usize;
+        Writer {
+            row_position: (pos / SCREEN_WIDTH).min(SCREEN_HEIGHT - 1),
+            column_position: pos % SCREEN_WIDTH,
+        }
+    }
+}
+
+/// Текущая позиция курсора как (row, col).
+pub fn hw_cursor_pos() -> (usize, usize) {
+    let pos = crate::cursor::get_position() as usize;
+    ((pos / SCREEN_WIDTH).min(SCREEN_HEIGHT - 1), pos % SCREEN_WIDTH)
+}
+
+/// Переставляет аппаратный курсор в (row, col) с зажимом в границы экрана.
+pub fn set_hw_cursor(row: usize, col: usize) {
+    crate::cursor::set_position(
+        row.min(SCREEN_HEIGHT - 1),
+        col.min(SCREEN_WIDTH - 1),
+    );
 }
 
 use x86_64::instructions::port::Port;
@@ -292,6 +328,15 @@ pub fn serial_putchar(c: u8) {
 }
 
 /// Пишет строку в COM1 без аллокаций (для debug-вывода из прерываний).
+/// Пишет строку в COM1 без вытеснения (маркеры диагностики не рвутся).
+pub fn serial_write_atomic(s: &str) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        for b in s.bytes() {
+            serial_putchar(b);
+        }
+    });
+}
+
 pub fn serial_write(s: &str) {
     for b in s.bytes() {
         serial_putchar(b);

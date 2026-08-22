@@ -32,7 +32,7 @@ pub fn read_file(writer: &mut Writer, vfs: &Vfs, filename: &str) {
     match vfs.cat(filename) {
         Some(data) => {
             for byte in data {
-                writer.write_byte(*byte);
+                writer.write_byte(byte);
             }
         }
         None => {
@@ -67,6 +67,3 @@ pub fn remove_file(vfs: &mut Vfs, path: &str) -> Result<(), ()> {
     vfs.rm(path)
 }
 
-pub fn write_to_file(vfs: &mut Vfs, args: &[&str]) -> Result<(), ()> {
-    vfs.echo(args)
-}

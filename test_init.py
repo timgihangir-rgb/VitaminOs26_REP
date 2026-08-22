@@ -7,6 +7,7 @@ import socket
 import json
 import re
 import sys
+import shutil
 
 QMP_PORT = 4451
 VGA_DUMP = "/tmp/init_vga.bin"
@@ -150,7 +151,7 @@ for p in ("/tmp/init_serial.log", VGA_DUMP):
         os.remove(p)
     except OSError:
         pass
-open(img, "wb").truncate(8 * 1024 * 1024)
+shutil.copyfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "target", "os.img"), img)
 
 subprocess.run(["pkill", "-f", f"qmp tcp:127.0.0.1:{QMP_PORT}"], stderr=subprocess.DEVNULL)
 time.sleep(0.5)

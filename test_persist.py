@@ -10,6 +10,7 @@ import os
 import socket
 import json
 import sys
+import shutil
 
 QMP_PORT = 4446
 VGA_DUMP = "/tmp/persist_vga.bin"
@@ -137,7 +138,7 @@ for p in ("/tmp/persist_serial.log", VGA_DUMP):
         os.remove(p)
     except OSError:
         pass
-open(IMG, "wb").truncate(8 * 1024 * 1024)
+shutil.copyfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "target", "os.img"), IMG)
 
 subprocess.run(["pkill", "-f", f"qmp tcp:127.0.0.1:{QMP_PORT}"], stderr=subprocess.DEVNULL)
 time.sleep(0.5)

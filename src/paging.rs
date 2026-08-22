@@ -1,3 +1,4 @@
+use alloc::vec;
 use x86_64::{
     registers::control::{Cr3, Cr3Flags},
     structures::paging::{
@@ -83,7 +84,9 @@ fn mapper(space: &mut AddressSpace) -> MappedPageTable<'_, PhysWindow> {
 // mirrored from the active tables, so kernel code, the phys window and the heap
 // stay reachable after a CR3 switch.
 pub fn create_address_space() -> Option<AddressSpace> {
-    unsafe {
+    // Атомарно против тика: три allocate_frame подряд и zero() таблиц не
+    // должны перемежаться со спавном другой задачи.
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         let alloc = &mut FRAME_ALLOC;
         let root_frame = alloc.allocate_frame()?;
         let pdp0_frame = alloc.allocate_frame()?;
@@ -96,11 +99,14 @@ pub fn create_address_space() -> Option<AddressSpace> {
         pdp0.zero();
         pd0.zero();
 
-        // Identity map the first 4 MiB as two 2 MiB huge pages. Доступны из
-        // ring 3 (USER_ACCESSIBLE): VGA, shared memory и ABI-трамплины лежат
-        // в этой области и видимы программе по тем же адресам, что и ядру.
+        // Identity map the first 4 MiB as two 2 MiB huge pages. Доступен из
+        // ring 3 ТОЛЬКО диапазон 0..2 МиБ: VGA, shared memory и ABI-трамплины.
+        // Вторая страница (2..4 МиБ) - физическая память САМОГО ЯДРА
+        // (.text/.data/.bss, boot-стек): она видна по low-alias, но запись
+        // из ring 3 запрещена. Иначе любая сбойная user-программа (crashy!)
+        // затирает ядро нулями и указателями - случайная порча статики.
         pd0[0].set_addr(PhysAddr::new(0x0), identity_flags() | PageTableFlags::USER_ACCESSIBLE);
-        pd0[1].set_addr(PhysAddr::new(0x200000), identity_flags() | PageTableFlags::USER_ACCESSIBLE);
+        pd0[1].set_addr(PhysAddr::new(0x200000), identity_flags());
         pdp0[0].set_frame(pd0_frame, table_flags());
         root[0].set_frame(pdp0_frame, table_flags());
 
@@ -112,7 +118,7 @@ pub fn create_address_space() -> Option<AddressSpace> {
         }
 
         Some(AddressSpace { root: root_frame })
-    }
+    })
 }
 
 // Releases every frame owned by the space: the pml4[0] subtree (page tables
@@ -276,10 +282,56 @@ pub fn map_user_image(space: &mut AddressSpace, data: &[u8]) -> Result<(), Space
     }
 }
 
-/// Выделяет и маппит стек user-задачи (USER_STACK_PAGES страниц) в диапазон
-/// [USER_STACK_BASE, USER_STACK_TOP). По адресу USER_STACK_TOP - 8 кладёт адрес
-/// exit-стаба (crate::progabi::EXIT_STUB) — туда попадает `ret` из `_start`.
-pub fn map_user_stack(space: &mut AddressSpace) -> Result<(), SpaceError> {
+/// Копирует байты в user-память (все страницы обязаны быть уже замаплены).
+/// Диапазон может пересекать границы страниц — пишется по кускам.
+pub fn write_user_bytes(space: &AddressSpace, mut vaddr: u64, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let page_rem = 4096 - (vaddr % 4096) as usize;
+        let n = page_rem.min(bytes.len());
+        let pa = match translate_addr(space, VirtAddr::new(vaddr)) {
+            Some(pa) => pa,
+            None => return,
+        };
+        unsafe {
+            let dst = (PHYS_MEM_OFFSET + pa.as_u64()) as *mut u8;
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, n);
+        }
+        vaddr += n as u64;
+        bytes = &bytes[n..];
+    }
+}
+
+/// Блок аргументов user-задачи на стеке.
+pub struct UserStackArgs {
+    /// Входной RSP: указывает на слот exit-стаба (`ret` из `_start` уходит
+    /// туда, если программа не завершилась сисколлом явно).
+    pub rsp: u64,
+    /// Число аргументов (дублируется в rdi при входе).
+    pub argc: u64,
+    /// User-адрес массива указателей argv[0..argc] (дублируется в rsi).
+    pub argv: u64,
+}
+
+/// Зазор между входным rsp и блоком аргументов: пушы и локалы программы
+/// растут ВНИЗ от входного rsp и не должны затирать argc/argv.
+const STACK_ARGS_GAP: u64 = 4096;
+
+/// Маппит стек user-задачи ([USER_STACK_BASE, USER_STACK_TOP)) и строит на
+/// нём блок аргументов. Раскладка сверху вниз:
+/// ```text
+/// TOP-8  : argc                        (информационно)
+/// ниже   : argv[0..n], NULL (конец argv), NULL (конец envp)
+/// ниже   : строки аргументов (NUL-terminated)
+/// зазор STACK_ARGS_GAP байт — свободное место под пуши/локалы программы
+/// rsp    : адрес exit-стаба (входной rsp указывает сюда; `ret` из `_start`
+///          попадает на него)
+/// ```
+/// Регистры при входе задаёт ядро: rdi=argc, rsi=&argv[0] (для ELF; для
+/// legacy .bin — rdi=vga_offset). Блок на стеке дублирует их по образцу SysV.
+pub fn setup_user_stack(
+    space: &mut AddressSpace,
+    argv: &[&str],
+) -> Result<UserStackArgs, SpaceError> {
     unsafe {
         for i in 0..USER_STACK_PAGES {
             let frame = FRAME_ALLOC.allocate_frame().ok_or(SpaceError::MapError)?;
@@ -289,15 +341,61 @@ pub fn map_user_stack(space: &mut AddressSpace) -> Result<(), SpaceError> {
                 USER_STACK_BASE + i * 4096,
             ));
             map_page(space, page, frame, user_flags())?;
-            if i == USER_STACK_PAGES - 1 {
-                let stub = PHYS_MEM_OFFSET
-                    + frame.start_address().as_u64()
-                    + (4096 - 8); // USER_STACK_TOP - 8 внутри верхней страницы стека
-                (stub as *mut u64).write(crate::progabi::EXIT_STUB as u64);
-            }
         }
-        Ok(())
     }
+
+    // Блок аргументов собираем в буфере ядра и пишем одним куском.
+    let n = argv.len();
+    // Размер строкового блока округляется до 8, чтобы strings_bottom был
+    // выровнен (строки начинаются с выровненного адреса).
+    let strings_size: usize = (argv.iter().map(|s| s.len() + 1).sum::<usize>() + 7) & !7;
+    // argc + указатели argv + NULL argv + NULL envp + строки
+    let block_size = 8u64 + 8 * (n as u64 + 2) + strings_size as u64;
+    if block_size + STACK_ARGS_GAP > USER_STACK_PAGES * 4096 / 2 {
+        return Err(SpaceError::OutOfRange);
+    }
+
+    let top = USER_STACK_TOP;
+    let strings_top = top - 8 - 8 * (n as u64 + 2);
+    let strings_bottom = strings_top - strings_size as u64;
+    let entry_rsp = strings_bottom - STACK_ARGS_GAP;
+
+    let mut buf = vec![0u8; (top - 8 - strings_bottom) as usize];
+    let mut off = 0usize;
+    for s in argv {
+        buf[off..off + s.len()].copy_from_slice(s.as_bytes());
+        off += s.len() + 1;
+    }
+    let mut p = (strings_top - strings_bottom) as usize;
+    for i in 0..n {
+        let ptr = strings_bottom + strings_offsets(argv, i);
+        buf[p..p + 8].copy_from_slice(&ptr.to_le_bytes());
+        p += 8;
+    }
+    // NULL конца argv и NULL конца envp уже нули в буфере.
+    let argc_off = (top - 16 - strings_bottom) as usize;
+    buf[argc_off..argc_off + 8].copy_from_slice(&(n as u64).to_le_bytes());
+
+    write_user_bytes(space, strings_bottom, &buf);
+
+    // Адрес exit-стаба по входному rsp: `ret` из `_start` уходит туда.
+    let stub_pa =
+        translate_addr(space, VirtAddr::new(entry_rsp)).ok_or(SpaceError::MapError)?;
+    unsafe {
+        ((PHYS_MEM_OFFSET + stub_pa.as_u64()) as *mut u64)
+            .write(crate::progabi::EXIT_STUB as u64);
+    }
+
+    Ok(UserStackArgs {
+        rsp: entry_rsp,
+        argc: n as u64,
+        argv: strings_top,
+    })
+}
+
+/// Смещение строки аргумента `i` от начала строкового блока.
+fn strings_offsets(argv: &[&str], i: usize) -> u64 {
+    argv[..i].iter().map(|s| s.len() as u64 + 1).sum()
 }
 
 #[allow(dead_code)]

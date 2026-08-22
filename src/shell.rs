@@ -26,30 +26,80 @@ pub fn run_shell(writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut Vfs) -> !
                 crate::vga::serial_putchar(b);
             }
         }
+        {
+            let _g = crate::scheduler::vfs_lock();
+            append_history(vfs, input.as_str());
+        }
         handle_command(input.as_str(), writer, mem, vfs);
     }
 }
 
+/// Разбирает и исполняет командную строку. Поддерживает цепочки `&&`:
+/// сегменты выполняются по порядку, первый неуспех останавливает цепочку.
 fn handle_command(command: &str, writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut Vfs) {
-    let args = tokenize(command.trim());
-
-    if args.is_empty() {
+    let raw = tokenize(command.trim());
+    if raw.is_empty() {
         return;
+    }
+
+    let mut start = 0;
+    for i in 0..=raw.len() {
+        if i == raw.len() || raw[i] == "&&" {
+            let seg = &raw[start..i];
+            start = i + 1;
+            if seg.is_empty() {
+                continue;
+            }
+            if !run_one(seg, writer, mem, vfs) {
+                break;
+            }
+        }
+    }
+}
+
+/// Исполняет один сегмент (без "&&"). false - команда не удалась.
+fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut Vfs) -> bool {
+    // Перенаправления: `> file` (перезапись), `>> file` (дозапись),
+    // `< file` (ввод из файла). Операторы вырезаются из args и обрабатываются
+    // отдельно для команд, поддерживающих редирект (echo, cat).
+    let mut out_overwrite: Option<&str> = None;
+    let mut out_append: Option<&str> = None;
+    let mut in_file: Option<&str> = None;
+    let mut args: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i] {
+            ">" => {
+                out_overwrite = raw.get(i + 1).copied();
+                i += 2;
+            }
+            ">>" => {
+                out_append = raw.get(i + 1).copied();
+                i += 2;
+            }
+            "<" => {
+                in_file = raw.get(i + 1).copied();
+                i += 2;
+            }
+            a => {
+                args.push(a);
+                i += 1;
+            }
+        }
     }
 
     // Foreground-программы (`run X` и неизвестные команды) исполняются БЕЗ
     // VFS_LOCK: лок нереентерабельный, а программа сама читает/пишет файлы
     // через ABI (with_vfs). Внутренние команды шелла — под локом.
-    if let ["run", path] = args.as_slice() {
-        let run_args = [*path];
-        if !exec::run_program(writer, &run_args, mem) {
-            writer.write_string("run: file not found: ");
-            writer.write_string(path);
-            writer.write_string("\n");
+    if let ["run", rest @ ..] = args.as_slice() {
+        let run_args: Vec<&str> = rest.to_vec();
+        let ok = !run_args.is_empty() && exec::run_program(writer, &run_args, mem);
+        if !ok {
+            writer.write_string("run: file not found\n");
         }
         let _g = crate::scheduler::vfs_lock();
-        let _ = crate::disk::flush(vfs);
-        return;
+        crate::vitafs::sync_all();
+        return ok;
     }
 
     // `bg` тоже запускается БЕЗ VFS_LOCK: бинарник читается через with_vfs
@@ -59,8 +109,8 @@ fn handle_command(command: &str, writer: &mut Writer, mem: sysinfo::MemInfo, vfs
     if let ["bg", name, args @ ..] = args.as_slice() {
         bg_task(writer, name, args);
         let _g = crate::scheduler::vfs_lock();
-        let _ = crate::disk::flush(vfs);
-        return;
+        crate::vitafs::sync_all();
+        return true;
     }
 
     // Весь доступ к VFS из шелла сериализуется с фоновыми задачами.
@@ -128,11 +178,6 @@ fn handle_command(command: &str, writer: &mut Writer, mem: sysinfo::MemInfo, vfs
                 }
             }
         }
-        ["cat", files @ ..] => {
-            for file in files {
-                fs::read_file(writer, vfs, file);
-            }
-        }
         ["cp", src, dst] => {
             if let Err(_) = vfs.copy(src, dst) {
                 writer.write_string("cp: cannot copy '");
@@ -165,16 +210,73 @@ fn handle_command(command: &str, writer: &mut Writer, mem: sysinfo::MemInfo, vfs
             }
         }
         ["echo", rest @ ..] => {
-            if rest.is_empty() {
-                writer.write_string("\n");
-            } else if rest.contains(&">") {
-                let echo_args: Vec<&str> = rest.to_vec();
-                if let Err(_) = fs::write_to_file(vfs, &echo_args) {
+            let out = out_append.or(out_overwrite);
+            if let Some(file) = out {
+                let msg = rest.join(" ") + "\n";
+                let res = if out_append.is_some() {
+                    vfs.append(file, msg.as_bytes())
+                } else {
+                    vfs.write_file(file, msg.as_bytes())
+                };
+                if res.is_err() {
                     writer.write_string("echo: write failed\n");
                 }
             } else {
                 writer.write_string(&rest.join(" "));
                 writer.write_string("\n");
+            }
+        }
+        ["cat", files @ ..] => {
+            let mut files: Vec<&str> = files.to_vec();
+            if files.is_empty() {
+                if let Some(f) = in_file {
+                    files.push(f);
+                }
+            }
+            let out = out_append.or(out_overwrite);
+            if let Some(out_path) = out {
+                let mut out_data: Vec<u8> = Vec::new();
+                let mut ok = true;
+                for file in &files {
+                    match vfs.cat(file) {
+                        Some(d) => out_data.extend_from_slice(&d),
+                        None => {
+                            writer.write_string("cat: no such file: ");
+                            writer.write_string(file);
+                            writer.write_string("\n");
+                            ok = false;
+                        }
+                    }
+                }
+                if ok {
+                    let res = if out_append.is_some() {
+                        vfs.append(out_path, &out_data)
+                    } else {
+                        vfs.write_file(out_path, &out_data)
+                    };
+                    if res.is_err() {
+                        writer.write_string("cat: write failed\n");
+                    }
+                }
+            } else {
+                for file in &files {
+                    fs::read_file(writer, vfs, file);
+                }
+            }
+        }
+        ["history"] => {
+            if let Some(data) = vfs.cat("/var/log/history.log") {
+                let mut n = 1;
+                let mut start = 0;
+                for (i, b) in data.iter().enumerate() {
+                    if *b == b'\n' {
+                        writer.write_string(&alloc::format!("{:>3}  ", n));
+                        writer.write_string(core::str::from_utf8(&data[start..i]).unwrap_or(""));
+                        writer.write_string("\n");
+                        n += 1;
+                        start = i + 1;
+                    }
+                }
             }
         }
         ["ps"] => {
@@ -207,22 +309,41 @@ fn handle_command(command: &str, writer: &mut Writer, mem: sysinfo::MemInfo, vfs
             // Неизвестная команда: пробуем .bin-программу в foreground.
             // VFS_LOCK освобождаем — программа сама работает с VFS через ABI.
             drop(_vfs_guard);
-            if !exec::run_program(writer, &args, mem) {
+            let ok = exec::run_program(writer, &args, mem);
+            if !ok {
                 writer.write_string("Unknown command: ");
                 writer.write_string(args[0]);
                 writer.write_string("\nType 'help' for available commands.\n");
             }
             let _g = crate::scheduler::vfs_lock();
-            let _ = crate::disk::flush(vfs);
-            return;
+            crate::vitafs::sync_all();
+            return ok;
         }
     }
 
-    let _ = crate::disk::flush(vfs);
+    crate::vitafs::sync_all();
+    true
 }
 
 fn tokenize(command: &str) -> Vec<&str> {
     command.split_whitespace().collect()
+}
+
+/// Дописывает команду в /var/log/history.log (с ограничением размера).
+fn append_history(vfs: &mut Vfs, line: &str) {
+    if line.trim().is_empty() {
+        return;
+    }
+    let mut out = vfs
+        .cat("/var/log/history.log")
+        .map(|d| d.to_vec())
+        .unwrap_or_default();
+    if out.len() + line.len() + 1 > 8192 {
+        out = out[out.len().saturating_sub(4096)..].to_vec();
+    }
+    out.extend_from_slice(line.as_bytes());
+    out.push(b'\n');
+    let _ = vfs.write_file("/var/log/history.log", &out);
 }
 
 fn bg_task(writer: &mut Writer, name: &str, args: &[&str]) {
@@ -232,14 +353,15 @@ fn bg_task(writer: &mut Writer, name: &str, args: &[&str]) {
         writer.write_string(&alloc::format!(" (pid {})\n", pid));
         return;
     }
-    // Программа из /bin (raw machine code). Работает в фоне в ring 3, в
-    // собственном адресном пространстве; может рисовать в VGA — с одним
-    // экраном это пересекается с выводом шелла.
+    // Программа из /bin (ELF или legacy raw machine code). Работает в фоне в
+    // ring 3, в собственном адресном пространстве; может рисовать в VGA — с
+    // одним экраном это пересекается с выводом шелла.
     let binpath = alloc::format!("/bin/{}", name);
     let code = crate::scheduler::with_vfs(|vfs| vfs.cat(&binpath).map(|d| d.to_vec()));
     if let Some(code) = code {
         crate::progabi::install();
-        match crate::exec::launch_user(name, &code, 0) {
+        let argv = [binpath.as_str()];
+        match crate::exec::launch_user(name, &code, &argv, 0) {
             Some(pid) => {
                 writer.write_string("Started background task ");
                 writer.write_string(name);

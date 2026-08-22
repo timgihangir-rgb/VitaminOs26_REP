@@ -30,7 +30,10 @@ const SUPERVISE_INTERVAL: u64 = 50;
 
 const DEFAULT_RC_CONF: &[u8] = b"\
 # VitaminOS26 init services\n\
-clock bin\n\
+clock bin
+ticker builtin respawn
+crashy builtin respawn
+\
 ticker builtin respawn\n\
 crashy builtin respawn\n";
 
@@ -76,7 +79,7 @@ fn kind_str(k: Kind) -> &'static str {
 fn load_config() {
     let text = scheduler_with_vfs(|vfs| {
         vfs.cat("/etc/rc.conf")
-            .map(|d| String::from_utf8_lossy(d).into_owned())
+            .map(|d| String::from_utf8_lossy(&d).into_owned())
     })
     .unwrap_or_default();
 
@@ -127,6 +130,7 @@ fn load_config() {
 /// Старт init-системы: создаёт /var/log, дефолтный /etc/rc.conf (если нет),
 /// запускает службы и задачу-супервизор. Вызывается из main перед run_shell.
 pub fn boot(writer: &mut Writer) {
+    crate::vga::serial_write_atomic("[B] enter\n");
     scheduler_with_vfs(|vfs| {
         let _ = vfs.mkdir("/var");
         let _ = vfs.mkdir("/var/log");
@@ -135,24 +139,42 @@ pub fn boot(writer: &mut Writer) {
         }
     });
 
+    crate::vga::serial_write_atomic("[B] cfg-done\n");
     crate::progabi::install();
     load_config();
+    crate::vga::serial_write_atomic("[B] conf-loaded\n");
 
     let n = SERVICES.lock().entries.len();
     for i in 0..n {
+        let svc = SERVICES.lock().entries[i].name.clone();
+        crate::vga::serial_write_atomic("[B] spawn ");
+        crate::vga::serial_write_atomic(&svc);
+        crate::vga::serial_write_atomic("\n");
         if start_service(i, None, true) {
+            crate::vga::serial_write_atomic("[B] started ");
+            crate::vga::serial_write_atomic(&svc);
+            crate::vga::serial_write_atomic("\n");
             let name = SERVICES.lock().entries[i].name.clone();
             log_line(None, &alloc::format!("[init] boot: {} started\n", name));
+            writer.set_color(crate::vga::COLOR_LIGHT_CYAN);
+            writer.write_string("  [ ** ] ");
+            writer.set_color(crate::vga::COLOR_WHITE);
+            writer.write_string(&alloc::format!("service: {}", svc));
+            writer.write_string("\n");
         }
+        crate::vga::serial_write_atomic("[B] logged ");
+        crate::vga::serial_write_atomic(&svc);
+        crate::vga::serial_write_atomic("\n");
     }
 
     if crate::scheduler::spawn("init", Box::new(|| supervisor_loop())).is_some() {
         log_line(None, "[init] boot: supervisor started\n");
-        writer.write_string("[init] ");
-        writer.write_string(&n.to_string());
-        writer.write_string(" service(s) configured\n");
+        crate::splash::step(
+            writer,
+            &alloc::format!("init: {} service(s) configured", n),
+        );
     } else {
-        writer.write_string("[init] ERROR: no free task slot for supervisor\n");
+        crate::splash::fail(writer, "init: no free task slot for supervisor");
     }
 }
 
@@ -299,7 +321,8 @@ fn start_bin_service(name: &str, vfs: Option<&mut Vfs>) -> Option<usize> {
         Some(v) => v.cat(&path).map(|d| d.to_vec()),
         None => scheduler_with_vfs(|v| v.cat(&path).map(|d| d.to_vec())),
     }?;
-    crate::exec::launch_user(name, &code, 0)
+    let argv = [path.as_str()];
+    crate::exec::launch_user(name, &code, &argv, 0)
 }
 
 /// Оборачивает VFS-доступ общим локом (безопасно вне шелла и без вложения

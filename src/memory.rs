@@ -15,7 +15,10 @@ pub const PHYS_MEM_OFFSET: u64 = 0xFFFF800000000000;
 // PML4). Note: pml4[256] cannot be used — boot.asm maps the whole pdp_high
 // table with 2 MiB huge pages, so every 1 GiB slot under pml4[256] is taken.
 pub const HEAP_START: usize = 0xFFFF8080_00000000;
-pub const HEAP_SIZE: usize = 1024 * 1024;
+/// 4 МиБ: 1 МиБ не хватало - staging WAL (164КБ куском) + стеки задач по
+/// 32КБ + ELF-загрузки фрагментировали кучу, и linked_list_allocator падал
+/// в split_current на обмельчавших дырах.
+pub const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C, packed)]
@@ -109,7 +112,10 @@ impl FrameAlloc {
     /// Следующий свободный кадр из линейного прохода по регионам, начиная с
     /// позиции курсора. O(1) амортизированно: курсор двигается только вперёд.
     unsafe fn sweep_next(&mut self) -> Option<PhysFrame> {
-        const LOW_MEMORY_END: u64 = 0x10_0000; // skip frames below 1 MiB
+        // Пропускаем всё ниже 4 МиБ: диапазон 0..2 МиБ виден user-задачам
+        // через identity-map (VGA/ABI), а 2..4 МиБ - это физическая память
+        // ядра. Фреймы из этой зоны в руках ring 3 - прямой путь к порче.
+        const LOW_MEMORY_END: u64 = 0x40_0000;
         let reserved = kernel_reserved_ranges();
         while self.region_idx < REGIONS.len() {
             let r = &REGIONS[self.region_idx];
@@ -136,25 +142,50 @@ impl FrameAlloc {
 
 unsafe impl FrameAllocator<Size4KiB> for FrameAlloc {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        unsafe {
-            if FREE_COUNT > 0 {
+        // Атомарность против тика: курсор sweep и free-list - static mut,
+        // без защиты две задачи (например, супервизор и exec) получают
+        // ОДИН И ТОТ ЖЕ фрейм, и zero() страниц затирает чужие данные.
+        x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+            while FREE_COUNT > 0 {
                 FREE_COUNT -= 1;
                 let addr = FREE_FRAMES[FREE_COUNT];
-                return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
+                // Валидация записи free-list: мусор здесь = чья-то порча.
+                if addr >= 0x40_0000 && addr < 0x80_0000 && addr % 4096 == 0 {
+                    return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
+                }
+                crate::vga::serial_write_atomic("[frames] BAD entry addr=");
+                crate::vga::serial_u64(addr as u64);
+                crate::vga::serial_write_atomic(" idx=");
+                crate::vga::serial_u64(FREE_COUNT as u64);
+                crate::vga::serial_write_atomic("\n");
             }
             self.sweep_next()
-        }
+        })
     }
 }
 
 impl FrameDeallocator<Size4KiB> for FrameAlloc {
     unsafe fn deallocate_frame(&mut self, frame: PhysFrame) {
-        unsafe {
-            if FREE_COUNT < FREE_LIST_CAP {
-                FREE_FRAMES[FREE_COUNT] = frame.start_address().as_u64();
-                FREE_COUNT += 1;
+        x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+            let addr = frame.start_address().as_u64();
+            // Детектор двойного освобождения: фрейм, уже висящий в списке,
+            // будет выдан второму владельцу, и тот затрёт память первого
+            // (нулями таблиц/страниц). Не пушим дубликат - кричим в serial.
+            for i in 0..FREE_COUNT {
+                if FREE_FRAMES[i] == addr {
+                    crate::vga::serial_write_atomic("[frames] DOUBLE FREE addr=");
+                    crate::vga::serial_u64(addr);
+                    crate::vga::serial_write_atomic("\n");
+                    return;
+                }
             }
-        }
+            if FREE_COUNT < FREE_LIST_CAP {
+                FREE_FRAMES[FREE_COUNT] = addr;
+                FREE_COUNT += 1;
+            } else {
+                crate::vga::serial_write_atomic("[frames] free-list FULL, leak\n");
+            }
+        })
     }
 }
 

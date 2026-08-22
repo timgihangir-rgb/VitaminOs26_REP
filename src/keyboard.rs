@@ -65,6 +65,24 @@ fn pop_scancode() -> Option<u8> {
     }
 }
 
+/// Есть ли сканкод в буфере (для ABI-сисколов программ). Не аллоцирует.
+pub fn kb_hit() -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe { BUF_HEAD != BUF_TAIL })
+}
+
+/// Вынимает сканкод из буфера (для ABI-сисколов программ). 0 — буфер пуст.
+pub fn kb_read() -> u8 {
+    x86_64::instructions::interrupts::without_interrupts(|| pop_scancode().unwrap_or(0))
+}
+
+/// Очищает буфер сканкодов (перед запуском foreground-программы, чтобы она
+/// не получила остатки от команд шелла).
+pub fn flush() {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        BUF_HEAD = BUF_TAIL;
+    });
+}
+
 fn translate(scancode: u8, shift: bool) -> Option<u8> {
     let base = match scancode {
         0x02 => Some(b'1'), 0x03 => Some(b'2'), 0x04 => Some(b'3'),
@@ -260,6 +278,71 @@ pub fn read_line(writer: &mut Writer, history: &mut History) -> String {
                     writer.write_byte(c);
                 }
             }
+        }
+    }
+}
+
+/// Инициализация 8042 при старте ядра: включаем клавиатурный интерфейс
+/// (0xAE) и вычитываем зависшие байты вывода. GRUB может оставить
+/// контроллер в командном режиме (статус 0x28) - тогда он молча глотает
+/// все нажатия; 0xAE сбрасывает это состояние.
+pub fn controller_init() {
+    // Каноническая инициализация 8042. Без неё контроллер может остаться в
+    // состоянии, где данные принимаются, но IRQ1 не выставляется
+    // (сброшен бит 0 конфига - "keyboard interrupt enable").
+    unsafe {
+        use x86_64::instructions::port::Port;
+        let mut cmd: Port<u8> = Port::new(0x64);
+        let mut data: Port<u8> = Port::new(0x60);
+        let mut status: Port<u8> = Port::new(0x64);
+
+        // 1) Вычитать зависшие байты вывода.
+        let mut guard = 128u32;
+        while guard > 0 {
+            if status.read() & 1 == 0 {
+                break;
+            }
+            let _ = data.read();
+            guard -= 1;
+        }
+
+        // 2) Самотест контроллера (0xAA): сбрасывает внутреннее состояние.
+        cmd.write(0xAAu8);
+        let mut wait = 200000u32;
+        while wait > 0 && status.read() & 1 == 0 {
+            core::hint::spin_loop();
+            wait -= 1;
+        }
+        if status.read() & 1 != 0 {
+            let _ = data.read(); // ответ 0x55 нам не важен
+        }
+
+        // 3) Читаем конфиг (0x20), разрешаем IRQ1 (бит0) и трансляцию (бит6),
+        //    включаем тактовую линию клавиатуры (снимаем бит4).
+        cmd.write(0x20u8);
+        let mut wait = 200000u32;
+        while wait > 0 && status.read() & 1 == 0 {
+            core::hint::spin_loop();
+            wait -= 1;
+        }
+        let mut cfg = if status.read() & 1 != 0 { data.read() } else { 0x45 };
+        cfg |= 0b0000_0001; // IRQ1 enable
+        cfg |= 0b0100_0000; // translate scancodes
+        cfg &= !0b0001_0000; // kbd clock enable
+        cfg &= !0b0010_0000; // mouse clock enable (не мешает)
+        cmd.write(0x60u8);
+        data.write(cfg);
+
+        // 4) Включаем интерфейсы и сканирование на устройстве.
+        cmd.write(0xAEu8); // enable keyboard interface
+        data.write(0xF4u8); // enable scanning (устройство ответит 0xFA - вычтем)
+        let mut guard = 64u32;
+        while guard > 0 {
+            if status.read() & 1 == 0 {
+                break;
+            }
+            let _ = data.read();
+            guard -= 1;
         }
     }
 }

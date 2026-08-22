@@ -43,7 +43,8 @@ struct Screen {
 
 #[no_mangle]
 #[link_section = ".text._start"]
-pub extern "C" fn _start(vga_offset: usize) {
+pub extern "C" fn _start(argc: usize, argv: *const *const u8, vga_offset: usize) {
+    let _ = (argc, argv);
     let info = unsafe { core::ptr::read_volatile(0x5000 as *const SysInfo) };
     let mut start_row = vga_offset / (SCREEN_WIDTH * 2);
     // Продолжение tty: если блок вывода fetch (13 строк) не помещается от

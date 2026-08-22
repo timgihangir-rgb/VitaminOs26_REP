@@ -13,6 +13,7 @@ import os
 import socket
 import json
 import sys
+import shutil
 
 QMP_PORT = 4444
 VGA_DUMP1 = "/tmp/vga_dump.bin"
@@ -116,7 +117,7 @@ for p in ("/tmp/vita_serial.log", VGA_DUMP1, VGA_DUMP2):
         os.remove(p)
     except OSError:
         pass
-open(img, "wb").truncate(8 * 1024 * 1024)
+shutil.copyfile(os.path.join(os.path.dirname(os.path.abspath(__file__)), "target", "os.img"), img)
 
 print(f"Starting QEMU: {' '.join(qemu_cmd)}")
 qemu = subprocess.Popen(qemu_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -206,6 +207,110 @@ try:
     check(qemu_alive(qemu), "QEMU alive after quitting vita")
     dump_vga(s, VGA_DUMP1)
     lines = vga_text(VGA_DUMP1)
+    # ---- Arrows test: create a 3-line file, navigate, verify cursor ----
+    print("\n=== Arrows test ===")
+
+    def type_text(s, text, delay=0.15):
+        for ch in text:
+            qmp_sendkey(s, {" ": "spc", "/": "slash", "_": "shift-minus"}.get(ch, ch))
+            time.sleep(delay)
+
+    def title_bar(lines):
+        for ln in lines:
+            if "Vita:" in ln:
+                return ln
+        return ""
+
+    def wait_vita(s, fname, timeout=8):
+        for i in range(timeout):
+            time.sleep(1)
+            if not qemu_alive(qemu):
+                return False
+            dump_vga(s, VGA_DUMP1)
+            if f"Vita: {fname}" in title_bar(vga_text(VGA_DUMP1)):
+                return True
+        return False
+
+    def wait_prompt(s, timeout=8):
+        for i in range(timeout):
+            time.sleep(1)
+            if not qemu_alive(qemu):
+                return False
+            dump_vga(s, VGA_DUMP1)
+            if any("vitamin_os26" in ln for ln in vga_text(VGA_DUMP1)):
+                return True
+        return False
+
+    # Session 1: create /tmp/arrows with three lines (aaa/bbb/ccc).
+    print("Sending: vita /tmp/arrows<enter>")
+    type_text(s, "vita /tmp/arrows")
+    qmp_sendkey(s, "ret")
+    time.sleep(1)
+    check(wait_vita(s, "/tmp/arrows"), "vita opened empty /tmp/arrows")
+
+    print("Typing three lines: aaa, bbb, ccc")
+    type_text(s, "aaa")
+    qmp_sendkey(s, "ret")
+    time.sleep(0.4)
+    type_text(s, "bbb")
+    qmp_sendkey(s, "ret")
+    time.sleep(0.4)
+    type_text(s, "ccc")
+    time.sleep(0.5)
+    dump_vga(s, VGA_DUMP2)
+    lines = vga_text(VGA_DUMP2)
+    check(lines[1].strip() == "aaa" and lines[2].strip() == "bbb" and lines[3].strip() == "ccc",
+          "three lines typed into editor")
+    check("Ln 3:4" in lines[0], f"cursor at end of line 3 (got {lines[0][60:75]!r})")
+
+    qmp_sendkey(s, "ctrl-s")
+    time.sleep(0.6)
+    qmp_sendkey(s, "ctrl-q")
+    time.sleep(1)
+    check(wait_prompt(s), "shell prompt after save+quit")
+
+    # Session 2: relaunch and navigate with arrows.
+    print("Sending: vita /tmp/arrows<enter> (relaunch)")
+    type_text(s, "vita /tmp/arrows")
+    qmp_sendkey(s, "ret")
+    time.sleep(1)
+    check(wait_vita(s, "/tmp/arrows"), "vita reopened /tmp/arrows")
+    dump_vga(s, VGA_DUMP1)
+    lines = vga_text(VGA_DUMP1)
+    check(lines[1].strip() == "aaa" and lines[2].strip() == "bbb" and lines[3].strip() == "ccc",
+          "3 lines loaded from disk")
+    check("Ln 1:1" in lines[0], "initial position Ln 1:1")
+
+    for key, expect, label in [
+        ("down", "Ln 2:1", "down -> line 2"),
+        ("down", "Ln 3:1", "down -> line 3"),
+        ("right", "Ln 3:2", "right -> col 2"),
+        ("right", "Ln 3:3", "right -> col 3"),
+        ("left", "Ln 3:2", "left -> col 2"),
+        ("up", "Ln 2:2", "up -> line 2 col 2"),
+        ("home", "Ln 2:1", "home -> col 1"),
+        ("end", "Ln 2:4", "end -> col 4 (line len 3)"),
+    ]:
+        qmp_sendkey(s, key)
+        time.sleep(0.5)
+        dump_vga(s, VGA_DUMP1)
+        tb = title_bar(vga_text(VGA_DUMP1))
+        check(expect in tb, f"'{key}' -> {expect} (got {tb[60:75]!r})")
+
+    qmp_sendkey(s, "ctrl-q")
+    time.sleep(1)
+    check(wait_prompt(s), "shell prompt after arrows session")
+
+    print("Sending: cat /tmp/arrows<enter>")
+    type_text(s, "cat /tmp/arrows")
+    qmp_sendkey(s, "ret")
+    time.sleep(1.5)
+    dump_vga(s, VGA_DUMP1)
+    lines = vga_text(VGA_DUMP1)
+    text = "\n".join(lines)
+    check("aaa" in text and "bbb" in text and "ccc" in text,
+          "file content aaa/bbb/ccc intact after navigation")
+
     check(any("vitamin_os26" in ln for ln in lines), "shell prompt visible again after vita exited")
 
     s.close()

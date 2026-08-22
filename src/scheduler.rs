@@ -37,7 +37,7 @@ use crate::vfs::Vfs;
 use spinning_top::{Spinlock, SpinlockGuard};
 
 pub const MAX_TASKS: usize = 16;
-pub const STACK_SIZE: usize = 16 * 1024;
+pub const STACK_SIZE: usize = 64 * 1024;
 
 /// Размер стартового контекста на стеке задачи: 15 регистров + фрейм iretq.
 const CONTEXT_SIZE: usize = 20 * 8;
@@ -85,6 +85,9 @@ struct Task {
     /// 0 — не просыпаться по таймеру (shell в wait_for будится только через
     /// WAITING_ON/exit_current). Устанавливается `block_until_tick`/`sleep_until`.
     wake_tick: u64,
+    /// Аппаратная позиция CRTC-курсора, сохранённая при вытеснении задачи.
+    /// `cursor::NO_POSITION` — задача ещё не сохраняла (не восстанавливать).
+    cursor_pos: u16,
     #[allow(dead_code)]
     stack: Box<[u8]>,
 }
@@ -188,6 +191,7 @@ pub fn init() {
             cr3: 0,
             space: None,
             wake_tick: 0,
+            cursor_pos: crate::cursor::NO_POSITION,
             stack,
         });
         CURRENT.store(0, Ordering::SeqCst);
@@ -205,13 +209,29 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::SeqCst)
 }
 
+/// Захват VFS_LOCK с уступкой CPU. Спин-лок нереентерабельный, а при
+/// вытесняющей многозадачности крутящийся на локе поток способен навсегда
+/// отобрать процессор у держателя лока (тикер не передаст ему управление,
+/// пока "крутильщик" Ready). hlt() спит до следующего тика - планировщик
+/// ротируется, держатель завершает критическую секцию, лок освобождается.
+fn vfs_lock_yield() -> SpinlockGuard<'static, ()> {
+    loop {
+        if let Some(g) = VFS_LOCK.try_lock() {
+            return g;
+        }
+        // hlt до следующего тика: планировщик ротируется, держатель лока
+        // завершает критическую секцию. ВЫЗЫВАТЬ ТОЛЬКО С IF=1.
+        x86_64::instructions::hlt();
+    }
+}
+
 pub fn vfs_lock() -> SpinlockGuard<'static, ()> {
-    VFS_LOCK.lock()
+    vfs_lock_yield()
 }
 
 /// Выполняет `f` с доступом к VFS (внутри глобального лока).
 pub fn with_vfs<R>(f: impl FnOnce(&mut Vfs) -> R) -> R {
-    let _g = VFS_LOCK.lock();
+    let _g = vfs_lock_yield();
     let ptr = VFS_PTR.load(Ordering::SeqCst);
     let vfs = unsafe { &mut *(ptr as *mut Vfs) };
     f(vfs)
@@ -222,12 +242,24 @@ pub fn with_vfs<R>(f: impl FnOnce(&mut Vfs) -> R) -> R {
 /// Внимание: аллокации выполняются при включённых прерываниях (иначе дедлок
 /// с аллокатором, если фоновая задача была вытеснена посреди аллокации).
 pub fn spawn(name: &str, entry: Box<dyn FnOnce()>) -> Option<usize> {
+    // Создание задачи атомарно против тиков: гонки спавна с вытеснением
+    // приводили к порче контекстов (см. bigtodo, zero-writer).
+    SCHED_FROZEN.fetch_add(1, Ordering::SeqCst);
+    let r = spawn_inner(name, entry);
+    SCHED_FROZEN.fetch_sub(1, Ordering::SeqCst);
+    r
+}
+
+fn spawn_inner(name: &str, entry: Box<dyn FnOnce()>) -> Option<usize> {
     let idx = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         (1..MAX_TASKS).find(|&i| TASKS[i].is_none())
     })?;
 
     let name_owned = String::from(name);
     let mut stack = vec![0u8; STACK_SIZE].into_boxed_slice();
+    // Яд-маркер 0xBE: если к первому переключению в стеке появятся НУЛИ
+    // там, где должен быть яд или контекст - память затёрта чужой записью.
+    stack.fill(0xBE);
     let kernel_stack_top = stack.as_ptr() as usize + STACK_SIZE;
     let raw_entry = Box::into_raw(Box::new(TaskClosure(Some(entry)))) as usize;
 
@@ -262,6 +294,7 @@ pub fn spawn(name: &str, entry: Box<dyn FnOnce()>) -> Option<usize> {
         cr3: 0,
         space: None,
         wake_tick: 0,
+        cursor_pos: crate::cursor::NO_POSITION,
         stack,
     };
 
@@ -274,16 +307,35 @@ pub fn spawn(name: &str, entry: Box<dyn FnOnce()>) -> Option<usize> {
     })
 }
 
-/// Запускает .bin-программу в ring 3 (user mode) в собственном адресном
-/// пространстве `space`. Первый вызов — `entry_rip` (код маппится ядром на
-/// `paging::USER_START`), стек — `user_rsp`. `rdi_val` кладётся в rdi при
-/// входе (foreground передаёт vga_offset, фону — 0).
+/// Запускает .bin/ELF-программу в ring 3 (user mode) в собственном адресном
+/// пространстве `space`. Первый вызов — `entry_rip` (для ELF это e_entry,
+/// для legacy .bin — paging::USER_START), стек — `user_rsp`. При входе
+/// rdi/rsi/rdx получают `rdi_val`/`rsi_val`/`rdx_val`: ELF-путь передаёт
+/// argc/&argv/vga_offset, legacy-путь — vga_offset/0/0.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_user(
     name: &str,
     space: AddressSpace,
     entry_rip: u64,
     user_rsp: u64,
     rdi_val: u64,
+    rsi_val: u64,
+    rdx_val: u64,
+) -> Option<usize> {
+    SCHED_FROZEN.fetch_add(1, Ordering::SeqCst);
+    let r = spawn_user_inner(name, space, entry_rip, user_rsp, rdi_val, rsi_val, rdx_val);
+    SCHED_FROZEN.fetch_sub(1, Ordering::SeqCst);
+    r
+}
+
+fn spawn_user_inner(
+    name: &str,
+    space: AddressSpace,
+    entry_rip: u64,
+    user_rsp: u64,
+    rdi_val: u64,
+    rsi_val: u64,
+    rdx_val: u64,
 ) -> Option<usize> {
     let idx = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         (1..MAX_TASKS).find(|&i| TASKS[i].is_none())
@@ -292,6 +344,8 @@ pub fn spawn_user(
     let name_owned = String::from(name);
     let root = space.root_frame().start_address().as_u64();
     let mut stack = vec![0u8; STACK_SIZE].into_boxed_slice();
+    // Яд-маркер 0xBE (см. spawn_inner).
+    stack.fill(0xBE);
     let kernel_stack_top = stack.as_ptr() as usize + STACK_SIZE;
 
     {
@@ -303,14 +357,24 @@ pub fn spawn_user(
             unsafe { p.add(k).write(0); }
         }
         unsafe {
-            p.add(10).write(rdi_val);             // rdi = vga_offset (0 для фона)
-            p.add(15).write(entry_rip);           // rip = USER_START
+            p.add(10).write(rdi_val);             // rdi = argc | vga_offset
+            p.add(11).write(rsi_val);             // rsi = &argv[0] | 0
+            p.add(12).write(rdx_val);             // rdx = vga_offset | 0
+            p.add(15).write(entry_rip);           // rip = e_entry | USER_START
             p.add(16).write(USER_CS as u64);      // cs (ring 3)
             p.add(17).write(USER_RFLAGS);         // rflags: IF=1, IOPL=3
-            p.add(18).write(user_rsp - 8);        // rsp: 8 байт под адрес exit-стаба
+            p.add(18).write(user_rsp);            // rsp: setup_user_stack вернул
+                                                  // rsp, указывающий на слот
+                                                  // exit-стаба (ret из _start
+                                                  // уходит туда)
             p.add(19).write(USER_DS as u64);      // ss (ring 3)
         }
         debug_assert!(saved_rsp >= base);
+        crate::vga::serial_write_atomic("[spawn-frame] rsp=");
+        crate::vga::serial_u64(saved_rsp as u64);
+        crate::vga::serial_write_atomic(" name=");
+        for &c in name.as_bytes().iter().take(8) { crate::vga::serial_putchar(c); }
+        crate::vga::serial_write_atomic("\n");
         let _ = base;
     }
 
@@ -324,6 +388,7 @@ pub fn spawn_user(
         cr3: root,
         space: Some(space),
         wake_tick: 0,
+        cursor_pos: crate::cursor::NO_POSITION,
         stack,
     };
 
@@ -355,6 +420,13 @@ pub fn slot_free() -> bool {
 /// не дедлокнуть аллокатор, если другая задача была вытеснена посреди
 /// аллокации.
 pub fn kill(pid: usize) -> bool {
+    SCHED_FROZEN.fetch_add(1, Ordering::SeqCst);
+    let r = kill_inner(pid);
+    SCHED_FROZEN.fetch_sub(1, Ordering::SeqCst);
+    r
+}
+
+fn kill_inner(pid: usize) -> bool {
     let removed = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         if pid == 0 || pid >= MAX_TASKS {
             return None;
@@ -373,6 +445,12 @@ pub fn kill(pid: usize) -> bool {
 /// Забирает завершившуюся задачу у планировщика: освобождает kernel-стек и
 /// адресное пространство. Вызывается шеллом после `wait_for`.
 pub fn reap(pid: usize) {
+    SCHED_FROZEN.fetch_add(1, Ordering::SeqCst);
+    reap_inner(pid);
+    SCHED_FROZEN.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn reap_inner(pid: usize) {
     let removed = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         if pid == 0 || pid >= MAX_TASKS {
             return None;
@@ -554,10 +632,27 @@ pub fn current_name() -> [u8; 32] {
     buf
 }
 
+/// Заморозка планирования: критические секции ядра (фиксация WAL), которым
+/// нужен монопольный доступ к данным задач/кучи БЕЗ переключения контекста,
+/// но БЕЗ запрета прерываний (чтобы клавиатура/таймер продолжали работать).
+pub static SCHED_FROZEN: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 /// Вызывается из asm-обработчика таймера: round-robin выбор следующей задачи.
 #[no_mangle]
 extern "C" fn schedule() -> usize {
-    TICKS.fetch_add(1, Ordering::SeqCst);
+    let t0 = TICKS.fetch_add(1, Ordering::SeqCst);
+    // Планирование заморожено: вернуть контекст ТЕКУЩЕЙ задачи (уже
+    // сохранённый в CURRENT_SAVE_SLOT) без выбора другой.
+    if SCHED_FROZEN.load(Ordering::SeqCst) != 0 {
+        unsafe {
+            let cur = CURRENT.load(Ordering::SeqCst);
+            if let Some(t) = TASKS[cur].as_mut() {
+                t.ticks += 1;
+            }
+            return TASKS[cur].as_ref().unwrap().saved_rsp;
+        }
+    }
     unsafe {
         let cur = CURRENT.load(Ordering::SeqCst);
         let ticks = TICKS.load(Ordering::SeqCst);
@@ -592,13 +687,57 @@ extern "C" fn schedule() -> usize {
             }
         }
 
+        // Сохраняем аппаратный курсор уходящей задачи, восстанавливаем —
+        // у входящей (в switch_to_task). Курсором владеют только задачи,
+        // работающие с дисплеем: шелл (pid 0) и user-задачи (cr3 != 0).
+        // Ядрёные демоны (ticker/init/clock-служба и т.п.) экран не трогают —
+        // для них save/restore только перезаписал бы CRTC устаревшим значением.
+        if next != cur {
+            let cur_owns_display = cur == 0
+                || TASKS[cur]
+                    .as_ref()
+                    .map_or(false, |t| t.cr3 != 0);
+            if cur_owns_display {
+                if let Some(t) = TASKS[cur].as_mut() {
+                    t.cursor_pos = crate::cursor::get_position();
+                }
+            }
+        }
+
         CURRENT.store(next, Ordering::SeqCst);
         let t = TASKS[next].as_mut().unwrap();
+        // ДЕТЕКТОР zero-writer: у готовой задачи rip-слот контекста обязан
+        // быть ненулевым, а яд 0xBE сразу ПОД контекстом - не тронутым.
+        // Нули там = чужая запись. Печатаем адрес жертвы и встаём на int3:
+        // под gdb это останов с полным контекстом, без gdb - видный сбой.
+        {
+            let base = t.stack.as_ptr() as usize;
+            let rsp = t.saved_rsp;
+            if rsp >= base && rsp + 160 <= base + t.stack.len() {
+                unsafe {
+                    let rip = *((rsp + 120) as *const u64);
+                    let poison = *((rsp - 8) as *const u64);
+                    if rip == 0 || poison == 0 {
+                        crate::vga::serial_write_atomic("[ZERO-WRITER] pid=");
+                        crate::vga::serial_u64(next as u64);
+                        crate::vga::serial_write_atomic(" rsp=");
+                        crate::vga::serial_u64(rsp as u64);
+                        crate::vga::serial_write_atomic(" rip=");
+                        crate::vga::serial_u64(rip);
+                        crate::vga::serial_write_atomic(" poison=");
+                        crate::vga::serial_u64(poison);
+                        crate::vga::serial_write_atomic("\n");
+                        t.state = TaskState::Running;
+                        core::arch::asm!("int3", options(nomem));
+                    }
+                }
+            }
+        }
         t.state = TaskState::Running;
         t.ticks += ticks - t.last_tick;
         t.last_tick = ticks;
         CURRENT_SAVE_SLOT = core::ptr::addr_of_mut!(t.saved_rsp) as usize;
-        switch_to_task(t);
+        switch_to_task(t, next);
         t.saved_rsp
     }
 }
@@ -611,7 +750,7 @@ extern "C" fn schedule() -> usize {
 /// Дальнейшие инструкции asm (pop-регистров, iretq) обращаются только к
 /// kernel-стеку, который зеркалируется в любом адресном пространстве, поэтому
 /// смена CR3 здесь безопасна.
-fn switch_to_task(t: &Task) {
+fn switch_to_task(t: &Task, pid: usize) {
     unsafe {
         let root = if t.cr3 != 0 {
             t.cr3
@@ -625,6 +764,10 @@ fn switch_to_task(t: &Task) {
             crate::paging::switch_to_root(frame);
         }
         crate::interrupts::set_tss_rsp0(t.kernel_stack_top as u64);
+    }
+    // Restore только для владельцев дисплея (см. save в schedule).
+    if (pid == 0 || t.cr3 != 0) && t.cursor_pos != crate::cursor::NO_POSITION {
+        crate::cursor::set_raw(t.cursor_pos);
     }
 }
 

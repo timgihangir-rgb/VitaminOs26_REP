@@ -11,9 +11,11 @@ static int next_food(int *fx, int *fy, const int *sx, const int *sy, int len,
                      int rows, int cols);
 static unsigned int rand_state;
 
-#define STEP_MS 100
+#define STEP_MS 180
 
-void _start(unsigned int vga_offset) {
+void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
+    (void)argc;
+    (void)argv;
     rand_state = vga_offset + 12345;
 
     clear_screen();
@@ -232,12 +234,23 @@ static void draw_score(int score) {
     draw_str(1, 63, buf, 0x0F);
 }
 
+/* Ввод через ABI ядра (int 0x80): SYS_KBHIT=6 / SYS_KBREAD=7. Трамплины
+ * ставит progabi по фиксированным адресам пользовательского стека-страницы.
+ * Читать порты 0x60/0x64 напрямую нельзя: их же обслуживает IRQ1-обработчик
+ * ядра, и он забирает сканкоды первым - игра остаётся без управления, а
+ * накопленное в буфере ядра вываливается в шелл после выхода. */
+#define KBHIT_PTR   0x7828
+#define KBREAD_PTR  0x7830
+
+typedef int (*kbhit_fn)(void);
+typedef unsigned int (*kbread_fn)(void);
+
 static int kb_hit(void) {
-    return inb(0x64) & 1;
+    return ((*(volatile kbhit_fn *)KBHIT_PTR)());
 }
 
 static unsigned char kb_read(void) {
-    return inb(0x60);
+    return (unsigned char)((*(volatile kbread_fn *)KBREAD_PTR)());
 }
 
 static int next_food(int *fx, int *fy, const int *sx, const int *sy, int len,

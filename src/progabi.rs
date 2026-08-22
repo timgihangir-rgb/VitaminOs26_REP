@@ -13,6 +13,8 @@ pub const TICKS_PTR: usize = 0x7800;pub const HLT_PTR: usize = 0x7808;
 pub const VFS_WRITE_PTR: usize = 0x7810;
 pub const VFS_READ_PTR: usize = 0x7818;
 pub const SLEEP_PTR: usize = 0x7820;
+pub const KBHIT_PTR: usize = 0x7828;
+pub const KBREAD_PTR: usize = 0x7830;
 
 pub const EXIT_STUB: usize = 0x7100;
 pub const TICKS_STUB: usize = 0x7110;
@@ -20,6 +22,8 @@ pub const HLT_STUB: usize = 0x7120;
 pub const VFS_WRITE_STUB: usize = 0x7130;
 pub const VFS_READ_STUB: usize = 0x7140;
 pub const SLEEP_STUB: usize = 0x7150;
+pub const KBHIT_STUB: usize = 0x7160;
+pub const KBREAD_STUB: usize = 0x7168;
 
 const SYS_TICKS: usize = 0;
 const SYS_HLT: usize = 1;
@@ -27,6 +31,8 @@ const SYS_VFS_WRITE: usize = 2;
 const SYS_VFS_READ: usize = 3;
 const SYS_EXIT: usize = 4;
 const SYS_SLEEP: usize = 5;
+const SYS_KBHIT: usize = 6;
+const SYS_KBREAD: usize = 7;
 
 fn store_pointer(at: usize, f: usize) {
     unsafe {
@@ -62,10 +68,14 @@ pub fn install() {
     write_stub(VFS_WRITE_STUB, SYS_VFS_WRITE, true);
     write_stub(VFS_READ_STUB, SYS_VFS_READ, true);
     write_stub(SLEEP_STUB, SYS_SLEEP, true);
+    write_stub(KBHIT_STUB, SYS_KBHIT, true);
+    write_stub(KBREAD_STUB, SYS_KBREAD, true);
 
     store_pointer(TICKS_PTR, TICKS_STUB);
     store_pointer(HLT_PTR, HLT_STUB);
     store_pointer(VFS_WRITE_PTR, VFS_WRITE_STUB);
     store_pointer(VFS_READ_PTR, VFS_READ_STUB);
     store_pointer(SLEEP_PTR, SLEEP_STUB);
+    store_pointer(KBHIT_PTR, KBHIT_STUB);
+    store_pointer(KBREAD_PTR, KBREAD_STUB);
 }

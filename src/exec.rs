@@ -15,28 +15,48 @@ fn dbg(msg: &str) {
     }
 }
 
-/// Готовит адресное пространство .bin-программы и запускает её в ring 3:
-/// маппит код на `paging::USER_START`, выделяет user-стек и создаёт задачу.
-/// `rdi_val` передаётся в rdi при первом входе (vga_offset для foreground).
-/// Возвращает PID или None (нет свободного слота / кончилась память).
-pub fn launch_user(name: &str, data: &[u8], rdi_val: u64) -> Option<usize> {
+/// Готовит адресное пространство программы и запускает её в ring 3.
+/// ELF-файл (магия \x7fELF) грузится сегментами PT_LOAD по e_entry; иначе
+/// данные считаются legacy flat .bin и копируются целиком на USER_START.
+///
+/// Регистры при входе:
+///   ELF : rdi=argc, rsi=&argv[0], rdx=vga_offset
+///   .bin: rdi=vga_offset, rsi=rdx=0 (старая конвенция)
+///
+/// Возвращает PID или None (нет свободного слота / битый образ / нет памяти).
+pub fn launch_user(name: &str, data: &[u8], argv: &[&str], vga_offset: u64) -> Option<usize> {
     if !crate::scheduler::slot_free() {
         return None;
     }
     let mut space = crate::paging::create_address_space()?;
-    if crate::paging::map_user_image(&mut space, data).is_err()
-        || crate::paging::map_user_stack(&mut space).is_err()
-    {
+    let elf = crate::elf::is_elf(data);
+    let entry = if elf {
+        match crate::elf::load_elf(&mut space, data) {
+            Ok(e) => e,
+            Err(_) => {
+                crate::paging::destroy_address_space(&mut space);
+                return None;
+            }
+        }
+    } else if crate::paging::map_user_image(&mut space, data).is_err() {
         crate::paging::destroy_address_space(&mut space);
         return None;
-    }
-    crate::scheduler::spawn_user(
-        name,
-        space,
-        crate::paging::USER_START,
-        crate::paging::USER_STACK_TOP,
-        rdi_val,
-    )
+    } else {
+        crate::paging::USER_START
+    };
+    let stack = match crate::paging::setup_user_stack(&mut space, argv) {
+        Ok(s) => s,
+        Err(_) => {
+            crate::paging::destroy_address_space(&mut space);
+            return None;
+        }
+    };
+    let (rdi, rsi, rdx) = if elf {
+        (stack.argc, stack.argv, vga_offset)
+    } else {
+        (vga_offset, 0, 0)
+    };
+    crate::scheduler::spawn_user(name, space, entry, stack.rsp, rdi, rsi, rdx)
 }
 
 /// Запускает .bin-программу в foreground (ring 3, собственное адресное
@@ -121,10 +141,21 @@ pub fn run_program(writer: &mut Writer, args: &[&str], mem: sysinfo::MemInfo) ->
             core::ptr::write_volatile(0x7090 as *mut i32, 0);
         }
 
+        // Клавиатура: сбрасываем буфер сканкодов, чтобы foreground-программа не
+        // получила остатки (break-коды Enter и т.п.) от командной строки шелла.
+        crate::keyboard::flush();
+
         crate::progabi::install();
 
+        // argv[0] — полный путь, дальше — аргументы командной строки.
+        let mut argv: alloc::vec::Vec<&str> = alloc::vec::Vec::with_capacity(args.len());
+        argv.push(binpath.as_str());
+        for a in &args[1..] {
+            argv.push(a);
+        }
+
         let vga_offset = writer.vga_offset() as u64;
-        let pid = match launch_user(name, &data, vga_offset) {
+        let pid = match launch_user(name, &data, &argv, vga_offset) {
             Some(pid) => pid,
             None => {
                 writer.write_string("exec: cannot load (no free task slot or out of memory)\n");

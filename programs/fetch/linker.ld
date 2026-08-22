@@ -2,7 +2,8 @@ ENTRY(_start)
 
 SECTIONS
 {
-    . = 0;
+    /* Ядро грузит ELF-сегменты по их p_vaddr; user-область начинается с 4 MiB. */
+    . = 0x400000;
     .text : {
         KEEP(*(.text._start))
         *(.text)

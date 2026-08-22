@@ -9,6 +9,15 @@
 #define FILENAME   ((volatile char *)0x600C)
 #define FILEDATA   ((volatile char *)0x608C)
 
+#define KBHIT_PTR   0x7828
+#define KBREAD_PTR  0x7830
+
+typedef int (*kbhit_fn)(void);
+typedef unsigned int (*kbread_fn)(void);
+
+#define abi_kbhit()  ((*(volatile kbhit_fn *)KBHIT_PTR)())
+#define abi_kbread() ((*(volatile kbread_fn *)KBREAD_PTR)())
+
 static int nlines;
 static int line_off[MAX_LINES];
 static int line_len[MAX_LINES];
@@ -17,7 +26,6 @@ static int scroll;
 static int modified;
 static int ctrl_pressed;
 
-static unsigned char inb(unsigned short port);
 static void outb(unsigned short port, unsigned char val);
 static void set_cursor(int row, int col);
 static void clear_screen(void);
@@ -31,7 +39,9 @@ static void ensure_visible(void);
 static unsigned char kb_read(void);
 static int kb_hit(void);
 
-void _start(unsigned int vga_offset) {
+void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
+    (void)argc;
+    (void)argv;
     (void)vga_offset;
     int i;
 
@@ -292,6 +302,11 @@ static void rebuild(void) {
         line_len[0] = 0;
         nlines = 1;
     }
+    if (FILE_SIZE > 0 && FILEDATA[FILE_SIZE - 1] == '\n' && nlines < MAX_LINES) {
+        line_off[nlines] = FILE_SIZE;
+        line_len[nlines] = 0;
+        nlines++;
+    }
 }
 
 static void delete_at(int pos) {
@@ -311,12 +326,6 @@ static void ensure_visible(void) {
     int max_col = line_len[cur_line];
     if (cur_col > max_col) cur_col = max_col;
     if (cur_col < 0) cur_col = 0;
-}
-
-static unsigned char inb(unsigned short port) {
-    unsigned char result;
-    __asm__ volatile("inb %1, %0" : "=a"(result) : "Nd"(port));
-    return result;
 }
 
 static void outb(unsigned short port, unsigned char val) {
@@ -377,9 +386,9 @@ static void fill_row(int row, unsigned char attr) {
 }
 
 static int kb_hit(void) {
-    return inb(0x64) & 1;
+    return abi_kbhit();
 }
 
 static unsigned char kb_read(void) {
-    return inb(0x60);
+    return (unsigned char)abi_kbread();
 }

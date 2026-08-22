@@ -1,29 +1,20 @@
 // src/vfs.rs
 //
-// ПЕРЕПИСАНО ЦЕЛИКОМ. Старая версия хранила дерево как Vec<FsEntry> с полем
-// `parent: *mut FsEntry` - "сырым" указателем на родителя. Проблема: как
-// только `Vec::push` вызывает реаллокацию (а это происходит при почти любом
-// mkdir/touch), ВСЕ элементы этого Vec физически переезжают в новую область
-// памяти - и все указатели, которые куда-то в них указывали (в т.ч. parent
-// указатели детей и `current`, т.е. текущая директория), становятся
-// висячими (dangling). Плюс в Vfs::new() был classic self-referential-struct
-// баг: `root.parent = &mut root` брало адрес локальной переменной ДО того,
-// как эта переменная переехала (была перемещена) в поле структуры.
+// VFS поверх inode-ФС VITAFS (см. docs/fs.md и src/vitafs.rs). Фаза 3.
 //
-// Итог - неопределённое поведение при обычной работе с файлами: иногда
-// файлы "не создавались", иногда падало, воспроизвести стабильно было
-// невозможно - именно то, что вы описали.
+// Старая реализация держала всё дерево в памяти (арена Vec<FsEntry>) и целиком
+// сериализовала его на диск слепком. Теперь источник истины - диск: каталоги и
+// файлы живут в инодах, операции идут через bcache, а структура хранит только
+// текущий каталог (канонический абсолютный путь строкой; инод для cwd не
+// годится - у нас нет родительских указателей, путь восстанавливать нечем).
 //
-// Новая версия хранит все узлы плоско в `Vec<FsEntry>` (арену) и ссылается
-// на них через usize-индексы вместо указателей. Индексы НЕ инвалидируются
-// реаллокацией Vec (в отличие от указателей/ссылок) - это и есть исправление.
-// rmdir/rm не сдвигают чужие индексы: они просто убирают ссылку на ребёнка
-// из списка `children` родителя, а сам узел остаётся в арене "осиротевшим".
-// Для игрушечной in-memory ФС это нормальная и безопасная цена простоты.
+// cat() возвращает владеющий Vec<u8> - читать с диска "по ссылке" нельзя.
 
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+
+use crate::vitafs;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EntryType {
@@ -31,470 +22,220 @@ pub enum EntryType {
     Directory,
 }
 
-#[derive(Debug, Clone)]
-struct FsEntry {
-    name: String,
-    entry_type: EntryType,
-    content: Vec<u8>,
-    parent: Option<usize>,
-    children: Vec<usize>,
-}
-
-impl FsEntry {
-    fn new_file(name: &str, parent: usize) -> Self {
-        Self {
-            name: name.to_string(),
-            entry_type: EntryType::File,
-            content: Vec::new(),
-            parent: Some(parent),
-            children: Vec::new(),
-        }
-    }
-
-    fn new_dir(name: &str, parent: Option<usize>) -> Self {
-        Self {
-            name: name.to_string(),
-            entry_type: EntryType::Directory,
-            content: Vec::new(),
-            parent,
-            children: Vec::new(),
-        }
-    }
-}
-
-const ROOT: usize = 0;
-
 pub struct Vfs {
-    nodes: Vec<FsEntry>,
-    current: usize,
+    cwd: String,
 }
 
 impl Vfs {
     pub fn new() -> Self {
-        let root = FsEntry::new_dir("/", None);
         Vfs {
-            nodes: alloc::vec![root],
-            current: ROOT,
+            cwd: "/".to_string(),
         }
     }
 
-    pub fn init(&mut self) {
-        let _ = self.mkdir("/bin");
-        let _ = self.mkdir("/etc");
-        let _ = self.mkdir("/home");
-        let _ = self.mkdir("/tmp");
-        let _ = self.cd("/home");
-        let _ = self.touch("/etc/passwd");
-        let _ = self.touch("/etc/hostname");
-        let _ = self.write_file("/etc/hostname", b"VitaminOS26\n");
-
-        self.install_bin();
-    }
-
-    /// Записывает встроенные программы ядра в /bin (перезаписывая одноимённые
-    /// файлы). Используется при создании начальной ФС и после загрузки слепка
-    /// с диска, чтобы бинарники всегда были актуальными.
-    pub fn install_bin(&mut self) {
-        for prog in crate::programs::PROGRAMS {
-            let path = alloc::format!("/bin/{}", prog.name);
-            let _ = self.write_file(&path, prog.data);
-        }
-    }
-
-    /// Сериализует живое дерево (только узлы, достижимые из корня) в бинарный
-    /// буфер для записи на диск.
-    ///
-    /// Обход — BFS от корня: родитель всегда сериализуется раньше ребёнка,
-    /// поэтому порядок не зависит от индексов арены (после mv они нарушаются).
-    /// Вместо индексов арены у каждого узла хранится серийный индекс родителя.
-    ///
-    /// Формат: u32 count, затем на каждый узел:
-    ///   u32 len_имени | имя | u8 тип (0 файл, 1 каталог) | u32 серийный_родителя
-    ///   (0xFFFFFFFF у корня) | u32 len_контента | контент.
-    pub fn serialize(&self) -> Vec<u8> {
-        let mut frontier = Vec::new();
-        frontier.push(ROOT);
-        let mut order = Vec::new();
-        let mut i = 0;
-        while i < frontier.len() {
-            let idx = frontier[i];
-            i += 1;
-            order.push(idx);
-            for &c in &self.nodes[idx].children {
-                frontier.push(c);
-            }
-        }
-
-        let mut serial = alloc::vec![0usize; self.nodes.len()];
-        for (pos, &idx) in order.iter().enumerate() {
-            serial[idx] = pos;
-        }
-
-        let mut out = Vec::new();
-        out.extend_from_slice(&(order.len() as u32).to_le_bytes());
-        for &idx in &order {
-            let n = &self.nodes[idx];
-            out.extend_from_slice(&(n.name.len() as u32).to_le_bytes());
-            out.extend_from_slice(n.name.as_bytes());
-            out.push(match n.entry_type {
-                EntryType::File => 0,
-                EntryType::Directory => 1,
-            });
-            let parent_serial = match n.parent {
-                Some(p) => serial[p] as u32,
-                None => 0xFFFF_FFFF,
-            };
-            out.extend_from_slice(&parent_serial.to_le_bytes());
-            out.extend_from_slice(&(n.content.len() as u32).to_le_bytes());
-            out.extend_from_slice(&n.content);
-        }
-        out
-    }
-
-    /// Полностью пересобирает дерево из слепка, полученного с диска.
-    /// Возвращает false при повреждённых данных (тогда дерево оставляется
-    /// в исходном состоянии — Vfs::new).
-    pub fn rebuild_from(&mut self, data: &[u8]) -> bool {
-        let mut pos = 0usize;
-        let take_u32 = |data: &[u8], pos: &mut usize| -> Option<u32> {
-            if *pos + 4 > data.len() {
-                return None;
-            }
-            let v = u32::from_le_bytes(data[*pos..*pos + 4].try_into().ok()?);
-            *pos += 4;
-            Some(v)
-        };
-
-        let count = match take_u32(data, &mut pos) {
-            Some(c) => c as usize,
-            None => return false,
-        };
-        if count == 0 || count > 1_000_000 {
-            return false;
-        }
-
-        self.nodes.clear();
-        self.nodes.push(FsEntry::new_dir("/", None));
-        self.current = ROOT;
-        let mut serial_to_node = Vec::with_capacity(count);
-        serial_to_node.push(ROOT);
-
-        for _ in 0..count {
-            let name_len = match take_u32(data, &mut pos) {
-                Some(l) => l as usize,
-                None => return false,
-            };
-            if pos + name_len > data.len() {
-                return false;
-            }
-            let name = match core::str::from_utf8(&data[pos..pos + name_len]) {
-                Ok(s) => s.to_string(),
-                Err(_) => return false,
-            };
-            pos += name_len;
-            if pos >= data.len() {
-                return false;
-            }
-            let etype = data[pos];
-            pos += 1;
-            let parent_serial = match take_u32(data, &mut pos) {
-                Some(p) => p as usize,
-                None => return false,
-            };
-            let is_root = parent_serial == 0xFFFF_FFFF;
-            if !is_root && parent_serial >= serial_to_node.len() {
-                return false;
-            }
-            let content_len = match take_u32(data, &mut pos) {
-                Some(l) => l as usize,
-                None => return false,
-            };
-            if pos + content_len > data.len() {
-                return false;
-            }
-            let content = data[pos..pos + content_len].to_vec();
-            pos += content_len;
-
-            // Корень уже находится в арене под индексом ROOT - узел из слепка
-            // не создаём, иначе получится два корня и все индексы съедут.
-            if is_root {
-                continue;
-            }
-
-            let parent = serial_to_node[parent_serial];
-            if self.nodes[parent]
-                .children
-                .iter()
-                .any(|&c| self.nodes[c].name == name)
-            {
-                return false;
-            }
-
-            let node_idx = match etype {
-                0 => {
-                    let mut f = FsEntry::new_file(&name, parent);
-                    f.content = content;
-                    let idx = self.nodes.len();
-                    self.nodes.push(f);
-                    idx
-                }
-                1 => {
-                    let idx = self.nodes.len();
-                    self.nodes.push(FsEntry::new_dir(&name, Some(parent)));
-                    idx
-                }
-                _ => return false,
-            };
-            self.nodes[parent].children.push(node_idx);
-            serial_to_node.push(node_idx);
-        }
-
-        self.current = ROOT;
-        true
-    }
-
-    /// Резолвит путь в индекс узла арены, начиная от `start` (для
-    /// относительных путей) либо от корня (для абсолютных, начинающихся с '/').
-    ///
-    /// Важно: директорией обязана быть только НЕПОСЛЕДНЯЯ часть пути.
-    /// Последняя часть может оказаться и файлом - раньше это было не так,
-    /// из-за чего cat() на любой существующий файл ошибочно возвращал None.
-    fn resolve_from(&self, start: usize, path: &str) -> Option<usize> {
+    /// Нормализует путь в список канонических компонент (без ".", "..", пустых).
+    /// Относительные пути отсчитываются от cwd. None - если ".." вышел выше корня.
+    fn canon_parts(&self, path: &str) -> Option<Vec<String>> {
         let path = path.trim();
-        let mut idx = if path.starts_with('/') { ROOT } else { start };
-        if path.is_empty() {
-            return Some(idx);
+        let mut out: Vec<String> = Vec::new();
+        if !path.starts_with('/') {
+            // cwd всегда каноничен ("/a/b"), так что просто добавляем его части.
+            let base = self.cwd.trim_start_matches('/');
+            if !base.is_empty() {
+                for p in base.split('/') {
+                    out.push(p.to_string());
+                }
+            }
         }
-
-        for part in path.split('/').filter(|s| !s.is_empty()) {
-            if part == "." {
-                continue;
+        for p in path.split('/') {
+            match p {
+                "" | "." => {}
+                ".." => {
+                    out.pop()?;
+                }
+                name => {
+                    if name.len() > vitafs::DIRENT_NAME_MAX {
+                        return None;
+                    }
+                    out.push(name.to_string());
+                }
             }
-            if part == ".." {
-                idx = self.nodes[idx].parent.unwrap_or(ROOT);
-                continue;
-            }
-            if self.nodes[idx].entry_type != EntryType::Directory {
-                return None;
-            }
-            idx = self.nodes[idx]
-                .children
-                .iter()
-                .copied()
-                .find(|&c| self.nodes[c].name == part)?;
         }
-        Some(idx)
+        Some(out)
     }
 
-    pub fn resolve(&self, path: &str) -> Option<usize> {
-        self.resolve_from(self.current, path)
+    fn parts_to_path(parts: &[String]) -> String {
+        if parts.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{}", parts.join("/"))
+        }
     }
 
-    fn node_path(&self, idx: usize) -> String {
-        if idx == ROOT {
-            return "/".to_string();
+    /// Резолвит канонические компоненты в инод, попутно возвращая иноды всех
+    /// промежуточных каталогов (включая корень и финальный узел).
+    fn walk(parts: &[String]) -> Option<(u32, Vec<u32>)> {
+        let sb = vitafs::mounted_sb()?;
+        let mut chain = Vec::with_capacity(parts.len() + 1);
+        chain.push(vitafs::ROOT_INODE);
+        let mut cur = vitafs::ROOT_INODE;
+        for part in parts {
+            cur = vitafs::dir_lookup(sb, cur, part)?;
+            chain.push(cur);
         }
-        let mut parts = Vec::new();
-        let mut i = idx;
-        while i != ROOT {
-            parts.push(self.nodes[i].name.clone());
-            i = self.nodes[i].parent.unwrap_or(ROOT);
-        }
-        parts.reverse();
-        format!("/{}", parts.join("/"))
+        Some((cur, chain))
     }
 
-    fn current_path(&self) -> String {
-        self.node_path(self.current)
+    fn resolve(&self, path: &str) -> Option<u32> {
+        Self::walk(&self.canon_parts(path)?).map(|(ino, _)| ino)
+    }
+
+    /// (инод родительского каталога, имя последней компоненты).
+    fn split_parent(&self, path: &str) -> Option<(u32, String)> {
+        let parts = self.canon_parts(path)?;
+        let name = parts.last()?.clone();
+        let parent_parts = &parts[..parts.len() - 1];
+        let (parent, _) = Self::walk(parent_parts)?;
+        Some((parent, name))
     }
 
     pub fn pwd(&self) -> String {
-        self.current_path()
+        self.cwd.clone()
     }
 
-    /// True, если `idx` находится внутри поддерева `ancestor`
-    /// (ancestor != ROOT). Используется для запрета cp/mv директории в себя.
-    fn is_descendant(&self, mut idx: usize, ancestor: usize) -> bool {
-        while idx != ROOT {
-            if idx == ancestor {
-                return true;
+    pub fn ls(&self, path: &str) -> Option<Vec<(String, EntryType, usize)>> {
+        let sb = vitafs::mounted_sb()?;
+        let ino = self.resolve(path)?;
+        let node = vitafs::iget(sb, ino)?;
+        if node.itype != vitafs::TYPE_DIR {
+            return None;
+        }
+        let entries = vitafs::dir_readdir(sb, ino)?;
+        let mut out = Vec::with_capacity(entries.len());
+        for e in entries {
+            let child = vitafs::iget(sb, e.ino)?;
+            let t = match child.itype {
+                vitafs::TYPE_DIR => EntryType::Directory,
+                _ => EntryType::File,
+            };
+            out.push((e.name, t, child.size as usize));
+        }
+        Some(out)
+    }
+
+    pub fn cd(&mut self, path: &str) -> bool {
+        let parts = match self.canon_parts(path) {
+            Some(p) => p,
+            None => return false,
+        };
+        let sb = match vitafs::mounted_sb() {
+            Some(sb) => sb,
+            None => return false,
+        };
+        if let Some((ino, _)) = Self::walk(&parts) {
+            match vitafs::iget(sb, ino) {
+                Some(n) if n.itype == vitafs::TYPE_DIR => {
+                    self.cwd = Self::parts_to_path(&parts);
+                    return true;
+                }
+                _ => {}
             }
-            idx = self.nodes[idx].parent.unwrap_or(ROOT);
         }
         false
     }
 
-    pub fn ls(&self, path: &str) -> Option<Vec<(String, EntryType, usize)>> {
-        let idx = self.resolve(path)?;
-        if self.nodes[idx].entry_type != EntryType::Directory {
-            return None;
-        }
-        Some(
-            self.nodes[idx]
-                .children
-                .iter()
-                .map(|&c| {
-                    let n = &self.nodes[c];
-                    (n.name.clone(), n.entry_type, n.content.len())
-                })
-                .collect(),
-        )
-    }
-
-    pub fn cd(&mut self, path: &str) -> bool {
-        let path = path.trim();
-        if path.is_empty() || path == "/" {
-            self.current = ROOT;
-            return true;
-        }
-        match self.resolve(path) {
-            Some(idx) if self.nodes[idx].entry_type == EntryType::Directory => {
-                self.current = idx;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Разбивает путь на (индекс родительской директории, имя последнего компонента).
-    fn split_parent(&self, path: &str) -> Option<(usize, String)> {
-        let path = path.trim();
-        if path.is_empty() {
-            return None;
-        }
-        let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        let name = (*parts.last()?).to_string();
-
-        let parent_idx = if parts.len() > 1 {
-            let parent_rel = parts[..parts.len() - 1].join("/");
-            let parent_path = if path.starts_with('/') {
-                format!("/{}", parent_rel)
-            } else {
-                parent_rel
-            };
-            self.resolve(&parent_path)?
-        } else if path.starts_with('/') {
-            ROOT
-        } else {
-            self.current
-        };
-
-        if self.nodes[parent_idx].entry_type != EntryType::Directory {
-            return None;
-        }
-        Some((parent_idx, name))
-    }
-
     pub fn mkdir(&mut self, path: &str) -> Result<(), ()> {
-        let (parent_idx, name) = self.split_parent(path).ok_or(())?;
-        if self.nodes[parent_idx]
-            .children
-            .iter()
-            .any(|&c| self.nodes[c].name == name)
-        {
-            return Err(());
-        }
-        let new_idx = self.nodes.len();
-        self.nodes.push(FsEntry::new_dir(&name, Some(parent_idx)));
-        self.nodes[parent_idx].children.push(new_idx);
-        Ok(())
+        wal_txn(|| {
+            let sb = vitafs::mounted_sb().ok_or(())?;
+            let (parent, name) = self.split_parent(path).ok_or(())?;
+            vitafs::create_node(sb, parent, &name, vitafs::TYPE_DIR).ok_or(())?;
+            Ok(())
+        })
     }
 
     pub fn rmdir(&mut self, path: &str) -> Result<(), ()> {
-        let (parent_idx, name) = self.split_parent(path).ok_or(())?;
-        let pos = self.nodes[parent_idx]
-            .children
-            .iter()
-            .position(|&c| self.nodes[c].name == name)
-            .ok_or(())?;
-        let child_idx = self.nodes[parent_idx].children[pos];
-        if self.nodes[child_idx].entry_type != EntryType::Directory {
-            return Err(());
-        }
-        if !self.nodes[child_idx].children.is_empty() {
-            return Err(());
-        }
-        self.nodes[parent_idx].children.remove(pos);
-        Ok(())
+        wal_txn(|| {
+            let sb = vitafs::mounted_sb().ok_or(())?;
+            let (parent, name) = self.split_parent(path).ok_or(())?;
+            if vitafs::destroy_node(sb, parent, &name, vitafs::TYPE_DIR) {
+                Ok(())
+            } else {
+                Err(())
+            }
+        })
     }
 
     pub fn touch(&mut self, path: &str) -> Result<(), ()> {
-        let (parent_idx, name) = self.split_parent(path).ok_or(())?;
-        if let Some(&existing) = self.nodes[parent_idx]
-            .children
-            .iter()
-            .find(|&&c| self.nodes[c].name == name)
-        {
-            // Настоящий touch не стирает содержимое существующего файла.
-            return if self.nodes[existing].entry_type == EntryType::File {
-                Ok(())
-            } else {
-                Err(())
-            };
-        }
-        let new_idx = self.nodes.len();
-        self.nodes.push(FsEntry::new_file(&name, parent_idx));
-        self.nodes[parent_idx].children.push(new_idx);
-        Ok(())
+        wal_txn(|| {
+            let sb = vitafs::mounted_sb().ok_or(())?;
+            let (parent, name) = self.split_parent(path).ok_or(())?;
+            if let Some(existing) = vitafs::dir_lookup(sb, parent, &name) {
+                // Настоящий touch не стирает содержимое существующего файла.
+                return match vitafs::iget(sb, existing) {
+                    Some(n) if n.itype == vitafs::TYPE_FILE => Ok(()),
+                    _ => Err(()),
+                };
+            }
+            vitafs::create_node(sb, parent, &name, vitafs::TYPE_FILE).ok_or(())?;
+            Ok(())
+        })
     }
 
     pub fn rm(&mut self, path: &str) -> Result<(), ()> {
-        let (parent_idx, name) = self.split_parent(path).ok_or(())?;
-        let pos = self.nodes[parent_idx]
-            .children
-            .iter()
-            .position(|&c| self.nodes[c].name == name)
-            .ok_or(())?;
-        let child_idx = self.nodes[parent_idx].children[pos];
-        if self.nodes[child_idx].entry_type != EntryType::File {
-            return Err(());
-        }
-        self.nodes[parent_idx].children.remove(pos);
-        Ok(())
-    }
-
-    pub fn cat(&self, path: &str) -> Option<&[u8]> {
-        let idx = self.resolve(path)?;
-        if self.nodes[idx].entry_type != EntryType::File {
-            return None;
-        }
-        Some(&self.nodes[idx].content)
-    }
-
-    pub fn write_file(&mut self, path: &str, data: &[u8]) -> Result<(), ()> {
-        let (parent_idx, name) = self.split_parent(path).ok_or(())?;
-        if let Some(&existing) = self.nodes[parent_idx]
-            .children
-            .iter()
-            .find(|&&c| self.nodes[c].name == name)
-        {
-            return if self.nodes[existing].entry_type == EntryType::File {
-                self.nodes[existing].content = data.to_vec();
+        wal_txn(|| {
+            let sb = vitafs::mounted_sb().ok_or(())?;
+            let (parent, name) = self.split_parent(path).ok_or(())?;
+            if vitafs::destroy_node(sb, parent, &name, vitafs::TYPE_FILE) {
                 Ok(())
             } else {
                 Err(())
-            };
-        }
-        let mut f = FsEntry::new_file(&name, parent_idx);
-        f.content = data.to_vec();
-        let new_idx = self.nodes.len();
-        self.nodes.push(f);
-        self.nodes[parent_idx].children.push(new_idx);
-        Ok(())
+            }
+        })
     }
 
-    pub fn echo(&mut self, args: &[&str]) -> Result<(), ()> {
-        if args.is_empty() {
-            return Ok(());
+    pub fn cat(&self, path: &str) -> Option<Vec<u8>> {
+        let sb = vitafs::mounted_sb()?;
+        let ino = self.resolve(path)?;
+        let node = vitafs::iget(sb, ino)?;
+        if node.itype != vitafs::TYPE_FILE {
+            return None;
         }
-        if let Some(gt_pos) = args.iter().position(|&a| a == ">") {
-            let message = args[..gt_pos].join(" ");
-            let path = *args.get(gt_pos + 1).ok_or(())?;
-            self.write_file(path, message.as_bytes())
-        } else {
-            let data = args.join(" ") + "\n";
-            self.write_file("/tmp/last_echo.txt", data.as_bytes())
-        }
+        vitafs::file_read_all(sb, ino)
+    }
+
+    pub fn write_file(&mut self, path: &str, data: &[u8]) -> Result<(), ()> {
+        wal_txn(|| {
+            let sb = vitafs::mounted_sb().ok_or(())?;
+            let (parent, name) = self.split_parent(path).ok_or(())?;
+            match vitafs::dir_lookup(sb, parent, &name) {
+                Some(existing) => {
+                    let node = vitafs::iget(sb, existing).ok_or(())?;
+                    if node.itype != vitafs::TYPE_FILE {
+                        return Err(());
+                    }
+                    if !vitafs::file_write_all(sb, existing, data) {
+                        return Err(());
+                    }
+                }
+                None => {
+                    let ino = vitafs::create_node(sb, parent, &name, vitafs::TYPE_FILE).ok_or(())?;
+                    if !vitafs::file_write_all(sb, ino, data) {
+                        // Файл-пустышка лучше потерянной записи: оставляем.
+                        return Err(());
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Дозаписывает данные в конец файла (создаёт файл, если его нет).
+    pub fn append(&mut self, path: &str, data: &[u8]) -> Result<(), ()> {
+        wal_txn(|| {
+            let mut existing = self.cat(path).unwrap_or_default();
+            existing.extend_from_slice(data);
+            self.write_file(path, &existing)
+        })
     }
 
     /// Копирует файл или директорию (рекурсивно).
@@ -503,69 +244,49 @@ impl Vfs {
     /// с сохранением своего имени. Если по целевому пути уже лежит файл —
     /// он перезаписывается (только файл поверх файла).
     pub fn copy(&mut self, src: &str, dst: &str) -> Result<(), ()> {
-        let src_idx = self.resolve(src).ok_or(())?;
-        let (mut dst_parent, mut dst_name) = self.split_parent(dst).ok_or(())?;
+        wal_txn(|| self.copy_inner(src, dst))
+    }
 
-        if let Some(dst_idx) = self.resolve(dst) {
-            if self.nodes[dst_idx].entry_type == EntryType::Directory {
-                dst_parent = dst_idx;
-                dst_name = self.nodes[src_idx].name.clone();
+    fn copy_inner(&mut self, src: &str, dst: &str) -> Result<(), ()> {
+        let sb = vitafs::mounted_sb().ok_or(())?;
+        let src_parts = self.canon_parts(src).ok_or(())?;
+        let src_ino = Self::walk(&src_parts).ok_or(())?.0;
+        let src_node = vitafs::iget(sb, src_ino).ok_or(())?;
+
+        // Куда именно копируем: либо dst как есть, либо внутрь каталога dst.
+        let mut dst_parts = self.canon_parts(dst).ok_or(())?;
+        if let Some((dst_ino, _)) = Self::walk(&dst_parts) {
+            if let Some(n) = vitafs::iget(sb, dst_ino) {
+                if n.itype == vitafs::TYPE_DIR {
+                    dst_parts.push(src_parts.last().ok_or(())?.clone());
+                }
             }
         }
 
         // Запрет копировать директорию саму в себя.
-        if self.nodes[src_idx].entry_type == EntryType::Directory
-            && self.is_descendant(dst_parent, src_idx)
-        {
+        if src_node.itype == vitafs::TYPE_DIR && is_prefix(&src_parts, &dst_parts) {
             return Err(());
         }
 
-        // Если целевой узел уже существует, разрешена только замена файла файлом.
-        if let Some(pos) = self.nodes[dst_parent]
-            .children
-            .iter()
-            .position(|&c| self.nodes[c].name == dst_name)
-        {
-            let existing = self.nodes[dst_parent].children[pos];
-            if self.nodes[existing].entry_type != EntryType::File
-                || self.nodes[src_idx].entry_type != EntryType::File
-            {
+        let (dst_parent_ino, _) =
+            Self::walk(&dst_parts[..dst_parts.len() - 1]).ok_or(())?;
+        let dst_name = dst_parts.last().ok_or(())?.clone();
+
+        if let Some(target) = vitafs::dir_lookup(sb, dst_parent_ino, &dst_name) {
+            // Разрешена только замена файла файлом.
+            let tnode = vitafs::iget(sb, target).ok_or(())?;
+            if tnode.itype != vitafs::TYPE_FILE || src_node.itype != vitafs::TYPE_FILE {
                 return Err(());
             }
-            let data = self.nodes[src_idx].content.clone();
-            self.nodes[existing].content = data;
-            return Ok(());
+            let data = vitafs::file_read_all(sb, src_ino).ok_or(())?;
+            return if vitafs::file_write_all(sb, target, &data) {
+                Ok(())
+            } else {
+                Err(())
+            };
         }
 
-        let new_idx = self.copy_node(src_idx, dst_parent, &dst_name)?;
-        self.nodes[dst_parent].children.push(new_idx);
-        Ok(())
-    }
-
-    fn copy_node(
-        &mut self,
-        src_idx: usize,
-        dst_parent: usize,
-        dst_name: &str,
-    ) -> Result<usize, ()> {
-        if self.nodes[src_idx].entry_type == EntryType::Directory {
-            let new_idx = self.nodes.len();
-            self.nodes
-                .push(FsEntry::new_dir(dst_name, Some(dst_parent)));
-            let children: Vec<usize> = self.nodes[src_idx].children.clone();
-            for &c in &children {
-                let child_name = self.nodes[c].name.clone();
-                let child_idx = self.copy_node(c, new_idx, &child_name)?;
-                self.nodes[new_idx].children.push(child_idx);
-            }
-            Ok(new_idx)
-        } else {
-            let mut f = FsEntry::new_file(dst_name, dst_parent);
-            f.content = self.nodes[src_idx].content.clone();
-            let new_idx = self.nodes.len();
-            self.nodes.push(f);
-            Ok(new_idx)
-        }
+        copy_tree(sb, src_ino, dst_parent_ino, &dst_name)
     }
 
     /// Перемещает/переименовывает файл или директорию.
@@ -574,50 +295,66 @@ impl Vfs {
     /// с сохранением своего имени. Файл-цель перезаписывается, директория-цель
     /// не трогается.
     pub fn mv(&mut self, src: &str, dst: &str) -> Result<(), ()> {
-        let src_idx = self.resolve(src).ok_or(())?;
-        let src_parent = self.nodes[src_idx].parent.ok_or(())?;
+        wal_txn(|| self.mv_inner(src, dst))
+    }
 
-        let (mut dst_parent, mut dst_name) = self.split_parent(dst).ok_or(())?;
-        if let Some(dst_idx) = self.resolve(dst) {
-            if self.nodes[dst_idx].entry_type == EntryType::Directory {
-                dst_parent = dst_idx;
-                dst_name = self.nodes[src_idx].name.clone();
+    fn mv_inner(&mut self, src: &str, dst: &str) -> Result<(), ()> {
+        let sb = vitafs::mounted_sb().ok_or(())?;
+        let src_parts = self.canon_parts(src).ok_or(())?;
+        let (src_ino, chain) = Self::walk(&src_parts).ok_or(())?;
+        let src_node = vitafs::iget(sb, src_ino).ok_or(())?;
+        let src_parent_ino = *chain.get(chain.len() - 2).ok_or(())?;
+
+        let mut dst_parts = self.canon_parts(dst).ok_or(())?;
+        if let Some((dst_ino, _)) = Self::walk(&dst_parts) {
+            if let Some(n) = vitafs::iget(sb, dst_ino) {
+                if n.itype == vitafs::TYPE_DIR {
+                    dst_parts.push(src_parts.last().ok_or(())?.clone());
+                }
             }
+        }
+
+        if src_parts == dst_parts {
+            return Ok(()); // mv a a — бездействие
         }
 
         // Запрет перемещать директорию саму в себя.
-        if self.nodes[src_idx].entry_type == EntryType::Directory
-            && self.is_descendant(dst_parent, src_idx)
-        {
+        if src_node.itype == vitafs::TYPE_DIR && is_prefix(&src_parts, &dst_parts) {
             return Err(());
         }
 
-        if let Some(pos) = self.nodes[dst_parent]
-            .children
-            .iter()
-            .position(|&c| self.nodes[c].name == dst_name)
-        {
-            let existing = self.nodes[dst_parent].children[pos];
-            if existing == src_idx {
-                return Ok(()); // mv a a — бездействие
+        let (dst_parent_ino, _) =
+            Self::walk(&dst_parts[..dst_parts.len() - 1]).ok_or(())?;
+        let dst_name = dst_parts.last().ok_or(())?.clone();
+
+        // Цель-файл перезаписывается, цель-каталог блокирует перемещение.
+        if let Some(target) = vitafs::dir_lookup(sb, dst_parent_ino, &dst_name) {
+            if target == src_ino {
+                return Ok(());
             }
-            if self.nodes[existing].entry_type != EntryType::File {
+            let tnode = vitafs::iget(sb, target).ok_or(())?;
+            if tnode.itype != vitafs::TYPE_FILE {
                 return Err(());
             }
-            self.nodes[dst_parent].children.remove(pos);
+            if !vitafs::destroy_node(sb, dst_parent_ino, &dst_name, vitafs::TYPE_FILE) {
+                return Err(());
+            }
         }
 
-        let src_pos = self
-            .nodes[src_parent]
-            .children
-            .iter()
-            .position(|&c| c == src_idx)
-            .ok_or(())?;
-        self.nodes[src_parent].children.remove(src_pos);
-
-        self.nodes[src_idx].name = dst_name;
-        self.nodes[src_idx].parent = Some(dst_parent);
-        self.nodes[dst_parent].children.push(src_idx);
+        // Перенос записи: убрать из старого каталога, добавить в новый.
+        if !vitafs::dir_remove(sb, src_parent_ino, src_parts.last().ok_or(())?) {
+            return Err(());
+        }
+        if !vitafs::dir_add(sb, dst_parent_ino, &dst_name, src_ino) {
+            // Откат: иначе узел осиротеет.
+            let _ = vitafs::dir_add(
+                sb,
+                src_parent_ino,
+                src_parts.last().ok_or(())?,
+                src_ino,
+            );
+            return Err(());
+        }
         Ok(())
     }
 
@@ -625,19 +362,72 @@ impl Vfs {
     /// с именем `name` и возвращает их полные пути.
     pub fn find(&self, name: &str) -> Vec<String> {
         let mut out = Vec::new();
-        self.find_from(ROOT, name, &mut out);
+        if let Some(sb) = vitafs::mounted_sb() {
+            find_from(sb, vitafs::ROOT_INODE, "", name, &mut out);
+        }
         out
     }
+}
 
-    fn find_from(&self, idx: usize, name: &str, out: &mut Vec<String>) {
-        for &c in &self.nodes[idx].children {
-            let child = &self.nodes[c];
-            if child.name == name {
-                out.push(self.node_path(c));
+/// true, если `prefix` — префикс `parts` (включая равенство): parts лежит
+/// внутри поддерева prefix.
+fn is_prefix(prefix: &[String], parts: &[String]) -> bool {
+    parts.len() >= prefix.len() && parts[..prefix.len()] == *prefix
+}
+
+/// Рекурсивное копирование дерева: файлы - через read/write_all,
+/// каталоги - созданием и обходом записей.
+fn copy_tree(sb: &vitafs::Superblock, src_ino: u32, dst_parent: u32, name: &str) -> Result<(), ()> {
+    let src_node = vitafs::iget(sb, src_ino).ok_or(())?;
+    let new_ino = vitafs::create_node(sb, dst_parent, name, src_node.itype).ok_or(())?;
+    if src_node.itype == vitafs::TYPE_FILE {
+        let data = vitafs::file_read_all(sb, src_ino).ok_or(())?;
+        if !vitafs::file_write_all(sb, new_ino, &data) {
+            return Err(());
+        }
+    } else if src_node.itype == vitafs::TYPE_DIR {
+        for entry in vitafs::dir_readdir(sb, src_ino).ok_or(())? {
+            copy_tree(sb, entry.ino, new_ino, &entry.name)?;
+        }
+    } else {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn find_from(sb: &vitafs::Superblock, dir_ino: u32, prefix: &str, name: &str, out: &mut Vec<String>) {
+    let entries = match vitafs::dir_readdir(sb, dir_ino) {
+        Some(e) => e,
+        None => return,
+    };
+    for e in entries {
+        let path = if prefix.is_empty() {
+            format!("/{}", e.name)
+        } else {
+            format!("{}/{}", prefix, e.name)
+        };
+        if e.name == name {
+            out.push(path.clone());
+        }
+        if let Some(node) = vitafs::iget(sb, e.ino) {
+            if node.itype == vitafs::TYPE_DIR {
+                find_from(sb, e.ino, &path, name, out);
             }
-            if child.entry_type == EntryType::Directory {
-                self.find_from(c, name, out);
-            }
+        }
+    }
+}
+
+/// Обёртка транзакции WAL вокруг мутации: успех -> commit, ошибка -> abort.
+fn wal_txn<T>(f: impl FnOnce() -> Result<T, ()>) -> Result<T, ()> {
+    crate::wal::begin();
+    match f() {
+        Ok(v) => {
+            crate::wal::commit();
+            Ok(v)
+        }
+        Err(e) => {
+            crate::wal::abort();
+            Err(e)
         }
     }
 }

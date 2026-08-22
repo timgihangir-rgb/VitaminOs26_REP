@@ -13,6 +13,8 @@
 //!   4 exit()  (не возвращается)
 //!   5 sleep(target_tick) — блокирует задачу до тика target_tick (не вернётся
 //!     раньше: спящие задачи не получают кванты round-robin)
+//!   6 kbhit() -> int (есть ли сканкод в буфере клавиатуры)
+//!   7 kbread() -> int (вынуть сканкод из буфера клавиатуры; 0 — буфер пуст)
 //!
 //! Аргументы (по SysV) приходят в rdi/rsi/rdx и лежат в сохранённых регистрах
 //! с той же раскладкой, что в `timer_entry` планировщика. Вершина стека после
@@ -28,6 +30,8 @@ pub const SYS_VFS_WRITE: usize = 2;
 pub const SYS_VFS_READ: usize = 3;
 pub const SYS_EXIT: usize = 4;
 pub const SYS_SLEEP: usize = 5;
+pub const SYS_KBHIT: usize = 6;
+pub const SYS_KBREAD: usize = 7;
 
 global_asm!(
     ".global int80_entry",
@@ -210,6 +214,14 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) -> usize {
         }
         SYS_VFS_READ => {
             sys_vfs_read(regs);
+            0
+        }
+        SYS_KBHIT => {
+            set_result(regs, if crate::keyboard::kb_hit() { 1 } else { 0 });
+            0
+        }
+        SYS_KBREAD => {
+            set_result(regs, crate::keyboard::kb_read() as u64);
             0
         }
         SYS_EXIT => {

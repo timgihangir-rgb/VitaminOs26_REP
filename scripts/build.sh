@@ -2,7 +2,6 @@
 set -e
 
 PROGRAMS_DIR="programs"
-PROGRAMS_RS="src/programs.rs"
 KERNEL_ELF="target/x86_64-unknown-none/debug/vitamin_os26"
 ISO_DIR="target/os.iso.dir"
 ISO="target/os.iso"
@@ -52,9 +51,15 @@ if ! command -v "$CC" &> /dev/null; then
 fi
 
 ###############################################################################
-# 3. Compile programs (C and Rust) to flat binaries
+# 3. Compile programs (C and Rust) to static ELF executables
+#
+# Ядро грузит программы как статические ELF64 (ET_EXEC) с диска: сегменты
+# PT_LOAD маппятся по p_vaddr, вход — e_entry. База линковки 0x400000
+# (начало user-области). Символы срезаются (-s): содержимое /bin хранится
+# в слепке VFS на диске (лимит 128 КБ).
 ###############################################################################
-PROGRAM_ENTRIES=""
+PROGRAM_LIST="target/programs.list"
+: > "$PROGRAM_LIST"
 
 if [ -n "$CC" ]; then
     echo ""
@@ -68,9 +73,10 @@ if [ -n "$CC" ]; then
     }
     SECTIONS
     {
-        . = 0x0;
-        .text : { *(.text) *(.rodata) *(.data) } :all
-        .bss : { *(.bss) } :all
+        . = 0x400000;
+        .text : { *(.text._start) *(.text) *(.rodata) *(.data) } :all
+        .bss : { *(.bss) *(COMMON) } :all
+        /DISCARD/ : { *(.eh_frame) *(.comment) *(.note.*) }
     }
 ENDLD
 fi
@@ -79,86 +85,53 @@ for prog_dir in "$PROGRAMS_DIR"/*/; do
     prog_name=$(basename "$prog_dir")
     c_src="${prog_dir}main.c"
     rs_src="${prog_dir}main.rs"
-    bin_file="${prog_dir}${prog_name}.bin"
+    elf_file="${prog_dir}${prog_name}.elf"
 
-    if [ -f "$c_src" ]; then
-        echo ""
-        echo "  Compiling (C): $c_src"
-        obj_file="${prog_dir}${prog_name}.o"
-        so_file="${prog_dir}${prog_name}.so"
-
-        $CC -m64 -nostdlib -ffreestanding -fno-stack-protector -fPIC -mno-red-zone \
-            -c "$c_src" -o "$obj_file" 2>&1
-
-        ld -nostdlib -shared -T "$LDSCRIPT" -e _start \
-            -o "$so_file" "$obj_file" 2>&1
-
-        objcopy -O binary "$so_file" "$bin_file" 2>&1
-
-        bss_pad=$(readelf -lW "$so_file" | awk '/LOAD/{memsz=strtonum($6); filesz=strtonum($5); if(memsz>filesz) print memsz-filesz}')
-        if [ -n "$bss_pad" ] && [ "$bss_pad" -gt 0 ] 2>/dev/null; then
-            dd if=/dev/zero bs=1 count="$bss_pad" status=none >> "$bin_file" 2>&1
-        fi
-
-        rm -f "$obj_file" "$so_file"
-    elif [ -f "$rs_src" ]; then
-        echo ""
-        echo "  Compiling (Rust): $rs_src"
-        # Пикод-модель: программа исполняется по произвольному адресу (ядро
-        # загружает .bin в кучу и прыгает на первый байт), поэтому доступ к
-        # .rodata/.text должен быть RIP-relative, а не абсолютным.
-        RUSTFLAGS="-C relocation-model=pic -C link-arg=-T$(pwd)/${prog_dir}linker.ld" \
-            cargo build -Z build-std=core,compiler_builtins \
-            --target x86_64-unknown-none \
-            --manifest-path "${prog_dir}Cargo.toml" \
-            --release 2>&1
-
-        elf_file="${prog_dir}target/x86_64-unknown-none/release/${prog_name}"
-        objcopy -O binary "$elf_file" "$bin_file" 2>&1
-
-        bss_pad=$(readelf -lW "$elf_file" | awk '/LOAD/{memsz=strtonum($6); filesz=strtonum($5); if(memsz>filesz) print memsz-filesz}')
-        if [ -n "$bss_pad" ] && [ "$bss_pad" -gt 0 ] 2>/dev/null; then
-            dd if=/dev/zero bs=1 count="$bss_pad" status=none >> "$bin_file" 2>&1
-        fi
-    else
+    if [ ! -f "$c_src" ] && [ ! -f "$rs_src" ]; then
         echo ""
         echo "  Skipping $prog_name (no main.c / main.rs)"
         continue
     fi
 
-    size=$(stat -c%s "$bin_file")
-    echo "    -> ${bin_file} (${size} bytes)"
+    if [ -f "$c_src" ]; then
+        echo ""
+        echo "  Compiling (C): $c_src"
+        obj_file="${prog_dir}${prog_name}.o"
 
-    PROGRAM_ENTRIES="${PROGRAM_ENTRIES}    Program { name: \"${prog_name}\", data: include_bytes!(\"../${prog_dir}${prog_name}.bin\") },
-"
+        $CC -m64 -nostdlib -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone \
+            -c "$c_src" -o "$obj_file" 2>&1
+
+        ld -nostdlib -s -T "$LDSCRIPT" -e _start \
+            -o "$elf_file" "$obj_file" 2>&1
+
+        rm -f "$obj_file"
+    else
+        echo ""
+        echo "  Compiling (Rust): $rs_src"
+        # static + --no-pie: на выходе ET_EXEC (загрузчик ядра не понимает
+        # ET_DYN/релокации). -s срезает символы.
+        RUSTFLAGS="-C relocation-model=static -C link-arg=--no-pie -C link-arg=-s -C link-arg=-T$(pwd)/${prog_dir}linker.ld" \
+            cargo build -Z build-std=core,compiler_builtins \
+            --target x86_64-unknown-none \
+            --manifest-path "${prog_dir}Cargo.toml" \
+            --release 2>&1
+
+        built="${prog_dir}target/x86_64-unknown-none/release/${prog_name}"
+        cp "$built" "$elf_file"
+    fi
+
+    size=$(stat -c%s "$elf_file")
+    echo "    -> ${elf_file} (${size} bytes)"
+
+    echo -e "${prog_name}\t$(pwd)/${elf_file}" >> "$PROGRAM_LIST"
+
+    # Устаревшие flat-артефакты больше не нужны.
+    rm -f "${prog_dir}${prog_name}.bin"
 done
 
 if [ -n "$CC" ]; then
     rm -f "$LDSCRIPT"
 fi
-
-###############################################################################
-# 4. Generate src/programs.rs
-###############################################################################
-echo ""
-echo "Generating $PROGRAMS_RS..."
-
-cat > "$PROGRAMS_RS" << 'ENDRS'
-// Auto-generated by build.sh -- do not edit manually.
-pub struct Program {
-    pub name: &'static str,
-    pub data: &'static [u8],
-}
-
-pub const PROGRAMS: &[Program] = &[
-ENDRS
-
-if [ -z "$PROGRAM_ENTRIES" ]; then
-    echo "    // No C programs found in $PROGRAMS_DIR" >> "$PROGRAMS_RS"
-fi
-
-echo "$PROGRAM_ENTRIES" >> "$PROGRAMS_RS"
-echo "];" >> "$PROGRAMS_RS"
 
 ###############################################################################
 # 5. Build kernel (Rust + NASM)
@@ -186,13 +159,12 @@ grub-mkrescue -o "$ISO" "$ISO_DIR" 2>&1
 rm -rf "$ISO_DIR"
 
 ###############################################################################
-# 6.5. Create disk image (kept if it already has data!)
+# 6.5. Disk image: VITAFS, пересобирается на каждой сборке (пересев /bin).
+# Пользовательские данные на os.img при пересборке теряются - это dev-flow.
 ###############################################################################
-if [ ! -f "$IMG" ]; then
-    echo ""
-    echo "Creating disk image: $IMG (8M)..."
-    truncate -s 8M "$IMG"
-fi
+echo ""
+echo "Creating disk image: $IMG (VITAFS 8M, seeded with /bin programs)..."
+python3 tools/mkfs.py "$IMG" "$PROGRAM_LIST"
 
 echo ""
 echo "================================="

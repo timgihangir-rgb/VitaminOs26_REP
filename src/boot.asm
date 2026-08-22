@@ -167,5 +167,6 @@ saved_magic:    dq 0
 section .boot.bss nobits alloc write noexec align=16
 
 stack_bottom:
-    resb 16384
+    ; 64 КиБ: слои ФС вкладывают кадры с 4КБ-буферами (dir->file->bcache).
+    resb 65536
 stack_top:
