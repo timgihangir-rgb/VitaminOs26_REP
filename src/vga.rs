@@ -282,6 +282,7 @@ impl Writer {
         Writer {
             row_position: (pos / SCREEN_WIDTH).min(SCREEN_HEIGHT - 1),
             column_position: pos % SCREEN_WIDTH,
+            color_code: COLOR_LIGHT_GREEN,
         }
     }
 }

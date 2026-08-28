@@ -15,6 +15,13 @@
 //!     раньше: спящие задачи не получают кванты round-robin)
 //!   6 kbhit() -> int (есть ли сканкод в буфере клавиатуры)
 //!   7 kbread() -> int (вынуть сканкод из буфера клавиатуры; 0 — буфер пуст)
+//!   8 ioctl(cmd, arg) -> i32
+//!       cmd 1 CURSOR_GET      -> (row<<16)|col
+//!       cmd 2 CURSOR_SET arg  = (row<<16)|col
+//!       cmd 3 CLEAR           - очистить экран
+//!       cmd 4 SCREEN_SIZE     -> (height<<16)|width
+//!       cmd 5 ECHO_GET        -> 0/1
+//!       cmd 6 ECHO_SET arg    = 0 выкл / 1 вкл
 //!
 //! Аргументы (по SysV) приходят в rdi/rsi/rdx и лежат в сохранённых регистрах
 //! с той же раскладкой, что в `timer_entry` планировщика. Вершина стека после
@@ -32,6 +39,7 @@ pub const SYS_EXIT: usize = 4;
 pub const SYS_SLEEP: usize = 5;
 pub const SYS_KBHIT: usize = 6;
 pub const SYS_KBREAD: usize = 7;
+pub const SYS_IOCTL: usize = 8;
 
 global_asm!(
     ".global int80_entry",
@@ -222,6 +230,41 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) -> usize {
         }
         SYS_KBREAD => {
             set_result(regs, crate::keyboard::kb_read() as u64);
+            0
+        }
+        SYS_IOCTL => {
+            let cmd = unsafe { *regs.add(10) };
+            let arg = unsafe { *regs.add(11) };
+            use crate::vga::{SCREEN_HEIGHT, SCREEN_WIDTH};
+            let r = match cmd {
+                1 => {
+                    let (row, col) = crate::vga::hw_cursor_pos();
+                    ((row << 16) | col) as i64
+                }
+                2 => {
+                    crate::vga::set_hw_cursor((arg >> 16) as usize, (arg & 0xFFFF) as usize);
+                    0
+                }
+                3 => {
+                    let mut w = crate::vga::Writer::new();
+                    w.clear_screen();
+                    0
+                }
+                4 => ((SCREEN_HEIGHT << 16) | SCREEN_WIDTH) as i64,
+                5 => {
+                    if crate::keyboard::echo_get() {
+                        1
+                    } else {
+                        0
+                    }
+                }
+                6 => {
+                    crate::keyboard::echo_set(arg != 0);
+                    0
+                }
+                _ => -1i64,
+            };
+            set_result(regs, r as u64);
             0
         }
         SYS_EXIT => {

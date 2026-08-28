@@ -83,6 +83,17 @@ pub fn flush() {
     });
 }
 
+// Эхо ввода в read_line (управляется ioctl ECHO_GET/ECHO_SET).
+static mut ECHO: bool = true;
+
+pub fn echo_get() -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe { ECHO })
+}
+
+pub fn echo_set(on: bool) {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe { ECHO = on });
+}
+
 fn translate(scancode: u8, shift: bool) -> Option<u8> {
     let base = match scancode {
         0x02 => Some(b'1'), 0x03 => Some(b'2'), 0x04 => Some(b'3'),
@@ -120,6 +131,47 @@ fn shift_char(c: u8) -> u8 {
         b'a'..=b'z' => c - 32,
         _ => c,
     }
+}
+
+/// Вычитывает всё, что накопилось в буфере, и переводит в ASCII
+/// (для чтения из /dev/keyboard). Не блокируется: пустой буфер - пустой ответ.
+pub fn drain_chars(max: usize) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::new();
+    let mut shift = false;
+    let mut e0 = false;
+    while out.len() < max {
+        let sc = x86_64::instructions::interrupts::without_interrupts(pop_scancode);
+        match sc {
+            None => break,
+            Some(0xE0) => {
+                e0 = true;
+                continue;
+            }
+            Some(s) if e0 => {
+                e0 = false;
+                continue; // стрелки/модификаторы расширений пропускаем
+            }
+            Some(0x2A | 0x36) => {
+                shift = true;
+                continue;
+            }
+            Some(0xAA | 0xB6) => {
+                shift = false;
+                continue;
+            }
+            Some(s) if s & 0x80 != 0 => continue,
+            Some(s) => {
+                if let Some(c) = translate(s, shift) {
+                    if c == b'\n' || c == b'\r' {
+                        out.push(b'\n');
+                    } else if c >= 0x20 && c < 0x7F {
+                        out.push(c);
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn erase_line(writer: &mut Writer, start_row: usize, start_col: usize, len: usize) {
@@ -262,20 +314,25 @@ pub fn read_line(writer: &mut Writer, history: &mut History) -> String {
         }
 
         if let Some(byte) = translate(scancode, shift) {
+            let echo = x86_64::instructions::interrupts::without_interrupts(|| unsafe { ECHO });
             match byte {
                 b'\n' | b'\r' => {
-                    writer.write_string("\n");
+                    if echo {
+                        writer.write_string("\n");
+                    }
                     history.add(line.clone());
                     return line;
                 }
                 0x08 => {
-                    if line.pop().is_some() {
+                    if line.pop().is_some() && echo {
                         writer.backspace();
                     }
                 }
                 c => {
                     line.push(c as char);
-                    writer.write_byte(c);
+                    if echo {
+                        writer.write_byte(c);
+                    }
                 }
             }
         }

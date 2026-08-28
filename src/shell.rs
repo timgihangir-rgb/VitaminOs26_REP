@@ -305,6 +305,67 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
         ["init", sub @ ..] => {
             crate::init::cmd(writer, vfs, sub);
         }
+        ["ln", "-s", target, link] => {
+            match vfs.symlink(target, link) {
+                Ok(()) => {}
+                Err(()) => writer.write_string("ln: cannot create symlink\n"),
+            }
+        }
+        ["chroot", path] => {
+            if vfs.chroot(path) {
+                writer.write_string("chroot: new root is ");
+                writer.write_string(path);
+                writer.write_string("\n");
+            } else {
+                writer.write_string("chroot: not a directory\n");
+            }
+        }
+        ["ioctl", sub, rest @ ..] => match *sub {
+            // Управление терминалом. Те же номера команд доступны C-программам
+            // через int 0x80 / трамплин ioctl() (см. src/syscall.rs).
+            "cursor" => {
+                let (row, col) = crate::vga::hw_cursor_pos();
+                writer.write_string(&alloc::format!("cursor: row={} col={}\n", row, col));
+            }
+            "goto" => {
+                let r: usize = rest.first().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let c: usize = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+                crate::vga::set_hw_cursor(r, c);
+            }
+            "clear" => {
+                writer.clear_screen();
+            }
+            "size" => {
+                let (row, _) = crate::vga::hw_cursor_pos();
+                let _ = row;
+                writer.write_string(&alloc::format!(
+                    "screen: {}x{}\n",
+                    crate::vga::SCREEN_WIDTH,
+                    crate::vga::SCREEN_HEIGHT
+                ));
+            }
+            "echo" => match rest.first() {
+                Some(&"on") => {
+                    crate::keyboard::echo_set(true);
+                    writer.write_string("echo: on\n");
+                }
+                Some(&"off") => {
+                    // Подсказку пишем ДО отключения - дальше шелл молчит,
+                    // пока не наберёшь вслепую: ioctl echo on
+                    writer.write_string("echo: off (restore: ioctl echo on)\n");
+                    crate::keyboard::echo_set(false);
+                }
+                _ => {
+                    writer.write_string(&alloc::format!(
+                        "echo: {}\n",
+                        if crate::keyboard::echo_get() { "on" } else { "off" }
+                    ));
+                }
+            },
+            _ => {
+                writer.write_string("ioctl: unknown op (cursor|goto|clear|size|echo)\n");
+            }
+        },
         _ => {
             // Неизвестная команда: пробуем .bin-программу в foreground.
             // VFS_LOCK освобождаем — программа сама работает с VFS через ABI.

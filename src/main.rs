@@ -10,6 +10,7 @@ use core::panic::PanicInfo;
 mod bcache;
 mod blockdev;
 mod cursor;
+mod devices;
 mod elf;
 mod exec;
 mod fs;

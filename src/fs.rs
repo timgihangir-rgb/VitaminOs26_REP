@@ -9,10 +9,11 @@ pub fn list_files(writer: &mut Writer, vfs: &Vfs, path: &str) {
     match vfs.ls(path) {
         Some(entries) if !entries.is_empty() => {
             for (name, entry_type, size) in entries {
-                let kind = if entry_type == crate::vfs::EntryType::Directory {
-                    "DIR"
-                } else {
-                    "FILE"
+                let kind = match entry_type {
+                    crate::vfs::EntryType::Directory => "DIR",
+                    crate::vfs::EntryType::CharDev => "DEV",
+                    crate::vfs::EntryType::Symlink => "LNK",
+                    _ => "FILE",
                 };
                 writer.write_string(&format!("{:<8} {:>6}  {}\n", kind, size, name));
             }

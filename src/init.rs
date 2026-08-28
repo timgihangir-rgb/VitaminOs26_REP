@@ -131,6 +131,7 @@ fn load_config() {
 /// запускает службы и задачу-супервизор. Вызывается из main перед run_shell.
 pub fn boot(writer: &mut Writer) {
     crate::vga::serial_write_atomic("[B] enter\n");
+    crate::devices::install();
     scheduler_with_vfs(|vfs| {
         let _ = vfs.mkdir("/var");
         let _ = vfs.mkdir("/var/log");
