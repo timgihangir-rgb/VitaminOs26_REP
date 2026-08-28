@@ -443,17 +443,14 @@ fn commit_all() -> bool {
     if !crate::bcache::capture_dirty_into_wal() {
         return false;
     }
-    if false {
-        if !crate::vitafs::capture_dirty_inodes_into_wal() {
-            return false;
-        }
-    } // TEST-F3: захват инодов отключён
-    // TEST-F4: порции отключены, staging сливаем
-    with_wal(|w| w.staging.clear());
-    true
-}
-#[allow(dead_code)]
-fn commit_portion_disabled() -> bool {
+    // Inode тоже часть транзакции: size/links каталога обязаны попасть в журнал
+    // вместе с данными. Без этого записи каталога и его размер расходятся:
+    // readdir видит записи, а dir_lookup (идущий по size) - лишь их часть.
+    if !crate::vitafs::capture_dirty_inodes_into_wal() {
+        return false;
+    }
+
+    // 2) Сливаем staging в журнал по порциям (write + apply + close).
     loop {
         let remaining = with_wal(|w| w.staging.len()).unwrap_or(0);
         if remaining == 0 {

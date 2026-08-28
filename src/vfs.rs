@@ -205,6 +205,35 @@ impl Vfs {
         }
     }
 
+    /// Создаёт /dev и все его спецфайлы в ОДНОЙ транзакции (атомарно).
+    /// Устройства идут целиком одним commit: не зависит от помежуточной
+    /// нестабильности роста каталога между wal_txn (см. WAL-блокер).
+    pub fn install_devices(&mut self) -> Result<(), ()> {
+        wal_txn(|| {
+            let sb = vitafs::mounted_sb().ok_or(())?;
+            let (root_ino, _) = Self::walk(&[]).ok_or(())?;
+            if vitafs::dir_lookup(sb, root_ino, "dev").is_none() {
+                if vitafs::create_node(sb, root_ino, "dev", vitafs::TYPE_DIR).is_none() {
+                    return Err(());
+                }
+            }
+            let dev_dir = vitafs::dir_lookup(sb, root_ino, "dev").ok_or(())?;
+            for name in crate::devices::DEV_NAMES {
+                let id = crate::devices::dev_id(name).ok_or(())?;
+                if vitafs::dir_lookup(sb, dev_dir, name).is_some() {
+                    continue; // уже есть - пропускаем
+                }
+                let ino = vitafs::create_node(sb, dev_dir, name, vitafs::TYPE_CHARDEV).ok_or(())?;
+                let mut node = vitafs::iget(sb, ino).ok_or(())?;
+                node.device_id = id;
+                if !vitafs::iput(sb, ino, &node) {
+                    return Err(());
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Создаёт спецфайл устройства (TYPE_CHARDEV). Имя последней компоненты
     /// обязано быть зарегистрированным устройством.
     pub fn mknod(&mut self, path: &str) -> Result<(), ()> {
@@ -212,9 +241,17 @@ impl Vfs {
             let sb = vitafs::mounted_sb().ok_or(())?;
             let (parent, name) = self.split_parent(path).ok_or(())?;
             let id = crate::devices::dev_id(&name).ok_or(())?;
-            if vitafs::dir_lookup(sb, parent, &name).is_some() {
-                // Уже есть (перезагрузка после install) - считаем успехом.
-                return Ok(());
+            if let Some(existing) = vitafs::dir_lookup(sb, parent, &name) {
+                // Уже есть. Если это корректный chardev - успех; иначе
+                // сносим и создаём заново (устройства должны быть char-нодами).
+                if let Some(n) = vitafs::iget(sb, existing) {
+                    if n.itype == vitafs::TYPE_CHARDEV && n.device_id == id {
+                        return Ok(());
+                    }
+                }
+                let _ = vitafs::destroy_node(sb, parent, &name, vitafs::TYPE_FILE);
+                let _ = vitafs::destroy_node(sb, parent, &name, vitafs::TYPE_CHARDEV);
+                let _ = vitafs::destroy_node(sb, parent, &name, vitafs::TYPE_SYMLINK);
             }
             let ino = vitafs::create_node(sb, parent, &name, vitafs::TYPE_CHARDEV).ok_or(())?;
             let mut node = vitafs::iget(sb, ino).ok_or(())?;

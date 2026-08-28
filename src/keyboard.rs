@@ -148,6 +148,7 @@ pub fn drain_chars(max: usize) -> alloc::vec::Vec<u8> {
                 continue;
             }
             Some(s) if e0 => {
+                let _ = s;
                 e0 = false;
                 continue; // стрелки/модификаторы расширений пропускаем
             }

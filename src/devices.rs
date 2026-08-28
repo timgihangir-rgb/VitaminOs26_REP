@@ -11,7 +11,6 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-
 pub const DEV_NAMES: [&str; 5] = ["null", "zero", "tty", "keyboard", "vga"];
 
 pub fn dev_id(name: &str) -> Option<u32> {
@@ -53,9 +52,6 @@ pub fn dev_write(name: &str, data: &[u8]) -> bool {
 /// Создаёт /dev и спецфайлы, если их ещё нет. Вызывается один раз при загрузке.
 pub fn install() {
     crate::scheduler::with_vfs(|vfs| {
-        let _ = vfs.mkdir("/dev");
-        for name in DEV_NAMES {
-            let _ = vfs.mknod(&alloc::format!("/dev/{}", name));
-        }
+        let _ = vfs.install_devices();
     });
 }

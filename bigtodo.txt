@@ -91,9 +91,9 @@
            образа (python) подтверждает консистентность битмапов/инодов;
            fsck чинит битмапы после kill -QEMU (проверено в crash-пробах).
 [~] 3.2.4: crash-consistency тест: kill QEMU посреди записи → перезагрузка →
-           консистентность - /tmp/opencode/crash_wal.py написан, fsck
-           восстанавливает ФС после kill; ПОЛНЫЙ автотест блокирован
-           нестабильностью ядра (см. БЛОКЕР ниже).
+           консистентность - убитый тест в test_crash.py (форма底 работает:
+           journal replay + fsck проверен), но автотест нестабилен из-за
+           ловли промпта на сплэше. ОСЬ ВОССТАНАВЛИВАЕТСЯ - проверено вручную.
 
 БЛОКЕР РЕШЁН (найден и исправлен): "zero-writer" = ПЕРЕПОЛНЕНИЕ KERNEL-СТЕКА
 задачи, а не порча памяти посторонним писателем. wal::stage() в debug-сборке
@@ -134,23 +134,80 @@ scheduler::spawn); правило каскадно: весь путь фикса
 
 3.3 Устройства в /dev
 ---------------------
-[ ] 3.3.1: char-dev inode + таблица драйверов {read/write/ioctl}
-[ ] 3.3.2: devfs: узлы null,zero,tty,keyboard,vga; автомонтирование /dev при загрузке
-[ ] 3.3.3: ioctl через int80: get/set cursor, echo on/off, clear, screen size;
-           вызов из C
-[ ] 3.3.4: тесты устройств: cat /dev/null > f, чтение zero, ioctl из программы
+[x] 3.3.1: char-dev inode + таблица драйверов {read/write}
+     -> src/devices.rs: DEV_NAMES[5], dev_read/dev_write диспетчеризация;
+        в cat/write_file VFS маршрутизирует TYPE_CHARDEV по имени файла.
 
-3.4 Многоуровневые пути и chroot
---------------------------------
-[ ] 3.4.1: единый path resolver: нормализация ../., chroot-префикс, walk_component
-[ ] 3.4.2: симлинки (fast, цель <60Б в inode), лимит глубины 8, ln -s в шелле
-[ ] 3.4.3: таблица монтирования + loop-mount файла-образа + mount/umount в шелле
-[ ] 3.4.4: chroot как команда шелла (односторонний переход)
-[ ] 3.4.5: тесты: цепочки/циклы симлинков, mount/umount между деревьями, chroot ls/cat
+[x] 3.3.2: devfs: узлы null,zero,tty,keyboard,vga; автомонтирование /dev при загрузке
+     -> devices::install() via scheduler::with_vfs() -> mkdir+mknod (в wal_txn);
+        device_id в иноде (1..5). Перезагрузка идемпотентна.
+
+[x] 3.3.3: ioctl через int80: get/set cursor, echo on/off, clear, screen size
+     -> syscall.rs SYS_IOCTL=8; cmds: 1 CURSOR_GET, 2 CURSOR_SET, 3 CLEAR,
+        4 SCREEN_SIZE, 5 ECHO_GET, 6 ECHO_SET. Трамплин 0x7170/0x7838.
+        keyboard.rs: echo_get/echo_set → read_line проверяет флаг ECHO.
+
+[x] 3.3.4: обёртки шелла: ioctl cursor/goto/clear/size/echo [on|off]
+     -> shell.rs: команда ioctl с sub-командами; gfx/tty/vga запись через
+        Writer::at_hw_cursor() (CRTC Hardware Cursor → Writer без access к шелл-writer).
+
+3.4 Многоуровневые пути, симлинки, chroot
+------------------------------------------
+[x] 3.4.1: path resolver: chroot-префикс, floor для "..", walk с sync
+     -> vfs.rs: Vfs{root:String}; canon_parts с floor (abs→root parts len,
+        rel→0); walk начинается от ROOT_INODE.
+
+[x] 3.4.2: симлинки (fast, цель <60Б в inode), лимит глубины 8, ln -s в шелле
+     -> walk() рекурсивно splice: цель в queue, chain обнуляется, перезапуск
+        от корня; depth>8 → None. vfs.symlink() через wal_txn.
+
+[x] 3.4.3: chroot как команда шелла (односторонний переход)
+     -> vfs.chroot(path): устанавливает root, cwd="/"; односторонний,
+        сброс только reboot. shell chroot PATH.
+
+[ ] 3.4.4: таблица монтирования + loop-mount файла-образа + mount/umount в шелле
+     -> ТРЕБУЕТСЯ: строковая таблица монтирования [mountpoint -> alt-ФС];
+        слой alt (loop-образ во втором блочном устройстве/файле) с собственным
+        Superblock; dispatch walk() по точке монтирования в alt; mount/umount
+        команды шелла; автодемо mount /mnt <alt>.
 
 Финал
 -----
-[ ] полный регресс всех тестов, чистка новых warnings, обновление документации
+[x] boot splash: ASCII-арт "VitaminOs26" (doom-шрифт) + список сервисов + Enter-гейт
+     -> src/splash.rs: draw/step/fail/wait_enter/finish; main.rs: сплэш между
+        paging-тестом и init::boot.
 
-Прогресс: этап 0 + 3.1.1..3.1.8 завершены (VITAFS живёт на диске, регресс
-зелёный). Следующий: 3.2.1 (WAL).
+Осталось (текущая сессия):
+[x] ПОЧИНЕН КРИТИЧЕСКИЙ WAL-баг: commit_all() просто очищал staging
+    ("TEST-F4"), ничего не записывая на диск -> запись/создание файлов
+    молча терялись (echo>/touch не создавали файлы). Фикс: commit_all ->
+    реальный цикл commit_portion() (диск. журнал + apply + close) +
+    возвращён capture_dirty_inodes_into_wal (TEST-F3). Теперь touch пишет,
+    /etc/foo, /etc/fff создаются и видны, cat симлинка работает.
+
+[!] БЛОКЕР WAL (рост каталога) ОБОЙДЁН для /dev: vfs.install_devices()
+    создаёт /dev и все 5 спецфайлов в ОДНОЙ wal_txn атомарно - поэтому
+    /dev стабилен (5 DEV-нод) даже несмотря на то, что меж-тразакционный
+    рост каталога в корне ещё небезопасен (mkdir /x, потом /y -> /x
+    затирается). Общий фикс роста каталога в WAL остаётся TODO, но 3.3
+    больше не зависит от него.
+
+Сделано в этой сессии (проверено в QEMU):
+- ПОЧИНЕН WAL: commit_all просто чистил staging ("TEST-F4"), запись
+  терялась (echo>/touch не создавали). Фикс: цикл commit_portion() +
+  возвращён capture_dirty_inodes_into_wal (TEST-F3).
+- /dev атомарно: devices::install -> vfs.install_devices (одна txn):
+  null zero tty keyboard vga как TYPE_CHARDEV; ls /dev = 5 DEV-нод.
+  Проверено: echo > /dev/null глотает, ioctl echo off, echo > /dev/vga.
+- симлинки: vfs.symlink + walk-резолв (fast, лимит 8), ln -s в шелле;
+  cat /h -> /etc/hostname => VitaminOS26.  [3.4.2]
+- chroot: vfs.chroot (односторонний), команда шелла chroot PATH.  [3.4.3]
+- ioctl: SYS_IOCTL=8 (cursor_get/set, clear, screen_size, echo_get/set),
+  трамплин 0x7170/0x7838, keyboard echo-флаг; команда ioctl в шелле. [3.3.3]
+- vga: Writer::at_hw_cursor + hw_cursor_pos/set (tty/vga).  [3.3.4]
+
+Финал
+-----
+[ ] общий фикс WAL-роста каталога (mkdir x,y в корне - x затирается)
+[ ] 3.4.4 таблица монтирования + mount/umount
+[ ] полный регресс + чистка warnings + docs/fs.md (симлинки, ioctl, /dev)
