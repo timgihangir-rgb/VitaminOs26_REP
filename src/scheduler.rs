@@ -21,20 +21,22 @@
 //! посреди аллокации).
 //!
 //! VFS общая для шелла и фоновых задач. Доступ к ней сериализуется
-//! глобальным `VFS_LOCK` (spinning). Шелл держит лок на время выполнения
-//! команды, фоновые задачи — на время своих операций через `with_vfs`.
+//! глобальным `VFS_LOCK` (spinning, см. vfs_lock_yield). Шелл держит лок на
+//! время выполнения команды, фоновые задачи — на время своих операций через
+//! `with_vfs`. Лок отслеживает владельца (VFS_LOCK_OWNER), а kill()/reap()
+//! принудительно снимают его, если жертва держала лок (CRITICAL-3): иначе
+//! система навсегда зависла бы на vfs_lock_yield.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::interrupts::{KERNEL_CS, KERNEL_DS, USER_CS, USER_DS};
 use crate::paging::AddressSpace;
 use crate::vfs::Vfs;
-use spinning_top::{Spinlock, SpinlockGuard};
 
 pub const MAX_TASKS: usize = 16;
 pub const STACK_SIZE: usize = 64 * 1024;
@@ -120,7 +122,74 @@ static WAITING_ON: AtomicUsize = AtomicUsize::new(0);
 static VFS_PTR: AtomicUsize = AtomicUsize::new(0);
 
 /// Сериализует доступ к VFS между шеллом и фоновыми задачами.
-pub static VFS_LOCK: Spinlock<()> = Spinlock::new(());
+///
+/// Собственный атомарный lock вместо spinning_top::Spinlock: необходим
+/// принудительный сброс из kill()/reap() (CRITICAL-3). Если задача убита,
+/// пока держала лок, а лок не снять — все задачи (включая шелл) навсегда
+/// застрянут в vfs_lock_yield().
+pub static VFS_LOCK: VfsLock = VfsLock::new();
+
+/// Атомарный spin-lock для VFS. Семантика та же, что у спинлока, плюс
+/// `force_unlock()` для принудительного снятия у убитой задачи.
+pub struct VfsLock {
+    locked: AtomicBool,
+}
+
+impl VfsLock {
+    pub const fn new() -> VfsLock {
+        VfsLock {
+            locked: AtomicBool::new(false),
+        }
+    }
+
+    fn try_lock(&self) -> Option<VfsLockGuard<'_>> {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(VfsLockGuard { lock: self })
+        } else {
+            None
+        }
+    }
+
+    fn release(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+
+    fn is_locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
+    }
+
+    /// Снимает лок ПРИНУДИТЕЛЬНО, игнорируя владельца. Вызов оправдан ТОЛЬКО
+    /// из kill_inner/reap_inner для задачи, которая больше никогда не
+    /// выполнится (слот освобождается, kernel-стек уничтожается) — её guard
+    /// не запустится и не сможет снять чужой захват.
+    unsafe fn force_unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+}
+
+/// PID владельца VFS_LOCK (0 — нет/устарело). Пишется при КАЖДОМ успешном
+/// try_lock (атомарно с ним, под без-прерываний). При drop guard'а НЕ
+/// обнуляется намеренно: stale-значение безвредно, потому что kill() смотрит
+/// строго на пару «лок занят И владелец == pid», а вот дыра между unlock и
+/// записью владельца позволила бы kill() промахнуться мимо владельца и не
+/// снять лок (deadlock).
+static VFS_LOCK_OWNER: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII-guard VFS_LOCKa: снимает лок при drop. Владельца не трогает
+/// (см. VFS_LOCK_OWNER). Живёт на стеке задачи, между задачами не передаётся.
+pub struct VfsLockGuard<'a> {
+    lock: &'a VfsLock,
+}
+
+impl Drop for VfsLockGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.release();
+    }
+}
 
 global_asm!(
     ".global timer_entry",
@@ -209,14 +278,28 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::SeqCst)
 }
 
+/// PID текущей (выполняющейся) задачи. Для диагностики (print в задачах).
+pub fn current_pid() -> usize {
+    CURRENT.load(Ordering::SeqCst)
+}
+
 /// Захват VFS_LOCK с уступкой CPU. Спин-лок нереентерабельный, а при
 /// вытесняющей многозадачности крутящийся на локе поток способен навсегда
 /// отобрать процессор у держателя лока (тикер не передаст ему управление,
 /// пока "крутильщик" Ready). hlt() спит до следующего тика - планировщик
 /// ротируется, держатель завершает критическую секцию, лок освобождается.
-fn vfs_lock_yield() -> SpinlockGuard<'static, ()> {
+fn vfs_lock_yield() -> VfsLockGuard<'static> {
     loop {
-        if let Some(g) = VFS_LOCK.try_lock() {
+        // Захват + запись владельца — атомарно относительно kill(): между
+        // CAS и store(VFS_LOCK_OWNER) не должно быть точки вытеснения, иначе
+        // kill() не опознал бы владельца и не снял бы лок (CRITICAL-3).
+        if let Some(g) = x86_64::instructions::interrupts::without_interrupts(|| {
+            let g = VFS_LOCK.try_lock();
+            if g.is_some() {
+                VFS_LOCK_OWNER.store(CURRENT.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+            g
+        }) {
             return g;
         }
         // hlt до следующего тика: планировщик ротируется, держатель лока
@@ -225,8 +308,22 @@ fn vfs_lock_yield() -> SpinlockGuard<'static, ()> {
     }
 }
 
-pub fn vfs_lock() -> SpinlockGuard<'static, ()> {
+pub fn vfs_lock() -> VfsLockGuard<'static> {
     vfs_lock_yield()
+}
+
+/// Одна попытка захвата VFS_LOCK без ожидания. None — лок занят. Нужен там,
+/// где ждать нельзя: append_history в шелле — если фоновая задача держит лок
+/// (зависла/убита), шелл обязан остаться отзывчивым, чтобы её можно было
+/// `kill`'нуть (CRITICAL-3).
+pub fn try_vfs_lock() -> Option<VfsLockGuard<'static>> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let g = VFS_LOCK.try_lock();
+        if g.is_some() {
+            VFS_LOCK_OWNER.store(CURRENT.load(Ordering::SeqCst), Ordering::SeqCst);
+        }
+        g
+    })
 }
 
 /// Выполняет `f` с доступом к VFS (внутри глобального лока).
@@ -431,6 +528,20 @@ fn kill_inner(pid: usize) -> bool {
         if pid == 0 || pid >= MAX_TASKS {
             return None;
         }
+        // CRITICAL-3: жертва могла держать VFS_LOCK. init-супервизор и шелл
+        // (ветка `kill` — до захвата лока) убивают задачу БЕЗ удержания
+        // VFS_LOCK, а лок нереентерабельный: если жертва владела им, все
+        // остальные задачи навсегда застряли бы в vfs_lock_yield. Снимаем
+        // лок принудительно — жертва больше не выполнится (слот освобождается,
+        // стек уничтожается), её guard не запустится и не затрёт чужой захват.
+        // Исключение — сама текущая задача: её guard ещё жив, сбрасывать лок
+        // нельзя (впрочем, kill текущей задачи невозможен — defensive).
+        let cur = CURRENT.load(Ordering::SeqCst);
+        if pid != cur && VFS_LOCK.is_locked() && VFS_LOCK_OWNER.load(Ordering::SeqCst) == pid {
+            VFS_LOCK.force_unlock();
+            VFS_LOCK_OWNER.store(0, Ordering::SeqCst);
+            crate::vga::serial_write_atomic("[kill] VFS_LOCK held by target; forced release\n");
+        }
         TASKS[pid].take()
     });
     let existed = removed.is_some();
@@ -454,6 +565,15 @@ fn reap_inner(pid: usize) {
     let removed = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         if pid == 0 || pid >= MAX_TASKS {
             return None;
+        }
+        // Defensive-аналог kill_inner: завершившаяся задача лоб не держит,
+        // но если между exit и reap случилось что-то нештатное — лок должен
+        // быть снят, чтобы не повесить шелл.
+        let cur = CURRENT.load(Ordering::SeqCst);
+        if pid != cur && VFS_LOCK.is_locked() && VFS_LOCK_OWNER.load(Ordering::SeqCst) == pid {
+            VFS_LOCK.force_unlock();
+            VFS_LOCK_OWNER.store(0, Ordering::SeqCst);
+            crate::vga::serial_write_atomic("[reap] VFS_LOCK held by reaped task; forced release\n");
         }
         TASKS[pid].take()
     });

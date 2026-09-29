@@ -27,8 +27,12 @@ pub fn run_shell(writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut Vfs) -> !
             }
         }
         {
-            let _g = crate::scheduler::vfs_lock();
-            append_history(vfs, input.as_str());
+            // История — best effort: не блокируемся на VFS_LOCK, если его
+            // держит фоновая задача. Иначе шелл не смог бы выполнить `kill`
+            // для зависшего владельца лока и завис бы сам (CRITICAL-3).
+            if let Some(_g) = crate::scheduler::try_vfs_lock() {
+                append_history(vfs, input.as_str());
+            }
         }
         handle_command(input.as_str(), writer, mem, vfs);
     }
@@ -110,6 +114,32 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
         bg_task(writer, name, args);
         let _g = crate::scheduler::vfs_lock();
         crate::vitafs::sync_all();
+        return true;
+    }
+
+    // `kill` исполняется БЕЗ VFS_LOCK: жертва может держать лок, а лок
+    // нереентерабельный — под ним шелл не смог бы убить владельца и система
+    // зависла бы навсегда (CRITICAL-3). kill() сам принудительно снимает лок
+    // жертвы. Ветку размещаем ДО захвата _vfs_guard.
+    if let ["kill", pid] = args.as_slice() {
+        match crate::tasks::parse_u64(Some(pid)) {
+            Some(p) if p > 0 => {
+                if crate::scheduler::kill(p as usize) {
+                    writer.write_string("Killed task ");
+                    writer.write_string(pid);
+                    writer.write_string("\n");
+                } else {
+                    writer.write_string("kill: no such task: ");
+                    writer.write_string(pid);
+                    writer.write_string("\n");
+                }
+            }
+            _ => {
+                writer.write_string("kill: bad pid: ");
+                writer.write_string(pid);
+                writer.write_string("\n");
+            }
+        }
         return true;
     }
 
@@ -281,26 +311,6 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
         }
         ["ps"] => {
             ps(writer);
-        }
-        ["kill", pid] => {
-            match crate::tasks::parse_u64(Some(pid)) {
-                Some(p) if p > 0 => {
-                    if crate::scheduler::kill(p as usize) {
-                        writer.write_string("Killed task ");
-                        writer.write_string(pid);
-                        writer.write_string("\n");
-                    } else {
-                        writer.write_string("kill: no such task: ");
-                        writer.write_string(pid);
-                        writer.write_string("\n");
-                    }
-                }
-                _ => {
-                    writer.write_string("kill: bad pid: ");
-                    writer.write_string(pid);
-                    writer.write_string("\n");
-                }
-            }
         }
         ["init", sub @ ..] => {
             crate::init::cmd(writer, vfs, sub);

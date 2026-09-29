@@ -2,7 +2,7 @@
 
 use alloc::boxed::Box;
 use alloc::string::String;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::scheduler;
 
@@ -30,6 +30,13 @@ pub fn spawn(name: &str, args: &[&str]) -> Option<usize> {
             let survival = parse_u64(args.get(0).copied()).unwrap_or(0);
             Box::new(move || crashy(survival))
         }
+        // Диагностика CRITICAL-3: kill() владельца VFS_LOCK. Проходит, только
+        // если kill() принудительно снимает лок убитой задачи.
+        "vfslocktest" => Box::new(vfslocktest),
+        // Демонстрация «сбежавшего» владельца лока: захватывает VFS_LOCK и
+        // держит вечно. Убить его можно только через `kill` (без взятия лока)
+        // — проверка, что шелл не замирает вместе с ним.
+        "holdlock" => Box::new(holdlock),
         _ => return None,
     };
     scheduler::spawn(name, f)
@@ -231,4 +238,86 @@ fn crashy(survival: u64) {
     });
     let target = start + survival;
     scheduler::sleep_until(target);
+}
+
+/// Диагностика CRITICAL-3: задача-«сбежавший держатель лока».
+///
+/// Захватывает VFS_LOCK и держит его навсегда (демонстрация «зависшей»
+/// задачи). Спустя HOLD_DELAY тиков после запуска — чтобы bg-ветка шелла
+/// успела сделать свой sync_all и выпустить шелл на промпт. Дальше шелл
+/// обязан остаться отзывчивым (история пишется через try_vfs_lock) и мочь
+/// `kill <pid>` — kill() снимает лок принудительно (CRITICAL-3).
+const HOLD_DELAY: u64 = 20;
+
+fn holdlock() {
+    crate::scheduler::sleep_until(crate::scheduler::ticks() + HOLD_DELAY);
+    let _g = crate::scheduler::vfs_lock();
+    crate::vga::serial_write_atomic("[holdlock] pid=");
+    crate::vga::serial_u64(crate::scheduler::current_pid() as u64);
+    crate::vga::serial_write_atomic(" acquired VFS_LOCK forever\n");
+    loop {
+        x86_64::instructions::hlt();
+    }
+}
+
+/// Маркер: жертва vfslocktest выполнила захват VFS_LOCK.
+static VICTIM_LOCKED: AtomicBool = AtomicBool::new(false);
+
+/// Диагностика CRITICAL-3 (kill владельца VFS_LOCK).
+///
+/// Сценарий: спавнится задача-жертва, которая захватывает VFS_LOCK и засыпает,
+/// НЕ отпуская лоб. Запускающий (мы) лок не держит — как init-супервизор при
+/// respawn — и убивает жертву. Без фикса лок остался бы занят навсегда
+/// (deadlock всей системы); с фиксом kill() снимает его принудительно.
+/// Проверка: после kill лок обязан быть свободен (try_vfs_lock == Some).
+fn vfslocktest() {
+    crate::vga::serial_write_atomic("[vfslocktest] start\n");
+    VICTIM_LOCKED.store(false, Ordering::SeqCst);
+
+    let victim = match scheduler::spawn(
+        "lockvictim",
+        Box::new(|| {
+            // Владелец лока становится = жертва (см. VFS_LOCK_OWNER).
+            let _g = crate::scheduler::vfs_lock();
+            VICTIM_LOCKED.store(true, Ordering::SeqCst);
+            // Спим, держа лок: жертва должна быть убита, а не отпустить сама.
+            crate::scheduler::sleep_until(crate::scheduler::ticks() + 100000);
+        }),
+    ) {
+        Some(p) => p,
+        None => {
+            crate::vga::serial_write_atomic("[vfslocktest] no free task slot\n");
+            return;
+        }
+    };
+    crate::vga::serial_write_atomic("[vfslocktest] victim pid=");
+    crate::vga::serial_u64(victim as u64);
+    crate::vga::serial_write_atomic("\n");
+
+    // Ждём, пока жертва ВЫПОЛНИТ захват лока (маркер ставится после
+    // vfs_lock()). Убивать раньше неинтересно: лок был бы свободен.
+    while !VICTIM_LOCKED.load(Ordering::SeqCst) {
+        crate::scheduler::sleep_until(crate::scheduler::ticks() + 1);
+    }
+
+    // Момент истины: убиваем владельца лока из не-владельца.
+    crate::scheduler::kill(victim);
+    crate::vga::serial_write_atomic("[vfslocktest] killed victim; probing lock\n");
+
+    if let Some(_g) = crate::scheduler::try_vfs_lock() {
+        // Guard упал в конце выражения — лок снова свободен.
+        crate::vga::serial_write_atomic("[vfslocktest] PASS: VFS_LOCK released after kill\n");
+        let report = alloc::format!(
+            "vfslocktest PASS pid={} lock-released-by-kill\n",
+            victim
+        );
+        crate::scheduler::with_vfs(|vfs| {
+            let _ = vfs.write_file("/tmp/vfslocktest.log", report.as_bytes());
+        });
+    } else {
+        // Не пишем в файл: лок занят, with_vfs завис бы. Зависший тест сам
+        // по себе — сигнал (это и есть старое поведение).
+        crate::vga::serial_write_atomic("[vfslocktest] FAIL: VFS_LOCK still held\n");
+    }
+    crate::vga::serial_write_atomic("[vfslocktest] done\n");
 }
