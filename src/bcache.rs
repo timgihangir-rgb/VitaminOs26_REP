@@ -211,6 +211,15 @@ pub fn capture_dirty_into_wal() -> bool {
                 buf.copy_from_slice(&e.data);
                 (e.block, buf)
             };
+            // Блок, изменённый ТЕКУЩЕЙ транзакцией, в bcache лежит в СТАРОЙ
+            // редакции (мутации идут в staging, минуя кэш). stage() дедуплицирует
+            // по номеру и ЗАМЕНИЛ бы свежий staging-контент устаревшим из кэша —
+            // тогда битмапы/данные «ревертились» бы между транзакциями и
+            // alloc_inode повторно выдавал занятые иноды. Версия из staging всегда
+            // новее: пропускаем её.
+            if crate::wal::is_staged(b) {
+                continue;
+            }
             if !crate::wal::stage_ref(b, data) {
                 return false;
             }

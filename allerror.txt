@@ -122,18 +122,33 @@ VitaminOS26 — Отсортированные баги (от самых опа�
     Фикс: Реализовать block-level append (write начиная с конца)
           без чтения всего файла.
 
-[HIGH-2] copy_tree() не копирует симлинки
-    Файл: src/vitafs.rs:592-598
-    Описание: copy_tree() обрабатывает TYPE_FILE и TYPE_DIR, но
-              TYPE_SYMLINK → else { return Err(()) }. cp -r на
-              каталог, содержащий симлинки, молча падает.
+[HIGH-2] copy_tree() не копирует симлинки — FIXED
+    Файл: src/vfs.rs:585-619, src/bcache.rs:197-221, src/wal.rs
+    Статус: FIXED (коммит HIGH-2+WAL)
+    Описание: copy_tree() обрабатывал TYPE_FILE и TYPE_DIR, а
+              TYPE_SYMLINK → else { return Err(()) }. cp каталога
+              с симлинками падал с откатом всей транзакции.
               В vfs.rs:copy_inner() — прямая замена файла файлом
               тоже не учитывает симлинки как source.
-    Влияние: Потеря данных при рекурсивном копировании каталогов
-              со ссылками.
-    Фикс: В copy_tree добавить ветку TYPE_SYMLINK: прочитать
-          цель через node.target_str() и создать symlnk через
-          dir_add + DiskInode::zeroed(TYPE_SYMLINK) + set_target.
+    Корень (два слоя):
+      a) отсутствовали ветки TYPE_SYMLINK и TYPE_CHARDEV в copy_tree;
+      b) ГЛУБЖЕ: alloc_inode повторно выдавал занятые иноды (25×4,
+         26×3 в прогоне) из-за реверта битмапа. Причина: на commit
+         capture_dirty_into_wal() перекладывал грязные bcache-блоки
+         в staging, а stage() дедуплицирует по номеру и ЗАМЕНЯЛ
+         свежий staging-контент (битмап с новым битом) устаревшей
+         копией из bcache. Следствие: iput(26, FILE) затирал в
+         icache запись каталога srcd (тоже ino 26) → dir_add
+         «not dir» → cp внутрь свежей директории падал.
+    Фикс:
+      a) copy_tree: ветки TYPE_SYMLINK (перенос цели через
+         target_str/set_target) и TYPE_CHARDEV (перенос device_id);
+      b) capture_dirty_into_wal: пропускать блоки, уже изменённые
+         текущей транзакцией (wal::is_staged) — их версия новее.
+    Верификация: cp /home/srcd /home/xcopy (FILE+3 LNK, включая
+      относительный) + cat относительного симлинка в копии;
+      cp /dev /home/devcopy (5 chardev); dumpfs: иноды уникальны;
+      полный test_commands-смоук (cp/mv/find/rm) — ALL CHECKS PASSED.
 
 [HIGH-3] boot_sb() захардкожен на 8 МиБ
     Файл: src/vitafs.rs:887-888

@@ -580,21 +580,43 @@ fn is_prefix(prefix: &[String], parts: &[String]) -> bool {
 }
 
 /// Рекурсивное копирование дерева: файлы - через read/write_all,
-/// каталоги - созданием и обходом записей.
+/// каталоги - созданием и обходом записей, симлинки - переносом цели
+/// (fast-symlink) из инода, chardev - переносом device_id.
 fn copy_tree(sb: &vitafs::Superblock, src_ino: u32, dst_parent: u32, name: &str) -> Result<(), ()> {
     let src_node = vitafs::iget(sb, src_ino).ok_or(())?;
     let new_ino = vitafs::create_node(sb, dst_parent, name, src_node.itype).ok_or(())?;
-    if src_node.itype == vitafs::TYPE_FILE {
-        let data = vitafs::file_read_all(sb, src_ino).ok_or(())?;
-        if !vitafs::file_write_all(sb, new_ino, &data) {
-            return Err(());
+    match src_node.itype {
+        vitafs::TYPE_FILE => {
+            let data = vitafs::file_read_all(sb, src_ino).ok_or(())?;
+            if !vitafs::file_write_all(sb, new_ino, &data) {
+                return Err(());
+            }
         }
-    } else if src_node.itype == vitafs::TYPE_DIR {
-        for entry in vitafs::dir_readdir(sb, src_ino).ok_or(())? {
-            copy_tree(sb, entry.ino, new_ino, &entry.name)?;
+        vitafs::TYPE_DIR => {
+            for entry in vitafs::dir_readdir(sb, src_ino).ok_or(())? {
+                copy_tree(sb, entry.ino, new_ino, &entry.name)?;
+            }
         }
-    } else {
-        return Err(());
+        vitafs::TYPE_SYMLINK => {
+            // Fast-symlink: цель лежит в области target самого инода.
+            let target = src_node.target_str().ok_or(())?;
+            let mut dst = vitafs::iget(sb, new_ino).ok_or(())?;
+            if !dst.set_target(target) {
+                return Err(());
+            }
+            dst.size = target.len() as u32;
+            if !vitafs::iput(sb, new_ino, &dst) {
+                return Err(());
+            }
+        }
+        vitafs::TYPE_CHARDEV => {
+            let mut dst = vitafs::iget(sb, new_ino).ok_or(())?;
+            dst.device_id = src_node.device_id;
+            if !vitafs::iput(sb, new_ino, &dst) {
+                return Err(());
+            }
+        }
+        _ => return Err(()),
     }
     Ok(())
 }

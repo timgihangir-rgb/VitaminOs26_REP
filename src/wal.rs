@@ -430,6 +430,11 @@ pub fn stage_ref(bno: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
     stage(bno, buf)
 }
 
+/// Занят ли блок в staging (т.е. уже изменён текущей транзакцией).
+pub fn is_staged(bno: u64) -> bool {
+    with_wal(|w| w.staging.iter().any(|(b, _)| *b == bno)).unwrap_or(false)
+}
+
 /// Читает блок сквозь staging (свежие данные текущей транзакции).
 pub fn read_through(bno: u64, out: &mut [u8; BLOCK_SIZE]) -> bool {
     with_wal(|w| {
