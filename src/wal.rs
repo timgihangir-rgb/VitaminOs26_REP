@@ -338,19 +338,35 @@ pub fn commit() -> bool {
     if !last {
         return true;
     }
-    commit_all()
+    let ok = commit_all();
+    if ok {
+        // Успешно зафиксировано: состояние icache стало истиной,
+        // журнал отката больше не нужен.
+        crate::vitafs::icache_undo_clear();
+    }
+    ok
 }
 
 /// Откатывает текущую внешнюю транзакцию без записи на диск.
 pub fn abort() {
-    with_wal(|w| {
+    let closed = with_wal(|w| {
         if w.depth > 0 {
             w.depth -= 1;
         }
-        if w.depth == 0 {
+        let c = w.depth == 0;
+        if c {
             w.staging.clear();
         }
-    });
+        c
+    })
+    .unwrap_or(true);
+    if closed {
+        // Откатываем и мутации inode-кэша, сделанные в транзакции
+        // (иначе «обнулённый» inode из упавшего destroy_node уехал бы
+        // на диск при следующем commit), затем чистим журнал.
+        crate::vitafs::icache_rollback();
+        crate::vitafs::icache_undo_clear();
+    }
 }
 
 /// Ставит блок в очередь транзакции (дедуп по номеру). Вызывается из

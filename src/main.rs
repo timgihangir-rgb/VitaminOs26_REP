@@ -148,8 +148,6 @@ fn stage0_diag() {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Под gdb: остановиться ПРЯМО В ПАНИКЕ с полным контекстом.
-    unsafe { core::arch::asm!("int3", options(nomem)) };
     let mut writer = vga::Writer::new();
     writer.write_string("KERNEL PANIC: ");
 
@@ -181,6 +179,12 @@ fn panic(info: &PanicInfo) -> ! {
     for b in msg.bytes() {
         vga::serial_putchar(b);
     }
+
+    // Стоп в панике только для отладки: int3 без подключённого GDB —
+    // молчаливое зависание. В debug-сборке сообщение уже напечатано
+    // (VGA + COM1), дальше gdb получает полный контекст на int3.
+    #[cfg(debug_assertions)]
+    unsafe { core::arch::asm!("int3", options(nomem)) };
 
     halt_loop()
 }

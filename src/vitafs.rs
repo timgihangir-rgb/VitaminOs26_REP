@@ -929,6 +929,83 @@ static mut ITABLE: [IEntry; INODE_CACHE_SLOTS] = [IEntry {
     pins: 0,
 }; INODE_CACHE_SLOTS];
 
+// Журнал отката inode-кэша для WAL-abort. Проблема: wal::abort() чистил
+// только staging, а мутации icache (iput -> Dirty, iget-miss -> заполнение
+// слота, ipick_victim -> вытеснение) оставались. Если destroy_node падал
+// ПОСЛЕ обнуления inode (например, dir_remove возвращал false), «обнулённый»
+// inode висел грязным в кэше и уезжал на диск при следующем commit — при
+// этом запись в каталоге оставалась: битый dangling-указатель.
+//
+// Здесь мы храним ИСХОДНОЕ состояние каждого мутированного слота (первый
+// snapshot побеждает, чтобы оригинал не затёрся) и восстанавливаем его при
+// abort. Commit просто сбрасывает журнал — зафиксированное состояние новое.
+#[derive(Clone, Copy)]
+struct IcacheUndo {
+    idx: usize,
+    ino: u32,
+    node: DiskInode,
+    state: IState,
+    pins: u32,
+}
+
+static mut ICACHE_UNDO: [IcacheUndo; INODE_CACHE_SLOTS] = [IcacheUndo {
+    idx: 0,
+    ino: 0,
+    node: DiskInode::zeroed(TYPE_FREE),
+    state: IState::Free,
+    pins: 0,
+}; INODE_CACHE_SLOTS];
+static mut ICACHE_UNDO_N: usize = 0;
+
+/// Снимает ПЕРВЫЙ snapshot слота idx при его мутации, если активна
+/// транзакция. Повторные вызовы для того же слота игнорируются.
+/// Вызывается из ipick_victim (до вытеснения/заполнения слота).
+unsafe fn icache_note(idx: usize) {
+    if !crate::wal::txn_active() {
+        return;
+    }
+    for i in 0..ICACHE_UNDO_N {
+        if ICACHE_UNDO[i].idx == idx {
+            return;
+        }
+    }
+    if ICACHE_UNDO_N >= INODE_CACHE_SLOTS {
+        return; // слотов не больше, чем слотов кэша
+    }
+    let e = &ITABLE[idx];
+    ICACHE_UNDO[ICACHE_UNDO_N] = IcacheUndo {
+        idx,
+        ino: e.ino,
+        node: e.node,
+        state: e.state,
+        pins: e.pins,
+    };
+    ICACHE_UNDO_N += 1;
+}
+
+/// Возвращает мутированные слоты к исходному состоянию (вызов: wal::abort
+/// при закрытии ВНЕШНЕЙ транзакции).
+pub fn icache_rollback() {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        while ICACHE_UNDO_N > 0 {
+            ICACHE_UNDO_N -= 1;
+            let u = ICACHE_UNDO[ICACHE_UNDO_N];
+            let e = &mut ITABLE[u.idx];
+            e.ino = u.ino;
+            e.node = u.node;
+            e.state = u.state;
+            e.pins = u.pins;
+        }
+    });
+}
+
+/// Сбрасывает журнал (успешный commit / старт новой транзакции).
+pub fn icache_undo_clear() {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        ICACHE_UNDO_N = 0;
+    });
+}
+
 static mut ICACHE_STATS: (u64, u64) = (0, 0); // (hits, misses)
 
 unsafe fn itick() -> u64 {
@@ -953,6 +1030,7 @@ unsafe fn ipick_victim(ino: u32) -> Option<usize> {
             }
             _ => {
                 if e.ino == ino {
+                    icache_note(i);
                     return Some(i);
                 }
                 if e.pins == 0 && e.stamp < lru_stamp {
@@ -963,6 +1041,7 @@ unsafe fn ipick_victim(ino: u32) -> Option<usize> {
         }
     }
     let idx = free_idx.or(lru_idx)?;
+    icache_note(idx);
     if ITABLE[idx].state == IState::Dirty {
         let e = ITABLE[idx];
         if !write_inode(&Superblock::for_image(8 * 1024 * 1024), e.ino, &e.node) {
@@ -1614,8 +1693,14 @@ pub fn file_read_all(sb: &Superblock, ino: u32) -> Option<alloc::vec::Vec<u8>> {
 }
 
 /// Освобождает блок данных по абсолютному номеру (с сбросом грязной копии).
+/// Использует СМОНТИРОВАННЫЙ суперблок (настоящий размер диска), а не
+/// захардкоженную 8MiB-константу — иначе на нестандартных образах битмап
+/// свободных блоков писался бы по смещениям для 8MiB.
 fn release_data_block(bno: u32) -> bool {
-    free_data_block(&boot_sb(), bno as u64)
+    match mounted_sb() {
+        Some(sb) => free_data_block(sb, bno as u64),
+        None => free_data_block(&boot_sb(), bno as u64),
+    }
 }
 
 /// Пишет файл ЦЕЛИКОМ поверх старого содержимого (create-or-truncate).
@@ -1745,6 +1830,15 @@ pub fn destroy_node(sb: &Superblock, parent_dir: u32, name: &str, expect_type: u
             _ => return false,
         }
     }
+    // Порядок освобождения важен для отката: сначала убираем запись из
+    // каталога, потом освобождаем данные и только в самом конце обнуляем
+    // inode и чистим его битмап. Если что-то упадёт после начала мутаций —
+    // wal::abort откатит staging + inode-кэш (журнал отката icache), и ФС
+    // останется консистентной: запись на месте, inode не «обнулён», блоки
+    // не зависли занятыми в битмапе.
+    if !dir_remove(sb, parent_dir, name) {
+        return false;
+    }
     // Данные: прямые + косвенный уровень.
     for d in node.direct.iter() {
         if *d != 0 {
@@ -1768,10 +1862,7 @@ pub fn destroy_node(sb: &Superblock, parent_dir: u32, name: &str, expect_type: u
     if !iput(sb, child, &zeroed) {
         return false;
     }
-    if !free_inode(sb, child) {
-        return false;
-    }
-    dir_remove(sb, parent_dir, name)
+    free_inode(sb, child)
 }
 
 /// Самопроверка файлового слоя: create/write/read/shrink/grow/rm на
