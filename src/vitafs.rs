@@ -22,6 +22,12 @@ pub const INODE_TABLE_START: u32 = 69;
 pub const INODE_TABLE_BLOCKS: u32 = 32;
 pub const DATA_START: u32 = INODE_TABLE_START + INODE_TABLE_BLOCKS; // 101
 
+// Лимит геометрии: битмапы данных фиксированы (BLOCK_BITMAP_BLOCKS), поэтому
+// суперблок не может описывать диск больше этой ёмкости. format_image()
+// клампит реальную ёмкость устройства этим пределом.
+pub const MAX_DATA_BITMAP_BITS: u32 = BLOCK_BITMAP_BLOCKS * BLOCK_SIZE as u32 * 8;
+pub const MAX_TOTAL_BLOCKS: u32 = DATA_START + MAX_DATA_BITMAP_BITS;
+
 pub const INODE_SIZE: usize = 128;
 pub const INODES_PER_BLOCK: u32 = (BLOCK_SIZE / INODE_SIZE) as u32; // 32
 pub const TOTAL_INODES: u32 = INODES_PER_BLOCK * INODE_TABLE_BLOCKS; // 1024
@@ -290,7 +296,7 @@ pub fn capture_dirty_inodes_into_wal() -> bool {
     static mut RAW: [u8; INODE_SIZE] = [0; INODE_SIZE];
     static mut BUF: [u8; BLOCK_SIZE] = [0; BLOCK_SIZE];
     x86_64::instructions::interrupts::without_interrupts(|| unsafe {
-        let sb = boot_sb();
+        let sb = current_sb();
         for i in 0..INODE_CACHE_SLOTS {
             let (ino, raw): (u32, &mut [u8; INODE_SIZE]) = {
                 let e = &ITABLE[i];
@@ -466,7 +472,7 @@ fn bitmap_selftest_pure() -> bool {
     true
 }
 
-/// Дисковая самопроверка аллокаторов на реальной геометрии образа 8 МиБ.
+/// Дисковая самопроверка аллокаторов на геометрии смонтированной ФС.
 /// Трогает только блоки битмапов (65 и 67); подменяет их свежим форматом,
 /// гоняет аллокатор и восстанавливает исходное содержимое.
 pub fn bitmap_selftest_disk() -> bool {
@@ -496,7 +502,7 @@ pub fn bitmap_selftest_disk() -> bool {
     }
     crate::bcache::drop_all();
 
-    let sb = Superblock::for_image(8 * 1024 * 1024);
+    let sb = current_sb();
     let mut ok = false;
     'run: {
         let a = match alloc_data_block(&sb) {
@@ -779,7 +785,7 @@ pub fn inode_selftest_disk() -> bool {
     if !inode_selftest_pure() {
         return false;
     }
-    let sb = Superblock::for_image(8 * 1024 * 1024);
+    let sb = current_sb();
     // Последний inode таблицы: 1023 -> блок 100, слот 31.
     let probe = sb.total_inodes - 1;
     let table_block = (sb.inode_table_start + probe / INODES_PER_BLOCK) as u64;
@@ -880,12 +886,20 @@ fn inode_selftest_pure() -> bool {
 // Инвариант union'а: у не-симлинков target в кэше всегда нули (это
 // гарантирует decode), поэтому кэш можно сравнивать и писать как есть.
 //
-// TODO(3.1.6): заменить захардкоженный for_image(8МиБ) на смонтированный
-// контекст ФС (структура Mount с реальным sb из суперблока диска).
+// Геометрия, отличную от 8-МиБ константы, несёт СМОНТИРОВАННЫЙ суперблок
+// (заполняется из sb на диске) — вся работа с ФС идёт через current_sb().
+// boot_sb() остаётся только для этапа форматирования, когда диска ещё нет.
 
-/// Канонический суперблок загрузочного образа (до появления mount-контекста).
+/// Канонический суперблок загрузочного образа (этап форматирования,
+/// fallback при недоступной ёмкости устройства).
 pub fn boot_sb() -> Superblock {
     Superblock::for_image(8 * 1024 * 1024)
+}
+
+/// Суперблок текущей ФС: смонтированный (реальная геометрия диска);
+/// до появления mount-контекста — канонический загрузочный.
+pub fn current_sb() -> Superblock {
+    mounted_sb().copied().unwrap_or_else(boot_sb)
 }
 
 
@@ -1044,7 +1058,7 @@ unsafe fn ipick_victim(ino: u32) -> Option<usize> {
     icache_note(idx);
     if ITABLE[idx].state == IState::Dirty {
         let e = ITABLE[idx];
-        if !write_inode(&Superblock::for_image(8 * 1024 * 1024), e.ino, &e.node) {
+        if !write_inode(&current_sb(), e.ino, &e.node) {
             return None;
         }
     }
@@ -1101,7 +1115,7 @@ pub fn sync_all() -> bool {
 /// Выгоняет все грязные inode на диск.
 pub fn iflush_all() -> bool {
     x86_64::instructions::interrupts::without_interrupts(|| unsafe {
-        let sb = boot_sb();
+        let sb = current_sb();
         let mut ok = true;
         for i in 0..INODE_CACHE_SLOTS {
             if ITABLE[i].state == IState::Dirty {
@@ -1157,7 +1171,7 @@ pub fn unpin(ino: u32) {
 pub fn icache_selftest_disk() -> bool {
     idrop_all();
     crate::bcache::drop_all();
-    let sb = Superblock::for_image(8 * 1024 * 1024);
+    let sb = current_sb();
     // Соседний с probe слот: 1022 -> блок 100.
     let probe = sb.total_inodes - 2;
     let table_block = (sb.inode_table_start + probe / INODES_PER_BLOCK) as u64;
@@ -1444,7 +1458,7 @@ pub fn dir_remove(sb: &Superblock, dir_ino: u32, name: &str) -> bool {
 pub fn dir_selftest_disk() -> bool {
     idrop_all();
     crate::bcache::drop_all();
-    let sb = boot_sb();
+    let sb = current_sb();
     // Затрагиваемые метаблоки: битмапы и таблица inode (блок 69 = inodes 32..63,
     // но наши 3..8 тоже в блоке 69? 3..31 -> да, блок 69).
     // Буферы восстановления - static, чтобы не раздувать 16КиБ boot-стек
@@ -1560,7 +1574,17 @@ pub fn format_image() -> bool {
     }
     idrop_all();
     crate::bcache::drop_all();
-    let sb = boot_sb();
+    // Геометрия выводится из РЕАЛЬНОЙ ёмкости устройства (IDENTIFY), а не из
+    // константы 8 МиБ: диск другого размера форматируется целиком. Кламп на
+    // вместимость фиксированных битмапов (MAX_TOTAL_BLOCKS). Без ёмкости
+    // (ошибка IDENTIFY) - запасной канонический 8-МиБ суперблок.
+    let sb = match crate::blockdev::capacity_blocks() {
+        Some(blocks) => {
+            let total = core::cmp::min(blocks, MAX_TOTAL_BLOCKS);
+            Superblock::for_image(total as u64 * BLOCK_SIZE as u64)
+        }
+        None => boot_sb(),
+    };
     let mut ok = true;
 
     // Суперблок.
@@ -1697,10 +1721,7 @@ pub fn file_read_all(sb: &Superblock, ino: u32) -> Option<alloc::vec::Vec<u8>> {
 /// захардкоженную 8MiB-константу — иначе на нестандартных образах битмап
 /// свободных блоков писался бы по смещениям для 8MiB.
 fn release_data_block(bno: u32) -> bool {
-    match mounted_sb() {
-        Some(sb) => free_data_block(sb, bno as u64),
-        None => free_data_block(&boot_sb(), bno as u64),
-    }
+    free_data_block(&current_sb(), bno as u64)
 }
 
 /// Пишет файл ЦЕЛИКОМ поверх старого содержимого (create-or-truncate).
@@ -1873,7 +1894,7 @@ pub fn fileops_selftest_disk() -> bool {
     const TEST_ROOT: u32 = 1000;
     idrop_all();
     crate::bcache::drop_all();
-    let sb = boot_sb();
+    let sb = current_sb();
     static mut ORIG_BB: [u8; BLOCK_SIZE] = [0; BLOCK_SIZE];
     static mut ORIG_IB: [u8; BLOCK_SIZE] = [0; BLOCK_SIZE];
     static mut ORIG_TB: [u8; BLOCK_SIZE] = [0; BLOCK_SIZE];

@@ -28,6 +28,10 @@ const ATA_CONTROL: u16 = 0x3F6;
 const ATA_CMD_READ_PIO: u8 = 0x20;
 const ATA_CMD_WRITE_PIO: u8 = 0x30;
 const ATA_CMD_CACHE_FLUSH: u8 = 0xE7;
+const ATA_CMD_IDENTIFY: u8 = 0xEC;
+
+/// Ёмкость диска, считанная через IDENTIFY (в 4-КиБ блоках); None - не снята.
+static mut CAPACITY_BLOCKS: Option<u32> = None;
 
 /// Статистика блочного устройства. Счётчики монотонные, насыщаются.
 pub struct BlockStats {
@@ -128,6 +132,41 @@ pub fn present() -> bool {
         let p = probe();
         DISK_PRESENT = Some(p);
         p
+    }
+}
+
+/// ATA IDENTIFY DEVICE: число секторов LBA28 (words 60-61).
+/// None при отсутствии ответа или ошибке шины.
+fn ata_identify_sectors() -> Option<u32> {
+    unsafe {
+        outb(ATA_DRIVE, 0xA0); // primary master, CHS-режим
+        outb(ATA_SECCOUNT, 0);
+        outb(ATA_LBA_LOW, 0);
+        outb(ATA_LBA_MID, 0);
+        outb(ATA_LBA_HIGH, 0);
+        outb(ATA_CMD, ATA_CMD_IDENTIFY);
+        if !wait_drq() {
+            return None;
+        }
+        let mut data = [0u16; 256];
+        for w in data.iter_mut() {
+            *w = inw(ATA_BASE);
+        }
+        Some((data[60] as u32) | ((data[61] as u32) << 16))
+    }
+}
+
+/// Число 4-КиБ блоков на устройстве (ёмкость). Кэшируется после первого
+/// вызова. Используется для вывода геометрии ФС из реального размера диска.
+pub fn capacity_blocks() -> Option<u32> {
+    unsafe {
+        if let Some(c) = CAPACITY_BLOCKS {
+            return Some(c);
+        }
+        let sectors = ata_identify_sectors()?;
+        let blocks = sectors / SECTORS_PER_BLOCK;
+        CAPACITY_BLOCKS = Some(blocks);
+        Some(blocks)
     }
 }
 
@@ -279,11 +318,14 @@ pub fn reset_controller() {
 }
 
 /// Самопроверка блочного слоя: roundtrip тестовый блок в конце образа.
-/// Образ 8 МиБ = 2048 блоков; используем последний блок, который не занят
-/// слепком VFS (слепок живёт в первых секторах после суперблока).
+/// Тестовый блок выводится из реальной ёмкости, но не выше блока 2047
+/// (8-МиБ лимита) — на больших образах не трогаем хвост, на малых не
+/// выходим за пределы. Слепок VFS живёт в первых секторах после
+/// суперблока, так что низ диска не задеваем.
 pub fn selftest() -> bool {
-    const IMG_BLOCKS: u64 = (8 * 1024 * 1024 / BLOCK_SIZE) as u64;
-    let probe_block = IMG_BLOCKS - 1;
+    let probe_block: u64 = capacity_blocks()
+        .map(|c| core::cmp::max(1, core::cmp::min(c, 2048) - 1) as u64)
+        .unwrap_or(2047);
     let mut w = [0u8; BLOCK_SIZE];
     let mut r = [0u8; BLOCK_SIZE];
     for (i, b) in w.iter_mut().enumerate() {

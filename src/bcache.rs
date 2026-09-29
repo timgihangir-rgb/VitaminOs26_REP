@@ -241,10 +241,12 @@ pub fn stats_line(buf: &mut alloc::string::String) {
 }
 
 /// Самопроверка семантики write-back: запись видна через кэш сразу,
-/// на диске - только после flush_all(). Тестовый блок в конце образа.
+/// на диске - только после flush_all(). Тестовый блок в конце образа
+/// (ёмкость берём с устройства, но не выше 8-МиБ лимита 2046).
 pub fn selftest() -> bool {
-    const IMG_BLOCKS: u64 = (8 * 1024 * 1024 / BLOCK_SIZE) as u64;
-    let b = IMG_BLOCKS - 2;
+    let b: u64 = blockdev::capacity_blocks()
+        .map(|c| core::cmp::max(1, core::cmp::min(c, 2048) - 2) as u64)
+        .unwrap_or(2046);
     let mut w = [0u8; BLOCK_SIZE];
     let mut out = [0u8; BLOCK_SIZE];
     let mut raw = [0u8; BLOCK_SIZE];
