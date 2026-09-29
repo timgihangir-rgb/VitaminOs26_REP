@@ -786,8 +786,13 @@ extern "C" fn schedule() -> usize {
         }
 
         // Пробуждаем спящие задачи, чей срок настал: Blocked + wake_tick <= now
-        // становятся Ready и участвуют в round-robin.
-        for i in 1..MAX_TASKS {
+        // становятся Ready и участвуют в round-robin. Включая задачу 0 (шелл):
+        // её sleep_until/block_until_tick тоже ставят wake_tick, без этого
+        // пункта шелл мог бы проснуться только через fallback (пока все прочие
+        // задачи спят) — первое же пробуждение фоновой задачи навсегда
+        // оставляло шелл Blocked с просроченным wake_tick (зависание ping).
+        // wait_for не задевается: там wake_tick == 0.
+        for i in 0..MAX_TASKS {
             if let Some(t) = TASKS[i].as_mut() {
                 if t.state == TaskState::Blocked && t.wake_tick != 0 && t.wake_tick <= ticks {
                     t.state = TaskState::Ready;

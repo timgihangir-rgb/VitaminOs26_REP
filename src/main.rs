@@ -18,7 +18,9 @@ mod init;
 mod interrupts;
 mod keyboard;
 mod memory;
+mod net;
 mod paging;
+mod pci;
 mod progabi;
 mod ralloc;
 mod rtc;
@@ -132,6 +134,20 @@ fn stage0_diag() {
     msg.push_str(if bcache::selftest() { "OK" } else { "FAIL" });
     msg.push_str(" vitafs-sb selftest=");
     msg.push_str(if vitafs::selftest() { "OK" } else { "FAIL" });
+    // Сетевой стек: карта (rtl8139) в этом прогоне может отсутствовать —
+    // это диагностика, а не ошибка.
+    msg.push_str(" | pci=");
+    match crate::pci::find_device(0x10EC, 0x8139) {
+        Some(d) => {
+            msg.push_str(&alloc::format!(
+                "rtl8139 {:02x}:{:02x}:{:02x} bar0={:08x}",
+                d.bus, d.slot, d.func, d.bar0
+            ));
+            msg.push_str(" | nic=");
+            msg.push_str(if crate::net::init() { "ready" } else { "init-fail" });
+        }
+        None => msg.push_str("no-rtl8139"),
+    }
     }
     let st = blockdev::stats();
     let _ = write!(

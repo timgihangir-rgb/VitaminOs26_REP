@@ -143,6 +143,17 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
         return true;
     }
 
+    // `ping` — сетевой стек: живёт на портах и в статической памяти ядра,
+    // VFS не трогает. Выполняем БЕЗ VFS_LOCK (как `kill`): запрос может
+    // ждать ARP/ICMP до пары секунд, и фоновые задачи с ФС не должны
+    // крутиться на локе в это время.
+    if let ["ping", addr] = args.as_slice() {
+        crate::net::ping(writer, addr);
+        let _g = crate::scheduler::vfs_lock();
+        crate::vitafs::sync_all();
+        return true;
+    }
+
     // Весь доступ к VFS из шелла сериализуется с фоновыми задачами.
     let _vfs_guard = crate::scheduler::vfs_lock();
 
