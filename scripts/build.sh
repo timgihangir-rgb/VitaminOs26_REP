@@ -59,6 +59,7 @@ fi
 # в слепке VFS на диске (лимит 128 КБ).
 ###############################################################################
 PROGRAM_LIST="target/programs.list"
+mkdir -p target
 : > "$PROGRAM_LIST"
 
 if [ -n "$CC" ]; then

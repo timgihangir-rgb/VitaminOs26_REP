@@ -9,3 +9,8 @@ rustflags = [
 
 [unstable]
 build-std = ["core", "compiler_builtins", "alloc"]
+
+[net]
+# libgit2 внутри cargo падает на SSL (unknown error; class=Ssl), системный git
+# работает. Заставляем cargo гонять git приложением - обход сетевого прокси.
+git-fetch-with-cli = true
