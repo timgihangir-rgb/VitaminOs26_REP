@@ -1,0 +1,19 @@
+[package]
+name = "meminfo"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "meminfo"
+path = "main.rs"
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 2

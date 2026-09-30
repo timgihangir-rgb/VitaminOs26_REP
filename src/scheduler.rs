@@ -283,6 +283,11 @@ pub fn current_pid() -> usize {
     CURRENT.load(Ordering::SeqCst)
 }
 
+/// Число активных задач (для sysinfo/meminfo).
+pub fn task_count() -> usize {
+    unsafe { TASKS.iter().filter(|s| s.is_some()).count() }
+}
+
 /// Захват VFS_LOCK с уступкой CPU. Спин-лок нереентерабельный, а при
 /// вытесняющей многозадачности крутящийся на локе поток способен навсегда
 /// отобрать процессор у держателя лока (тикер не передаст ему управление,

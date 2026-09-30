@@ -151,6 +151,7 @@ unsafe impl FrameAllocator<Size4KiB> for FrameAlloc {
                 let addr = FREE_FRAMES[FREE_COUNT];
                 // Валидация записи free-list: мусор здесь = чья-то порча.
                 if addr >= 0x40_0000 && addr < 0x80_0000 && addr % 4096 == 0 {
+                    ALLOCATED_FRAMES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
                     return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
                 }
                 crate::vga::serial_write_atomic("[frames] BAD entry addr=");
@@ -159,7 +160,11 @@ unsafe impl FrameAllocator<Size4KiB> for FrameAlloc {
                 crate::vga::serial_u64(FREE_COUNT as u64);
                 crate::vga::serial_write_atomic("\n");
             }
-            self.sweep_next()
+            let f = self.sweep_next();
+            if f.is_some() {
+                ALLOCATED_FRAMES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            }
+            f
         })
     }
 }
@@ -185,11 +190,19 @@ impl FrameDeallocator<Size4KiB> for FrameAlloc {
             } else {
                 crate::vga::serial_write_atomic("[frames] free-list FULL, leak\n");
             }
+            // И в free-list, и в «утечке» фрейм больше не занят владельцем.
+            ALLOCATED_FRAMES.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
         })
     }
 }
 
 pub static mut FRAME_ALLOC: FrameAlloc = FrameAlloc::new();
+
+/// Счётчик выданных и не освобождённых фреймов (рамка для `meminfo`:
+/// «занято/свободно»). Не точный аудит, а оценка: кадры ещё не отданные
+/// аллокатором в подсчёт не входят.
+pub static ALLOCATED_FRAMES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 pub fn init_allocator(regions: &'static [MemRegion]) {
     unsafe {

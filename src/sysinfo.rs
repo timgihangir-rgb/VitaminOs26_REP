@@ -22,6 +22,10 @@ pub struct SysInfo {
     pub bootloader_version: [u8; 16],
     pub resolution: [u8; 16],
     pub terminal: [u8; 16],
+    // Поля для программ (meminfo и пр.) — добавлены в конец, чтобы не менять
+    // смещения прежних полей (fetch читает только старые).
+    pub used_kb: u32,
+    pub proc_count: u32,
 }
 
 fn str_to_fixed<const N: usize>(s: &str) -> [u8; N] {
@@ -58,6 +62,10 @@ impl SysInfo {
             bootloader_version: str_to_fixed("GRUB"),
             resolution: str_to_fixed("80x30 VGA"),
             terminal: str_to_fixed("VGA text mode"),
+            used_kb: (crate::memory::ALLOCATED_FRAMES.load(
+                core::sync::atomic::Ordering::SeqCst,
+            ) * 4) as u32, // 1 фрейм = 4 КиБ -> КБ
+            proc_count: crate::scheduler::task_count() as u32,
         }
     }
 

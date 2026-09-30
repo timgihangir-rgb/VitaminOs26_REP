@@ -25,6 +25,7 @@ static int cur_line, cur_col;
 static int scroll;
 static int modified;
 static int ctrl_pressed;
+static int shift_pressed;
 
 static void outb(unsigned short port, unsigned char val);
 static void set_cursor(int row, int col);
@@ -39,6 +40,23 @@ static void ensure_visible(void);
 static unsigned char kb_read(void);
 static int kb_hit(void);
 
+/* Shift-раскладка: цифры -> символы, буквы -> заглавные (как в ядре). */
+static char shift_char(char c) {
+    switch (c) {
+        case '1': return '!'; case '2': return '@'; case '3': return '#';
+        case '4': return '$'; case '5': return '%'; case '6': return '^';
+        case '7': return '&'; case '8': return '*'; case '9': return '(';
+        case '0': return ')'; case '-': return '_'; case '=': return '+';
+        case ',': return '<'; case '.': return '>'; case '/': return '?';
+        case '[': return '{'; case ']': return '}'; case ';': return ':';
+        case '\'': return '"'; case '`': return '~'; case '\\': return '|';
+        default:
+            if (c >= 'a' && c <= 'z')
+                return (char)(c - 32);
+            return c;
+    }
+}
+
 void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
     (void)argc;
     (void)argv;
@@ -52,6 +70,7 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
     scroll = 0;
     modified = 0;
     ctrl_pressed = 0;
+    shift_pressed = 0;
 
     clear_screen();
 
@@ -100,7 +119,7 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
         }
 
         fill_row(29, 0x07);
-        draw_str(29, 0, " Ctrl+Q: Quit  Ctrl+S: Save ", 0x0E);
+        draw_str(29, 0, " Ctrl+Q Quit  Ctrl+S Save  Tab=4 AutoIndent ", 0x0E);
 
         set_cursor(cur_line - scroll + 1, cur_col < COLS ? cur_col : COLS - 1);
 
@@ -158,8 +177,8 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
             }
 
             switch (sc) {
-                case 0x2A: case 0x36: continue;
-                case 0xAA: case 0xB6: continue;
+                case 0x2A: case 0x36: shift_pressed = 1; continue;
+                case 0xAA: case 0xB6: shift_pressed = 0; continue;
                 case 0x1D: ctrl_pressed = 1; continue;
                 case 0x9D: ctrl_pressed = 0; continue;
             }
@@ -199,17 +218,34 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
             }
 
             switch (sc) {
-                case 0x1C: /* Enter */
+                case 0x1C: /* Enter: разрыв строки с авто-отступом */
                     if (FILE_SIZE >= MAX_SIZE) break;
                     {
+                        char *ln = FILEDATA + line_off[cur_line];
+                        int indent = 0;
+                        while (indent < line_len[cur_line] && ln[indent] == ' ')
+                            indent++;
+                        /* Умный отступ: строка заканчивается открывающим блоком
+                         * ({ или [) — новая строка глубже на 4. */
+                        int extra = 0;
+                        int last = line_len[cur_line];
+                        while (last > 0 && (ln[last - 1] == ' ' || ln[last - 1] == '\t'))
+                            last--;
+                        if (last > 0 && (ln[last - 1] == '{' || ln[last - 1] == '['))
+                            extra = 4;
+                        int d = 1 + indent + extra; /* '\n' + пробелы */
+                        if (FILE_SIZE + d > MAX_SIZE) break;
                         int pos = line_off[cur_line] + cur_col;
-                        for (i = FILE_SIZE; i > pos; i--) FILEDATA[i] = FILEDATA[i - 1];
+                        for (int k = FILE_SIZE; k > pos; k--)
+                            FILEDATA[k + d - 1] = FILEDATA[k - 1];
                         FILEDATA[pos] = '\n';
-                        FILE_SIZE++;
+                        for (int k = 0; k < indent + extra; k++)
+                            FILEDATA[pos + 1 + k] = ' ';
+                        FILE_SIZE += d;
                         modified = 1;
                         rebuild();
                         cur_line++;
-                        cur_col = 0;
+                        cur_col = indent + extra;
                     }
                     break;
                 case 0x0E: /* Backspace */
@@ -229,17 +265,20 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
                         }
                     }
                     break;
-                case 0x0F: /* Tab */
-                    for (int t = 0; t < 4; t++) {
-                        if (FILE_SIZE >= MAX_SIZE) break;
+                case 0x0F: /* Tab: до следующей позиции табуляции (шаг 4) */
+                    {
+                        int d = 4 - (cur_col % 4);
+                        if (FILE_SIZE + d > MAX_SIZE) break;
                         int pos = line_off[cur_line] + cur_col;
-                        for (i = FILE_SIZE; i > pos; i--) FILEDATA[i] = FILEDATA[i - 1];
-                        FILEDATA[pos] = ' ';
-                        FILE_SIZE++;
-                        cur_col++;
+                        for (int k = FILE_SIZE; k > pos; k--)
+                            FILEDATA[k + d - 1] = FILEDATA[k - 1];
+                        for (int t = 0; t < d; t++)
+                            FILEDATA[pos + t] = ' ';
+                        FILE_SIZE += d;
+                        cur_col += d;
+                        modified = 1;
+                        rebuild();
                     }
-                    modified = 1;
-                    rebuild();
                     break;
                 default: {
                     char ch = 0;
@@ -261,7 +300,8 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
                         case 0x22: ch = 'g'; break; case 0x23: ch = 'h'; break;
                         case 0x24: ch = 'j'; break; case 0x25: ch = 'k'; break;
                         case 0x26: ch = 'l'; break; case 0x27: ch = ';'; break;
-                        case 0x28: ch = '\''; break; case 0x2B: ch = '\\'; break;
+                        case 0x28: ch = '\''; break; case 0x29: ch = '`'; break;
+                        case 0x2B: ch = '\\'; break;
                         case 0x2C: ch = 'z'; break; case 0x2D: ch = 'x'; break;
                         case 0x2E: ch = 'c'; break; case 0x2F: ch = 'v'; break;
                         case 0x30: ch = 'b'; break; case 0x31: ch = 'n'; break;
@@ -269,12 +309,22 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
                         case 0x34: ch = '.'; break; case 0x35: ch = '/'; break;
                         case 0x39: ch = ' '; break;
                     }
+                    if (shift_pressed)
+                        ch = shift_char(ch);
                     if (ch && FILE_SIZE < MAX_SIZE) {
                         int pos = line_off[cur_line] + cur_col;
                         for (i = FILE_SIZE; i > pos; i--) FILEDATA[i] = FILEDATA[i - 1];
                         FILEDATA[pos] = ch;
                         FILE_SIZE++;
                         cur_col++;
+                        if (ch == '}') {
+                            /* Выравниваем } по родителю: отступ строки минус 4. */
+                            char *ln = FILEDATA + line_off[cur_line];
+                            int ind = 0;
+                            while (ind < line_len[cur_line] && ln[ind] == ' ') ind++;
+                            int targ = ind >= 4 ? ind - 4 : 0;
+                            cur_col = targ;
+                        }
                         modified = 1;
                         rebuild();
                     }

@@ -1,0 +1,19 @@
+[package]
+name = "uptime"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "uptime"
+path = "main.rs"
+
+[dependencies]
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+opt-level = 2
