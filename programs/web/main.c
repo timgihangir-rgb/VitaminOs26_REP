@@ -11,8 +11,11 @@
  * программа крутит циклы `sleep(ticks+2)` — как и положено cooperative-задаче.
  *
  * Рендер как в lynx: режем HTTP-заголовки, распаковываем chunked, стрипуем
- * теги, декодируем сущности, оборачиваем по ширине и подписываем ссылки
- * как [1], [2]… Номера выдаются на видимую часть страницы, как в lynx.
+ * теги, декодируем сущности/UTF-8. Блочные теги дают структуру — заголовки и
+ * абзацы с отступом и пустой строкой, <ul>/<ol> — буллиты и нумерацию,
+ * <pre> сохраняет пробелы, <blockquote> — вложенный отступ. Текст
+ * оборачивается по ширине, ссылки подписываются [1], [2]… прямо в строке.
+ * Номера выдаются на видимую часть страницы, как в lynx.
  *
  * Клавиши: стрелки ↑↓ — скролл, PgUp/PgDn/Home/End — экран, ←/→ и TAB —
  * предыдущая/следующая ссылка, Enter или «номер.» — открыть ссылку,
@@ -85,11 +88,13 @@ static char lines[MAX_LINES][TEXT_W + 1];
 static int nlines;
 
 struct Link {
-    int line; /* строка документа, где стоит ссылка */
+    int line;     /* строка документа, где стоит ссылка */
+    int col_mark; /* колонка, куда вставить «[N]»; -1 — ссылка ещё открыта */
     char href[HREF_MAX];
 };
 static struct Link links[MAX_LINKS];
 static int nlinks;
+static int open_link = -1; /* индекс ссылки между <a> и </a> */
 
 static int vis_num[MAX_LINKS]; /* ссылка -> видимый номер 1.., 0 = не видна */
 static int max_vis;
@@ -803,53 +808,177 @@ static int parse_response(char *status, int statsz, char *location,
 
 static char word[160];
 static int wl;
-static int col;
-static int cur;
+static int col;  /* текущая колонка на строке cur */
+static int cur;  /* текущая строка документа */
+static int indent;      /* левое поле переносимого текста */
+static int want_blank;  /* нужна пустая строка перед следующим блоком */
+static int pre_mode;    /* внутри <pre>: пробелы и переводы строк сохраняются */
+static unsigned char line_used[MAX_LINES]; /* на строке есть текст */
+static int indent_stack[16];
+static int indent_sp;
+
+static void clear_line(int k) {
+    for (int i = 0; i <= TEXT_W; i++)
+        lines[k][i] = 0;
+    line_used[k] = 0;
+}
+
+/* Заполнить левое поле на текущей (пустой) строке. */
+static void apply_indent(void) {
+    for (int i = 0; i < indent && i < TEXT_W; i++)
+        lines[cur][i] = ' ';
+    col = indent;
+    lines[cur][col] = 0;
+}
 
 static void new_line(void) {
     if (cur < MAX_LINES - 1) {
         cur++;
-        lines[cur][0] = 0;
-        col = 0;
+        clear_line(cur);
+        apply_indent();
     }
+}
+
+/* Сменить отступ; если строка ещё пуста — перерисовать её поле. */
+static void set_indent(int v) {
+    if (v < 0)
+        v = 0;
+    if (v > TEXT_W)
+        v = TEXT_W;
+    indent = v;
+    if (cur < MAX_LINES && !line_used[cur]) {
+        clear_line(cur);
+        apply_indent();
+    }
+}
+
+static void push_indent(int add) {
+    if (indent_sp < 16)
+        indent_stack[indent_sp++] = indent;
+    set_indent(indent + add);
+}
+
+static void pop_indent(void) {
+    if (indent_sp > 0)
+        set_indent(indent_stack[--indent_sp]);
 }
 
 static void flush_word(void) {
     if (wl == 0)
         return;
-    if (cur >= MAX_LINES)
+    if (cur >= MAX_LINES) {
+        wl = 0;
         return;
-    if (col > 0 && col + 1 + wl > TEXT_W)
+    }
+    if (line_used[cur] && col + 1 + wl > TEXT_W)
         new_line();
-    else if (col > 0)
+    else if (line_used[cur])
         lines[cur][col++] = ' ';
     for (int i = 0; i < wl && col < TEXT_W; i++)
         lines[cur][col++] = word[i];
     lines[cur][col] = 0; /* без терминатора строка читается до хвоста */
+    line_used[cur] = 1;
     if (col >= TEXT_W)
         new_line();
     wl = 0;
 }
 
+/* Записать один символ прямо в строку (pre, буллиты, маркеры). */
+static void line_put(char c) {
+    if (cur >= MAX_LINES)
+        return;
+    if (col >= TEXT_W) {
+        if (cur >= MAX_LINES - 1)
+            return; /* последняя строка заполнена — писать больше некуда */
+        new_line();
+        if (col >= TEXT_W)
+            return;
+    }
+    lines[cur][col++] = c;
+    lines[cur][col] = 0;
+    line_used[cur] = 1;
+}
+
+static void line_puts(const char *s) {
+    while (*s)
+        line_put(*s++);
+}
+
+static void line_put_num(int v) {
+    char b[12];
+    int n = 0;
+    if (v <= 0) {
+        line_put('0');
+        return;
+    }
+    while (v > 0 && n < 11) {
+        b[n++] = (char)('0' + v % 10);
+        v /= 10;
+    }
+    while (n > 0)
+        line_put(b[--n]);
+}
+
 static void push_ch(unsigned char c) {
+    if (pre_mode) {
+        line_put((char)c);
+        return;
+    }
     if (c >= 0x20 && c < 0x7F && wl < 79)
         word[wl++] = (char)c;
 }
 
-static void block_end(void) {
+/* Перейти на новую строку, если текущая не пуста (без пустой вставки). */
+static void hard_break(void) {
     flush_word();
-    if (col > 0)
+    if (line_used[cur])
         new_line();
 }
 
-static void add_link(const char *href) {
-    if (nlinks >= MAX_LINKS || !href || !href[0])
+/* Запросить пустую строку-разделитель перед следующим блоком. */
+static void request_blank(void) { want_blank = 1; }
+
+/* Начать новый блок: закончить строку и, если запрошено, вставить пустую. */
+static void block_start(void) {
+    flush_word();
+    if (line_used[cur])
+        new_line();
+    if (want_blank && cur > 0)
+        new_line();
+    want_blank = 0;
+}
+
+static void finish_link(void) {
+    if (open_link < 0)
         return;
+    /* Ставим «[N]» сразу после текста ссылки, не разрывая слово: следующие
+     * символы (точка и т.п.) остаются в том же слове и не получают пробел. */
+    int start = line_used[cur] ? col + 1 : col;
+    if (cur >= MAX_LINES || (line_used[cur] && col + 1 + wl > TEXT_W)) {
+        flush_word();
+        start = col;
+    } else {
+        start += wl;
+    }
+    if (start < 0)
+        start = 0;
+    if (start > TEXT_W)
+        start = TEXT_W;
+    links[open_link].line = cur;
+    links[open_link].col_mark = start;
+    open_link = -1;
+}
+
+static int add_link(const char *href) {
+    if (nlinks >= MAX_LINKS || !href || !href[0])
+        return -1;
     char abs[URL_MAX];
     resolve_href(href, abs, sizeof(abs));
     links[nlinks].line = cur;
+    links[nlinks].col_mark = -1;
     str_copy(links[nlinks].href, abs, HREF_MAX);
     nlinks++;
+    return nlinks - 1;
 }
 
 /* Значение атрибута name внутри тега tag[0..taglen). */
@@ -907,27 +1036,143 @@ static int tag_is(const char *name, int nl, const char *want) {
     return 1;
 }
 
-static int is_block_tag(const char *name, int nl) {
-    static const char *tags[] = { "p",  "div", "h1", "h2",      "h3",
-                                  "h4", "h5",  "h6", "ul",      "ol",
-                                  "li", "tr",  "td", "th",      "blockquote",
-                                  "pre", "hr", "table", "section", "header",
-                                  "footer", "article", "nav", "dl", "dt", "dd" };
+static int is_heading(const char *name, int nl) {
+    return tag_is(name, nl, "h1") || tag_is(name, nl, "h2") ||
+           tag_is(name, nl, "h3") || tag_is(name, nl, "h4") ||
+           tag_is(name, nl, "h5") || tag_is(name, nl, "h6");
+}
+
+/* Контейнерные блоки: вызывают разрыв строки, но не добавляют пустую. */
+static int is_container_tag(const char *name, int nl) {
+    static const char *tags[] = { "div",  "section", "header", "footer",
+                                  "article", "nav", "main",  "aside",
+                                  "form", "figure", "figcaption", "center" };
     for (unsigned i = 0; i < sizeof(tags) / sizeof(tags[0]); i++)
         if (tag_is(name, nl, tags[i]))
             return 1;
     return 0;
 }
 
+/* Стек списков для нумерации <ol>. */
+struct ListCtx {
+    int ordered;
+    int counter;
+};
+static struct ListCtx lstk[8];
+static int ldepth;
+
+/* Разбор сущности &name; / &#N; / &#xN;. Возвращает 1 и кладёт ASCII в out
+ * (outn символов), consumed — сколько байт от '&' израсходовано. */
+static int decode_entity(const unsigned char *b, int i, int n, char *out,
+                         int *outn, int *consumed) {
+    *outn = 0;
+    if (i + 1 >= n || b[i] != '&')
+        return 0;
+    int j = i + 1;
+    if (b[j] == '#') {
+        j++;
+        int hex = 0;
+        if (j < n && (b[j] == 'x' || b[j] == 'X')) {
+            hex = 1;
+            j++;
+        }
+        int base = hex ? 16 : 10;
+        long v = 0;
+        int any = 0;
+        while (j < n) {
+            int d = -1;
+            if (b[j] >= '0' && b[j] <= '9')
+                d = b[j] - '0';
+            else if (hex && b[j] >= 'a' && b[j] <= 'f')
+                d = b[j] - 'a' + 10;
+            else if (hex && b[j] >= 'A' && b[j] <= 'F')
+                d = b[j] - 'A' + 10;
+            if (d < 0 || d >= base)
+                break;
+            v = v * base + d;
+            if (v > 0x10FFFF)
+                v = 0x10FFFF;
+            any = 1;
+            j++;
+        }
+        if (!any || j >= n || b[j] != ';')
+            return 0;
+        *consumed = (j + 1) - i;
+        if (v == 0xA0)
+            out[(*outn)++] = ' ';
+        else if (v == 0x2018 || v == 0x2019)
+            out[(*outn)++] = '\'';
+        else if (v == 0x201C || v == 0x201D)
+            out[(*outn)++] = '"';
+        else if (v == 0x2013 || v == 0x2014)
+            out[(*outn)++] = '-';
+        else if (v == 0x2026) {
+            out[(*outn)++] = '.';
+            out[(*outn)++] = '.';
+            out[(*outn)++] = '.';
+        } else if (v == 0x00B7)
+            out[(*outn)++] = '*';
+        else if (v >= 0x20 && v < 0x7F)
+            out[(*outn)++] = (char)v;
+        else
+            out[(*outn)++] = ' '; /* неизобразимое — пробел вместо склейки */
+        return 1;
+    }
+    static const struct {
+        const char *name;
+        const char *rep;
+    } ents[] = {
+        { "nbsp", " " },   { "amp", "&" },    { "lt", "<" },   { "gt", ">" },
+        { "quot", "\"" },  { "apos", "'" },   { "copy", "(c)" }, { "reg", "(r)" },
+        { "hellip", "..." }, { "mdash", "-" }, { "ndash", "-" }, { "lsquo", "'" },
+        { "rsquo", "'" },  { "ldquo", "\"" }, { "rdquo", "\"" }, { "middot", "*" },
+        { "bull", "*" },   { "sect", "S" },   { "para", "P" },  { "times", "x" },
+    };
+    int start = j;
+    while (j < n && j - start < 12 && b[j] != ';' && b[j] != '&' && b[j] != ' ' &&
+           b[j] != '\n')
+        j++;
+    if (j >= n || b[j] != ';')
+        return 0;
+    int len = j - start;
+    for (unsigned e = 0; e < sizeof(ents) / sizeof(ents[0]); e++) {
+        if ((int)str_len(ents[e].name) != len)
+            continue;
+        int ok = 1;
+        for (int q = 0; q < len; q++) {
+            char a = (char)b[start + q];
+            if (a >= 'A' && a <= 'Z')
+                a = (char)(a + 32);
+            if (a != ents[e].name[q]) {
+                ok = 0;
+                break;
+            }
+        }
+        if (ok) {
+            str_copy(out, ents[e].rep, 8);
+            *outn = str_len(out);
+            *consumed = (j + 1) - i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void build_page(int body_start) {
     wl = 0;
-    col = 0;
     cur = 0;
-    lines[0][0] = 0;
+    indent = 3; /* как lynx: текст абзаца с отступом */
+    want_blank = 0;
+    pre_mode = 0;
+    indent_sp = 0;
+    ldepth = 0;
+    open_link = -1;
     /* Буферы строк переиспользуются между страницами — чистим, иначе на
      * экране остаётся хвост предыдущего документа. */
-    for (int r = 1; r < MAX_LINES; r++)
-        lines[r][0] = 0;
+    for (int r = 0; r < MAX_LINES; r++)
+        clear_line(r);
+    col = 0;
+    apply_indent();
     nlinks = 0;
 
     int i = body_start;
@@ -965,7 +1210,7 @@ static void build_page(int body_start) {
             int taglen = end - i - 1;
             if (taglen > 0) {
                 const unsigned char *tag = rxbuf + i + 1;
-                int skip_to_close = -1;
+                const char *skip_needle = NULL;
                 int closing = 0;
                 int s = 0;
                 if (tag[0] == '/') {
@@ -982,30 +1227,170 @@ static void build_page(int body_start) {
                 name[nl] = 0;
 
                 if (!closing && tag_is(name, nl, "script"))
-                    skip_to_close = 1;
+                    skip_needle = "</script";
                 else if (!closing && tag_is(name, nl, "style"))
-                    skip_to_close = 2;
-                else if (!closing && tag_is(name, nl, "br")) {
-                    block_end();
-                } else if (!closing && tag_is(name, nl, "hr")) {
-                    block_end();
-                } else if (!closing && tag_is(name, nl, "a")) {
-                    if (attr_value(tag, taglen, "href", href_buf,
-                                   sizeof(href_buf))) {
+                    skip_needle = "</style";
+                else if (!closing && tag_is(name, nl, "title"))
+                    skip_needle = "</title"; /* lynx не печатает <title> в теле */
+                else if (tag_is(name, nl, "br")) {
+                    finish_link();
+                    flush_word();
+                    new_line(); /* явный разрыв: <br><br> даёт пустую строку */
+                } else if (tag_is(name, nl, "hr")) {
+                    finish_link();
+                    block_start();
+                    for (int k = indent; k < TEXT_W; k++)
+                        line_put('-');
+                    hard_break();
+                    request_blank();
+                } else if (!closing && tag_is(name, nl, "img")) {
+                    if (attr_value(tag, taglen, "alt", href_buf,
+                                   sizeof(href_buf)) && href_buf[0]) {
+                        finish_link();
                         flush_word();
-                        add_link(href_buf);
+                        line_put('[');
+                        line_puts(href_buf);
+                        line_put(']');
                     }
-                } else if (is_block_tag(name, nl)) {
-                    block_end();
+                } else if (tag_is(name, nl, "a")) {
+                    finish_link(); /* закрывает предыдущую/текущую ссылку */
+                    if (!closing && attr_value(tag, taglen, "href", href_buf,
+                                               sizeof(href_buf))) {
+                        flush_word();
+                        open_link = add_link(href_buf);
+                    }
+                } else if (tag_is(name, nl, "p")) {
+                    finish_link();
+                    if (closing) {
+                        hard_break();
+                        request_blank();
+                    } else {
+                        block_start();
+                        request_blank(); /* пустая строка после абзаца */
+                    }
+                } else if (is_heading(name, nl)) {
+                    finish_link();
+                    if (closing) {
+                        hard_break();
+                        pop_indent();
+                        request_blank();
+                    } else {
+                        block_start();
+                        push_indent(-indent); /* заголовок без отступа */
+                        request_blank();
+                    }
+                } else if (tag_is(name, nl, "ul") || tag_is(name, nl, "ol")) {
+                    finish_link();
+                    if (closing) {
+                        hard_break();
+                        if (ldepth > 0)
+                            ldepth--;
+                        pop_indent();
+                        request_blank();
+                    } else {
+                        if (ldepth == 0)
+                            block_start();
+                        else
+                            hard_break();
+                        if (ldepth < 8) {
+                            lstk[ldepth].ordered = tag_is(name, nl, "ol");
+                            lstk[ldepth].counter = 0;
+                            ldepth++;
+                        }
+                        push_indent(2);
+                    }
+                } else if (tag_is(name, nl, "li")) {
+                    finish_link();
+                    if (closing) {
+                        hard_break();
+                    } else {
+                        hard_break();
+                        want_blank = 0;
+                        int ord = (ldepth > 0) ? lstk[ldepth - 1].ordered : 0;
+                        if (ord && ldepth > 0) {
+                            lstk[ldepth - 1].counter++;
+                            line_put_num(lstk[ldepth - 1].counter);
+                            line_puts(".");
+                        } else {
+                            line_puts("*");
+                        }
+                    }
+                } else if (tag_is(name, nl, "blockquote")) {
+                    finish_link();
+                    if (closing) {
+                        hard_break();
+                        pop_indent();
+                        request_blank();
+                    } else {
+                        block_start();
+                        push_indent(3);
+                    }
+                } else if (tag_is(name, nl, "pre")) {
+                    finish_link();
+                    if (closing) {
+                        hard_break();
+                        pre_mode = 0;
+                        pop_indent();
+                        request_blank();
+                    } else {
+                        block_start();
+                        pre_mode = 1;
+                        push_indent(3);
+                    }
+                } else if (tag_is(name, nl, "table")) {
+                    finish_link();
+                    if (closing) {
+                        hard_break();
+                        request_blank();
+                    } else {
+                        block_start();
+                    }
+                } else if (tag_is(name, nl, "tr")) {
+                    finish_link();
+                    hard_break();
+                } else if (tag_is(name, nl, "td") || tag_is(name, nl, "th")) {
+                    if (closing) {
+                        flush_word();
+                    } else {
+                        flush_word();
+                        if (line_used[cur])
+                            line_puts("  ");
+                    }
+                } else if (tag_is(name, nl, "dl")) {
+                    finish_link();
+                    if (closing)
+                        request_blank();
+                    else
+                        block_start();
+                } else if (tag_is(name, nl, "dd")) {
+                    finish_link();
+                    if (closing) {
+                        hard_break();
+                        pop_indent();
+                    } else {
+                        block_start();
+                        push_indent(3);
+                    }
+                } else if (tag_is(name, nl, "dt")) {
+                    finish_link();
+                    if (closing)
+                        hard_break();
+                    else
+                        block_start();
+                } else if (is_container_tag(name, nl)) {
+                    finish_link();
+                    if (closing)
+                        hard_break();
+                    else
+                        block_start();
                 }
-                if (skip_to_close > 0) {
-                    const char *needle = (skip_to_close == 1) ? "</script" : "</style";
-                    int nl2 = str_len(needle);
+                if (skip_needle) {
+                    int nl2 = str_len(skip_needle);
                     while (i < rx_total) {
                         if (rxbuf[i] == '<' && i + nl2 <= rx_total) {
                             int ok = 1;
                             for (int k = 0; k < nl2; k++)
-                                if ((char)rxbuf[i + k] != needle[k]) {
+                                if ((char)rxbuf[i + k] != skip_needle[k]) {
                                     ok = 0;
                                     break;
                                 }
@@ -1024,55 +1409,12 @@ static void build_page(int body_start) {
         }
 
         if (c == '&') {
-            if (i + 3 < rx_total && rxbuf[i + 1] == 'l' && rxbuf[i + 2] == 't' &&
-                rxbuf[i + 3] == ';') {
-                flush_word();
-                push_ch('<');
-                i += 4;
-                continue;
-            }
-            if (i + 3 < rx_total && rxbuf[i + 1] == 'g' && rxbuf[i + 2] == 't' &&
-                rxbuf[i + 3] == ';') {
-                flush_word();
-                push_ch('>');
-                i += 4;
-                continue;
-            }
-            if (i + 4 < rx_total && rxbuf[i + 1] == 'a' && rxbuf[i + 2] == 'm' &&
-                rxbuf[i + 3] == 'p' && rxbuf[i + 4] == ';') {
-                flush_word();
-                push_ch('&');
-                i += 5;
-                continue;
-            }
-            if (i + 5 < rx_total && rxbuf[i + 1] == 'q' && rxbuf[i + 2] == 'u' &&
-                rxbuf[i + 3] == 'o' && rxbuf[i + 4] == 't' && rxbuf[i + 5] == ';') {
-                flush_word();
-                push_ch('"');
-                i += 6;
-                continue;
-            }
-            if (i + 2 < rx_total && rxbuf[i + 1] == '#') {
-                int j = i + 2, num = 0, is_hex = 0;
-                if (j < rx_total && (rxbuf[j] == 'x' || rxbuf[j] == 'X')) {
-                    is_hex = 1;
-                    j++;
-                }
-                int any = 0;
-                while (j < rx_total && rxbuf[j] >= '0' && rxbuf[j] <= '9') {
-                    num = num * 10 + (rxbuf[j] - '0');
-                    any = 1;
-                    j++;
-                }
-                if (!is_hex && any && j < rx_total && rxbuf[j] == ';' &&
-                    num > 0 && num < 0x7F) {
-                    flush_word();
-                    push_ch((unsigned char)num);
-                    i = j + 1;
-                    continue;
-                }
-                push_ch('&');
-                i++;
+            char ent[8];
+            int en = 0, used = 0;
+            if (decode_entity(rxbuf, i, rx_total, ent, &en, &used)) {
+                for (int k = 0; k < en; k++)
+                    push_ch((unsigned char)ent[k]);
+                i += used;
                 continue;
             }
             push_ch('&');
@@ -1081,7 +1423,14 @@ static void build_page(int body_start) {
         }
 
         if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
-            flush_word();
+            if (pre_mode) {
+                if (c == '\n' || c == '\r')
+                    hard_break();
+                else
+                    line_put(' ');
+            } else {
+                flush_word();
+            }
             i++;
             continue;
         }
@@ -1089,15 +1438,45 @@ static void build_page(int body_start) {
             i++;
             continue;
         }
+        if (c >= 0x80) { /* UTF-8: общие знаки -> ASCII, остальное -> пробел */
+            int cp = -1, len = 1;
+            if ((c & 0xE0) == 0xC0 && i + 1 < rx_total) {
+                cp = ((c & 0x1F) << 6) | (rxbuf[i + 1] & 0x3F);
+                len = 2;
+            } else if ((c & 0xF0) == 0xE0 && i + 2 < rx_total) {
+                cp = ((c & 0x0F) << 12) | ((rxbuf[i + 1] & 0x3F) << 6) |
+                     (rxbuf[i + 2] & 0x3F);
+                len = 3;
+            } else if ((c & 0xF8) == 0xF0 && i + 3 < rx_total) {
+                cp = ((c & 0x07) << 18) | ((rxbuf[i + 1] & 0x3F) << 12) |
+                     ((rxbuf[i + 2] & 0x3F) << 6) | (rxbuf[i + 3] & 0x3F);
+                len = 4;
+            }
+            if (cp == 0x2018 || cp == 0x2019)
+                push_ch('\'');
+            else if (cp == 0x201C || cp == 0x201D)
+                push_ch('"');
+            else if (cp == 0x2013 || cp == 0x2014)
+                push_ch('-');
+            else if (cp == 0x2026) {
+                push_ch('.');
+                push_ch('.');
+                push_ch('.');
+            } else
+                push_ch(' ');
+            i += len;
+            continue;
+        }
         push_ch(c);
         i++;
     }
     flush_word();
+    finish_link();
     nlines = cur + 1;
     if (nlines > MAX_LINES)
         nlines = MAX_LINES;
     /* Пустые строки по краям не нужны. */
-    while (nlines > 1 && lines[nlines - 1][0] == 0)
+    while (nlines > 1 && !line_used[nlines - 1])
         nlines--;
 }
 
@@ -1126,18 +1505,31 @@ static void draw_line(int row, int doc_line) {
         attr = 0x1F; /* строка с курсорной ссылкой подсвечена */
     int colc = 0;
     fill_row(row, 0x0F); /* строка затирается целиком — иначе виден хвост */
-    while (*s && colc < TEXT_W)
-        put_ch(row, colc++, *s++, attr);
-    for (int i = 0; i < nlinks; i++) {
-        if (links[i].line != doc_line || !vis_num[i])
-            continue;
-        int v = vis_num[i];
-        int mark = (i == cur_link) ? 0x1E : 0x0E;
-        put_ch(row, colc++, '[', mark);
-        if (v >= 10)
-            put_ch(row, colc++, (char)('0' + (v / 10) % 10), mark);
-        put_ch(row, colc++, (char)('0' + v % 10), mark);
-        put_ch(row, colc++, ']', mark);
+    /* Идём по символам строки, вставляя «[N]» в записанные колонки. */
+    for (int pos = 0; pos <= TEXT_W && colc < SCREEN_W; pos++) {
+        for (int i = 0; i < nlinks; i++) {
+            if (links[i].line != doc_line || !vis_num[i] ||
+                links[i].col_mark != pos)
+                continue;
+            int v = vis_num[i];
+            int mark = (i == cur_link) ? 0x1E : 0x0E;
+            if (colc < SCREEN_W)
+                put_ch(row, colc++, '[', mark);
+            if (v >= 100 && colc < SCREEN_W)
+                put_ch(row, colc++, (char)('0' + (v / 100) % 10), mark);
+            if (v >= 10 && colc < SCREEN_W)
+                put_ch(row, colc++, (char)('0' + (v / 10) % 10), mark);
+            if (colc < SCREEN_W)
+                put_ch(row, colc++, (char)('0' + v % 10), mark);
+            if (colc < SCREEN_W)
+                put_ch(row, colc++, ']', mark);
+        }
+        if (pos >= TEXT_W)
+            break;
+        if (!s[pos])
+            break;
+        if (colc < SCREEN_W)
+            put_ch(row, colc++, s[pos], attr);
     }
 }
 
