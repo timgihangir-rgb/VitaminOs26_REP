@@ -402,25 +402,39 @@ fn icmp_echo(target_mac: &[u8; 6], target_ip: &[u8; 4]) -> bool {
 /// Опрашивает кольцо RX, диспетчеризует новые кадры. Возвращает их число.
 fn rx_poll() -> u32 {
     unsafe {
-        // Позиция записи чипа — через порт (кэш не участвует). CBR НЕ «off by 16».
-        let cbr = inw(REG_CBR) as usize;
-        let new = (cbr as isize - RX_CUR as isize).rem_euclid(RX_RING_SIZE as isize) as usize;
-        if new == 0 {
-            return 0; // новых данных нет
-        }
-        // Инвалидируем кэш кольца: данные писал эмулятор (DMA).
-        clflush_range(RX_RING.0.as_ptr() as usize, RX_RING_SIZE + 16);
-
         let mut count = 0;
         loop {
-            let off = RX_CUR;
-            let hdr = u32::from_le_bytes(RX_RING.0[off..off + 4].try_into().unwrap());
-            if (hdr & RX_STATUS_OK) == 0 {
+            // Позицию записи чипа перечитываем НА КАЖДОЙ итерации, а не один
+            // раз: запись в CAPR вызывает в QEMU `qemu_flush_queued_packets()`,
+            // и чип дописывает в кольцо прямо посреди нашего обхода. Со снятым
+            // однажды значением мы уезжали за реальную границу и читали остатки
+            // прошлой «революции» кольца.
+            // CBR (RxBufAddr) НЕ «off by 16» — это позиция записи чипа.
+            let cbr = inw(REG_CBR) as usize;
+            let new = (cbr as isize - RX_CUR as isize).rem_euclid(RX_RING_SIZE as isize) as usize;
+            if new == 0 {
                 break; // свежих пакетов больше нет
             }
+            // Инвалидируем кэш кольца: данные писал эмулятор (DMA).
+            clflush_range(RX_RING.0.as_ptr() as usize, RX_RING_SIZE + 16);
+
+            let off = RX_CUR;
+            let hdr = u32::from_le_bytes(RX_RING.0[off..off + 4].try_into().unwrap());
             let size_field = ((hdr >> 16) & 0x3FFF) as usize;
-            if !(4..=2048).contains(&size_field) {
-                break; // битый заголовок: длину не знаем — не продвигаемся
+            // Дескриптор без флага «готов», битая длина или кадр длиннее
+            // оставшегося места — рассинхронизация с чипом. Раньше здесь был
+            // `break` без продвижения RX_CUR, и это убивало сеть НАВСЕГДА:
+            // RxBufPtr уезжал вперёд RxBufAddr, `rtl8139_can_receive()` возвращал
+            // `avail < 1514` → false навсегда, кольцо больше не принимало пакетов
+            // («cannot resolve host» на втором и всех следующих запусках).
+            // Лечение: прыгаем указателем чтения на позицию записи чипа.
+            if (hdr & RX_STATUS_OK) == 0
+                || !(4..=2048).contains(&size_field)
+                || size_field + 4 > new
+            {
+                RX_CUR = cbr;
+                outw(REG_CAPR, (RX_CUR as u16).wrapping_sub(16));
+                break;
             }
             let payload_len = size_field - 4; // минус CRC, который доливает чип
             if off + 4 + payload_len <= RX_RING_SIZE {
@@ -911,6 +925,8 @@ const DNS_SRC_PORT: u16 = 0x3E00;
 const DNS_RX_CAP: usize = 1024;
 /// 3 c на ARP + запрос + ответ (300 тиков PIT 100 Гц).
 const DNS_TIMEOUT: u64 = 300;
+/// Сколько раз повторяем запрос, прежде чем сдаться.
+const DNS_ATTEMPTS: u32 = 3;
 /// Максимум A-записей, которые разбираем из ответа.
 const DNS_MAX_ANS: usize = 8;
 
@@ -1075,32 +1091,42 @@ pub fn dns_resolve(name: &str, out: &mut [[u8; 4]]) -> usize {
         None => return 0,
     };
     unsafe {
-        // Этап 2: отправляем запрос и ждём ответа с нашим ID.
-        DNS_QUERY_ID = DNS_QUERY_ID.wrapping_add(1);
-        let q = dns_build_query(name, DNS_QUERY_ID);
-        if !udp_send(&dns_mac, &DNS_SERVER, DNS_SRC_PORT, DNS_PORT, &q) {
-            return 0;
-        }
-        DNS_REPLY_LEN = 0;
-        let deadline = crate::scheduler::ticks() + DNS_TIMEOUT;
-        while crate::scheduler::ticks() < deadline {
-            rx_poll();
-            if DNS_REPLY_LEN > 0 {
-                break;
+        // Этап 2: отправляем запрос и ждём ответа с нашим ID. UDP не имеет
+        // ретрасмитов — потерянная датаграмма молча ломала весь резолв, поэтому
+        // повторяем запрос с новым ID (старый ответ отфильтруется по ID).
+        for _ in 0..DNS_ATTEMPTS {
+            DNS_QUERY_ID = DNS_QUERY_ID.wrapping_add(1);
+            let q = dns_build_query(name, DNS_QUERY_ID);
+            if !udp_send(&dns_mac, &DNS_SERVER, DNS_SRC_PORT, DNS_PORT, &q) {
+                return 0;
             }
-            crate::scheduler::sleep_until(crate::scheduler::ticks() + 1);
-        }
-        if DNS_REPLY_LEN == 0 {
+            DNS_REPLY_LEN = 0;
+            let deadline = crate::scheduler::ticks() + DNS_TIMEOUT;
+            while crate::scheduler::ticks() < deadline {
+                rx_poll();
+                if DNS_REPLY_LEN > 0 {
+                    break;
+                }
+                crate::scheduler::sleep_until(crate::scheduler::ticks() + 1);
+            }
+            if DNS_REPLY_LEN == 0 {
+                continue;
+            }
+            let n = dns_parse_answer(
+                &DNS_REPLY[..DNS_REPLY_LEN],
+                DNS_QUERY_ID,
+                &mut answers[..],
+            );
+            if n > 0 {
+                for i in 0..n.min(out.len()) {
+                    out[i] = answers[i].ip;
+                }
+                return n.min(out.len());
+            }
+            // Ответ пришёл, но A-записей нет (NXDOMAIN/прокси-пустышка):
+            // повтор не поможет.
             return 0;
         }
-        let n = dns_parse_answer(
-            &DNS_REPLY[..DNS_REPLY_LEN],
-            DNS_QUERY_ID,
-            &mut answers[..],
-        );
-        for i in 0..n.min(out.len()) {
-            out[i] = answers[i].ip;
-        }
-        n.min(out.len())
+        0
     }
 }
