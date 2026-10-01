@@ -22,6 +22,14 @@
 //!       cmd 4 SCREEN_SIZE     -> (height<<16)|width
 //!       cmd 5 ECHO_GET        -> 0/1
 //!       cmd 6 ECHO_SET arg    = 0 выкл / 1 вкл
+//!   9 net_connect(ip_str, port) -> i32  (0 = установлено, -2 = в процессе)
+//!  10 net_send(buf, len) -> i32         (байт отправлено / -3 ошибка)
+//!  11 net_recv(buf, max) -> i32         (>0 байт / -2 нет данных / -1 EOF / -3)
+//!  12 net_close() -> i32
+//!
+//!   net_* — НЕ-блокирующие: ядро продвигает TCP-состояние и возвращает
+//!   NET_EAGAIN (-2), когда ждёт сети; программа сама повторяет вызов со
+//!   `sleep`-отпуском CPU (см. src/net.rs и programs/web).
 //!
 //! Аргументы (по SysV) приходят в rdi/rsi/rdx и лежат в сохранённых регистрах
 //! с той же раскладкой, что в `timer_entry` планировщика. Вершина стека после
@@ -40,6 +48,11 @@ pub const SYS_SLEEP: usize = 5;
 pub const SYS_KBHIT: usize = 6;
 pub const SYS_KBREAD: usize = 7;
 pub const SYS_IOCTL: usize = 8;
+pub const SYS_NET_CONNECT: usize = 9;
+pub const SYS_NET_SEND: usize = 10;
+pub const SYS_NET_RECV: usize = 11;
+pub const SYS_NET_CLOSE: usize = 12;
+pub const SYS_NET_RESOLVE: usize = 13;
 
 global_asm!(
     ".global int80_entry",
@@ -265,6 +278,108 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) -> usize {
                 _ => -1i64,
             };
             set_result(regs, r as u64);
+            0
+        }
+        SYS_NET_CONNECT => {
+            let ip_ptr = unsafe { *regs.add(10) };
+            let port = unsafe { *regs.add(11) } as u16;
+            if !user_ptr_ok(ip_ptr) {
+                set_result(regs, -1i64 as u64);
+                0
+            } else {
+                let ip_slice =
+                    unsafe { core::slice::from_raw_parts(ip_ptr as *const u8, 64) };
+                let ip_str = match ip_slice.iter().position(|&b| b == 0) {
+                    Some(n) => match core::str::from_utf8(&ip_slice[..n]) {
+                        Ok(s) => s,
+                        Err(_) => {
+                            set_result(regs, -1i64 as u64);
+                            return 0;
+                        }
+                    },
+                    None => {
+                        set_result(regs, -1i64 as u64);
+                        return 0;
+                    }
+                };
+                let r = match crate::net::parse_ip(ip_str) {
+                    Some(ip) => crate::net::tcp_connect(&ip, port),
+                    None => -1i32,
+                };
+                set_result(regs, r as u64);
+                0
+            }
+        }
+        SYS_NET_SEND => {
+            let buf = unsafe { *regs.add(10) };
+            let len = (unsafe { *regs.add(11) }).min(1400) as usize;
+            if !user_ptr_ok(buf) {
+                set_result(regs, -1i64 as u64);
+            } else {
+                let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
+                let r = crate::net::tcp_send(data);
+                set_result(regs, r as u64);
+            }
+            0
+        }
+        SYS_NET_RECV => {
+            let buf = unsafe { *regs.add(10) };
+            let max = (unsafe { *regs.add(11) }).min(16384) as usize;
+            if !user_ptr_ok(buf) {
+                set_result(regs, -1i64 as u64);
+            } else {
+                let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, max) };
+                let r = crate::net::tcp_recv(out);
+                set_result(regs, r as u64);
+            }
+            0
+        }
+        SYS_NET_CLOSE => {
+            let r = crate::net::tcp_close();
+            set_result(regs, r as u64);
+            0
+        }
+        SYS_NET_RESOLVE => {
+            let name_ptr = unsafe { *regs.add(10) };
+            let out_ptr = unsafe { *regs.add(11) };
+            let max_ips = (unsafe { *regs.add(12) }).min(8) as usize;
+            if !user_ptr_ok(name_ptr) || !user_ptr_ok(out_ptr) || max_ips == 0 {
+                set_result(regs, -1i64 as u64);
+                return 0;
+            }
+            // Имя хоста: C-строка, максимум 255 байт.
+            let name_bytes = unsafe { core::slice::from_raw_parts(name_ptr as *const u8, 255) };
+            let name_len = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(255);
+            let name_str = match core::str::from_utf8(&name_bytes[..name_len]) {
+                Ok(s) => s,
+                Err(_) => {
+                    set_result(regs, -1i64 as u64);
+                    return 0;
+                }
+            };
+            // Числовой адрес — резолвить нечего, сразу отдаём как есть.
+            if let Some(ip) = crate::net::parse_ip(name_str) {
+                unsafe { core::ptr::copy_nonoverlapping(ip.as_ptr(), out_ptr as *mut u8, 4) };
+                set_result(regs, 1i64 as u64);
+                return 0;
+            }
+            let mut ips = [[0u8; 4]; 8];
+            let n = crate::net::dns_resolve(name_str, &mut ips);
+            if n > 0 {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        ips.as_ptr() as *const u8,
+                        out_ptr as *mut u8,
+                        n * 4,
+                    );
+                }
+                set_result(regs, n as u64);
+            } else {
+                set_result(regs, -1i64 as u64);
+            }
             0
         }
         SYS_EXIT => {

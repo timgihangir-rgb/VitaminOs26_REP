@@ -144,6 +144,8 @@ pub fn run_program(writer: &mut Writer, args: &[&str], mem: sysinfo::MemInfo) ->
         // Клавиатура: сбрасываем буфер сканкодов, чтобы foreground-программа не
         // получила остатки (break-коды Enter и т.п.) от командной строки шелла.
         crate::keyboard::flush();
+        // TCP-сокет не должен «протекать» между запусками программ.
+        crate::net::tcp_reset();
 
         crate::progabi::install();
 

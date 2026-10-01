@@ -441,6 +441,7 @@ fn bg_task(writer: &mut Writer, name: &str, args: &[&str]) {
     let binpath = alloc::format!("/bin/{}", name);
     let code = crate::scheduler::with_vfs(|vfs| vfs.cat(&binpath).map(|d| d.to_vec()));
     if let Some(code) = code {
+        crate::net::tcp_reset();
         crate::progabi::install();
         let argv = [binpath.as_str()];
         match crate::exec::launch_user(name, &code, &argv, 0) {

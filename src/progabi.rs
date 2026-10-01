@@ -16,6 +16,11 @@ pub const SLEEP_PTR: usize = 0x7820;
 pub const KBHIT_PTR: usize = 0x7828;
 pub const KBREAD_PTR: usize = 0x7830;
 pub const IOCTL_PTR: usize = 0x7838;
+pub const NET_CONNECT_PTR: usize = 0x7840;
+pub const NET_SEND_PTR: usize = 0x7848;
+pub const NET_RECV_PTR: usize = 0x7850;
+pub const NET_CLOSE_PTR: usize = 0x7858;
+pub const NET_RESOLVE_PTR: usize = 0x7860;
 
 pub const EXIT_STUB: usize = 0x7100;
 pub const TICKS_STUB: usize = 0x7110;
@@ -26,6 +31,11 @@ pub const SLEEP_STUB: usize = 0x7150;
 pub const KBHIT_STUB: usize = 0x7160;
 pub const KBREAD_STUB: usize = 0x7168;
 pub const IOCTL_STUB: usize = 0x7170;
+pub const NET_CONNECT_STUB: usize = 0x7180;
+pub const NET_SEND_STUB: usize = 0x7188;
+pub const NET_RECV_STUB: usize = 0x7190;
+pub const NET_CLOSE_STUB: usize = 0x7198;
+pub const NET_RESOLVE_STUB: usize = 0x71A0;
 
 const SYS_TICKS: usize = 0;
 const SYS_HLT: usize = 1;
@@ -36,6 +46,11 @@ const SYS_SLEEP: usize = 5;
 const SYS_KBHIT: usize = 6;
 const SYS_KBREAD: usize = 7;
 const SYS_IOCTL: usize = 8;
+const SYS_NET_CONNECT: usize = 9;
+const SYS_NET_SEND: usize = 10;
+const SYS_NET_RECV: usize = 11;
+const SYS_NET_CLOSE: usize = 12;
+const SYS_NET_RESOLVE: usize = 13;
 
 fn store_pointer(at: usize, f: usize) {
     unsafe {
@@ -74,6 +89,11 @@ pub fn install() {
     write_stub(KBHIT_STUB, SYS_KBHIT, true);
     write_stub(KBREAD_STUB, SYS_KBREAD, true);
     write_stub(IOCTL_STUB, SYS_IOCTL, true);
+    write_stub(NET_CONNECT_STUB, SYS_NET_CONNECT, true);
+    write_stub(NET_SEND_STUB, SYS_NET_SEND, true);
+    write_stub(NET_RECV_STUB, SYS_NET_RECV, true);
+    write_stub(NET_CLOSE_STUB, SYS_NET_CLOSE, true);
+    write_stub(NET_RESOLVE_STUB, SYS_NET_RESOLVE, true);
 
     store_pointer(TICKS_PTR, TICKS_STUB);
     store_pointer(HLT_PTR, HLT_STUB);
@@ -83,4 +103,9 @@ pub fn install() {
     store_pointer(KBHIT_PTR, KBHIT_STUB);
     store_pointer(KBREAD_PTR, KBREAD_STUB);
     store_pointer(IOCTL_PTR, IOCTL_STUB);
+    store_pointer(NET_CONNECT_PTR, NET_CONNECT_STUB);
+    store_pointer(NET_SEND_PTR, NET_SEND_STUB);
+    store_pointer(NET_RECV_PTR, NET_RECV_STUB);
+    store_pointer(NET_CLOSE_PTR, NET_CLOSE_STUB);
+    store_pointer(NET_RESOLVE_PTR, NET_RESOLVE_STUB);
 }
