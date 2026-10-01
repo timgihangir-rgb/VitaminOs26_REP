@@ -106,7 +106,7 @@ class FsBuilder:
         return DATA_START + p
 
     def write_file(self, name, content, ino=None):
-        direct, indirect1, indirect_tbl = [], 0, None
+        direct, indirect1, indirect_tbl = [], 0, []
         n_full = len(content) // BLOCK
         for bi in range(n_full):
             b = self.alloc_data(content[bi * BLOCK:(bi + 1) * BLOCK])

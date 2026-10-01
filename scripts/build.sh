@@ -96,16 +96,24 @@ for prog_dir in "$PROGRAMS_DIR"/*/; do
 
     if [ -f "$c_src" ]; then
         echo ""
-        echo "  Compiling (C): $c_src"
-        obj_file="${prog_dir}${prog_name}.o"
+        echo "  Compiling (C): ${prog_dir}*.c"
 
-        $CC -m64 -nostdlib -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone \
-            -c "$c_src" -o "$obj_file" 2>&1
+        # Программа может состоять из нескольких .c (например браузер web:
+        # main.c + tls_*.c). Компилируем каждый и линкуем вместе.
+        c_srcs=("${prog_dir}"*.c)
+        objs=()
+        for src in "${c_srcs[@]}"; do
+            obj="${src%.c}.o"
+            echo "    CC $src"
+            $CC -m64 -nostdlib -ffreestanding -fno-stack-protector -fno-pic \
+                -mno-red-zone -c "$src" -o "$obj" 2>&1
+            objs+=("$obj")
+        done
 
         ld -nostdlib -s -T "$LDSCRIPT" -e _start \
-            -o "$elf_file" "$obj_file" 2>&1
+            -o "$elf_file" "${objs[@]}" 2>&1
 
-        rm -f "$obj_file"
+        rm -f "${objs[@]}"
     else
         echo ""
         echo "  Compiling (Rust): $rs_src"
