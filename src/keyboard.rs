@@ -1,4 +1,4 @@
-use crate::vga::Writer;
+use crate::vga::{SCREEN_HEIGHT, SCREEN_WIDTH, Writer};
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
@@ -175,13 +175,6 @@ pub fn drain_chars(max: usize) -> alloc::vec::Vec<u8> {
     out
 }
 
-fn erase_line(writer: &mut Writer, start_row: usize, start_col: usize, len: usize) {
-    writer.set_cursor(start_row, start_col);
-    for _ in 0..len {
-        writer.write_byte(b' ');
-    }
-}
-
 pub struct History {
     entries: Vec<String>,
     nav_index: usize,
@@ -246,12 +239,134 @@ impl History {
     }
 }
 
+/// Предельная длина строки ввода (в байтах).
+const MAX_LINE: usize = 1024;
+
+/// Редактор одной строки ввода с настоящим курсором: держит текст, индекс
+/// курсора и перерисовывает область ввода целиком после каждой правки.
+///
+/// Ввод начинается там, где шелл закончил промпт, то есть в произвольной
+/// ячейке, а строка может быть длиннее экрана и переноситься на несколько
+/// строк. Поэтому экранные координаты считаются от «якоря» — (row, col),
+/// где было начало ввода, а сам якорь поднимается вверх при прокрутке.
+struct LineEditor {
+    line: String,
+    cursor: usize,
+    row: usize,
+    col: usize,
+    drawn: usize,
+}
+
+impl LineEditor {
+    fn new(writer: &Writer) -> Self {
+        LineEditor {
+            line: String::new(),
+            cursor: 0,
+            row: writer.row(),
+            col: writer.column(),
+            drawn: 0,
+        }
+    }
+
+    /// Сколько строк экрана нужно под текст и под курсор в конце строки.
+    /// Единица запаса: если текст ровно кончил ячейку, курсор стоит на
+    /// начале следующей строки, и её тоже надо иметь на экране.
+    fn rows_needed(&self) -> usize {
+        (self.col + self.line.len()) / SCREEN_WIDTH + 1
+    }
+
+    /// Экранные координаты символа с индексом `i`, отсчитанные от якоря.
+    fn cell(&self, i: usize) -> (usize, usize) {
+        let abs = self.col + i;
+        (self.row + abs / SCREEN_WIDTH, abs % SCREEN_WIDTH)
+    }
+
+    /// Ячейка последнего напечатанного символа (или якорь для пустой строки).
+    /// От неё шелл пишет перевод строки по Enter — сразу под введённым текстом.
+    fn end_cell(&self) -> (usize, usize) {
+        if self.line.is_empty() {
+            (self.row, self.col)
+        } else {
+            self.cell(self.line.len() - 1)
+        }
+    }
+
+    fn redraw(&mut self, writer: &mut Writer) {
+        let need = self.rows_needed();
+        // Стираем прежний рисунок: первая строка — с якоря (промпт слева
+        // не трогаем), остальные целиком.
+        writer.fill_rect(self.row, self.col, self.drawn.max(need), SCREEN_WIDTH);
+        // Не помещается — прокручиваем; якорь уезжает вверх вместе с экраном.
+        if self.row + need > SCREEN_HEIGHT {
+            let up = self.row + need - SCREEN_HEIGHT;
+            writer.scroll_up_by(up);
+            self.row -= up;
+        }
+        for (i, &b) in self.line.as_bytes().iter().enumerate() {
+            let (r, c) = self.cell(i);
+            writer.put(r, c, b);
+        }
+        self.drawn = need;
+        let (r, c) = self.cell(self.cursor);
+        writer.set_cursor(r, c);
+    }
+
+    fn insert(&mut self, b: u8) {
+        if self.line.len() >= MAX_LINE {
+            return;
+        }
+        self.line.insert(self.cursor, b as char);
+        self.cursor += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 {
+            self.line.remove(self.cursor - 1);
+            self.cursor -= 1;
+        }
+    }
+
+    fn delete(&mut self) {
+        if self.cursor < self.line.len() {
+            self.line.remove(self.cursor);
+        }
+    }
+
+    fn kill_before(&mut self) {
+        if self.cursor > 0 {
+            self.line.replace_range(..self.cursor, "");
+            self.cursor = 0;
+        }
+    }
+
+    fn kill_after(&mut self) {
+        self.line.truncate(self.cursor);
+    }
+
+    fn kill_word_before(&mut self) {
+        let bytes = self.line.as_bytes();
+        let mut i = self.cursor;
+        while i > 0 && bytes[i - 1] == b' ' {
+            i -= 1;
+        }
+        while i > 0 && bytes[i - 1] != b' ' {
+            i -= 1;
+        }
+        self.line.replace_range(i..self.cursor, "");
+        self.cursor = i;
+    }
+
+    fn set_line(&mut self, s: &str) {
+        self.line = s.chars().take(MAX_LINE).collect();
+        self.cursor = self.line.len();
+    }
+}
+
 pub fn read_line(writer: &mut Writer, history: &mut History) -> String {
-    let mut line = String::new();
+    let mut ed = LineEditor::new(writer);
     let mut shift = false;
+    let mut ctrl = false;
     let mut e0 = false;
-    let start_row = writer.row();
-    let start_col = writer.column();
 
     loop {
         let scancode = match pop_scancode() {
@@ -267,75 +382,116 @@ pub fn read_line(writer: &mut Writer, history: &mut History) -> String {
             continue;
         }
 
+        let mut dirty = false;
+        let mut done = false;
+
         if e0 {
             e0 = false;
-            if scancode & 0x80 != 0 {
-                continue;
+            if scancode & 0x80 == 0 {
+                match scancode {
+                    0x48 => {
+                        // Up — предыдущая команда из истории
+                        if let Some(entry) = history.up(&ed.line) {
+                            ed.set_line(entry);
+                            dirty = true;
+                        }
+                    }
+                    0x50 => {
+                        // Down — следующая (или возврат к сохранённой строке)
+                        if let Some(entry) = history.down() {
+                            ed.set_line(entry);
+                            dirty = true;
+                        }
+                    }
+                    0x4B => {
+                        if ed.cursor > 0 {
+                            ed.cursor -= 1;
+                            dirty = true;
+                        }
+                    }
+                    0x4D => {
+                        if ed.cursor < ed.line.len() {
+                            ed.cursor += 1;
+                            dirty = true;
+                        }
+                    }
+                    0x47 => {
+                        if ed.cursor != 0 {
+                            ed.cursor = 0;
+                            dirty = true;
+                        }
+                    }
+                    0x4F => {
+                        let end = ed.line.len();
+                        if ed.cursor != end {
+                            ed.cursor = end;
+                            dirty = true;
+                        }
+                    }
+                    0x53 => {
+                        if ed.cursor < ed.line.len() {
+                            ed.delete();
+                            dirty = true;
+                        }
+                    }
+                    0x1C => done = true, // Enter на цифровой клавиатуре
+                    _ => {}
+                }
             }
+        } else {
             match scancode {
-                0x48 => {
-                    if let Some(entry) = history.up(&line) {
-                        erase_line(writer, start_row, start_col, line.len());
-                        writer.set_cursor(start_row, start_col);
-                        for b in entry.bytes() {
-                            writer.write_byte(b);
+                0x2A | 0x36 => shift = true,
+                0xAA | 0xB6 => shift = false,
+                0x1D => ctrl = true,
+                0x9D => ctrl = false,
+                _ if scancode & 0x80 != 0 => {}
+                // Ctrl-комбинации разбираем до translate(): их сканкоды
+                // совпадают с буквами, иначе они не отличились бы от ввода.
+                _ if ctrl => {
+                    match scancode {
+                        0x1E => ed.cursor = 0, // Ctrl+A — в начало строки
+                        0x12 => ed.cursor = ed.line.len(), // Ctrl+E — в конец
+                        0x16 => ed.kill_before(),          // Ctrl+U — сбросить влево
+                        0x25 => ed.kill_after(),           // Ctrl+K — сбросить вправо
+                        0x11 => ed.kill_word_before(),     // Ctrl+W — сбросить слово
+                        0x1B => {
+                            ed.line.clear();
+                            ed.cursor = 0;
+                        } // Ctrl+[ — выход без изменений
+                        _ => {}
+                    }
+                    dirty = true;
+                }
+                _ => {
+                    if let Some(byte) = translate(scancode, shift) {
+                        match byte {
+                            b'\n' | b'\r' => done = true,
+                            0x08 => {
+                                ed.backspace();
+                                dirty = true;
+                            }
+                            c => {
+                                ed.insert(c);
+                                dirty = true;
+                            }
                         }
-                        line = entry.to_string();
                     }
                 }
-                0x50 => {
-                    if let Some(entry) = history.down() {
-                        erase_line(writer, start_row, start_col, line.len());
-                        writer.set_cursor(start_row, start_col);
-                        for b in entry.bytes() {
-                            writer.write_byte(b);
-                        }
-                        line = entry.to_string();
-                    }
-                }
-                _ => {}
             }
-            continue;
         }
 
-        match scancode {
-            0x2A | 0x36 => {
-                shift = true;
-                continue;
+        if done {
+            if echo_get() {
+                let (r, c) = ed.end_cell();
+                writer.set_cursor(r, c);
+                writer.write_string("\n");
             }
-            0xAA | 0xB6 => {
-                shift = false;
-                continue;
-            }
-            _ => {}
+            history.add(ed.line.clone());
+            return ed.line;
         }
 
-        if scancode & 0x80 != 0 {
-            continue;
-        }
-
-        if let Some(byte) = translate(scancode, shift) {
-            let echo = x86_64::instructions::interrupts::without_interrupts(|| unsafe { ECHO });
-            match byte {
-                b'\n' | b'\r' => {
-                    if echo {
-                        writer.write_string("\n");
-                    }
-                    history.add(line.clone());
-                    return line;
-                }
-                0x08 => {
-                    if line.pop().is_some() && echo {
-                        writer.backspace();
-                    }
-                }
-                c => {
-                    line.push(c as char);
-                    if echo {
-                        writer.write_byte(c);
-                    }
-                }
-            }
+        if dirty && echo_get() {
+            ed.redraw(writer);
         }
     }
 }

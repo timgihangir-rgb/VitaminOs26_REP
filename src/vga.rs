@@ -53,6 +53,11 @@ pub fn set_80x30() {
 
     outb(CRTC_INDEX, 0x09);
     outb(CRTC_DATA, 0x0F);
+
+    // Форма курсора. Без этого курсор невидим: GRUB оставляет в CRTC 0x0A
+    // бит 5 («курсор выключен»). Подчёркивание внизу клетки — как в обычном
+    // терминале.
+    crate::cursor::set_shape(crate::cursor::UNDERLINE.0, crate::cursor::UNDERLINE.1);
 }
 
 fn seq_write(idx: u8, val: u8) {
@@ -159,20 +164,6 @@ impl Writer {
         self.update_hw_cursor();
     }
 
-    pub fn backspace(&mut self) {
-        if self.column_position > 0 {
-            self.column_position -= 1;
-            let row = self.row_position;
-            let col = self.column_position;
-            unsafe {
-                let offset = (row * SCREEN_WIDTH + col) * 2;
-                *VGA_BUFFER.add(offset) = b' ';
-                *VGA_BUFFER.add(offset + 1) = self.color_code;
-            }
-            self.update_hw_cursor();
-        }
-    }
-
     fn new_line(&mut self) {
         self.column_position = 0;
         self.row_position += 1;
@@ -243,6 +234,49 @@ impl Writer {
             }
         }
         self.update_hw_cursor();
+    }
+
+    /// Прокручивает экран вверх на `n` строк, поднимая позицию вывода.
+    /// Нужно редактору строки, который сам следит, где на экране его текст.
+    pub fn scroll_up_by(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        for _ in 0..n {
+            self.scroll_up();
+        }
+        self.row_position = self.row_position.saturating_sub(n);
+        self.update_hw_cursor();
+    }
+
+    /// Пишет байт в конкретную ячейку, не трогая позицию вывода: так
+    /// редактор строки рисует текст по своему собственному отсчёту от
+    /// начала ввода (промпт может начинаться с середины экрана).
+    pub fn put(&mut self, row: usize, col: usize, byte: u8) {
+        if row >= SCREEN_HEIGHT || col >= SCREEN_WIDTH {
+            return;
+        }
+        unsafe {
+            let offset = (row * SCREEN_WIDTH + col) * 2;
+            *VGA_BUFFER.add(offset) = byte;
+            *VGA_BUFFER.add(offset + 1) = self.color_code;
+        }
+    }
+
+    /// Затирает пробелами прямоугольник `rows` x `cols`, отсчёт от (row, col).
+    /// Позиция вывода не меняется — её ставит вызывающий.
+    pub fn fill_rect(&mut self, row: usize, col: usize, rows: usize, cols: usize) {
+        for r in 0..rows {
+            let rr = row + r;
+            if rr >= SCREEN_HEIGHT {
+                break;
+            }
+            let from = if r == 0 { col } else { 0 };
+            let to = if r == 0 { cols } else { SCREEN_WIDTH };
+            for c in from..to.min(SCREEN_WIDTH) {
+                self.put(rr, c, b' ');
+            }
+        }
     }
 
     pub fn row(&self) -> usize {

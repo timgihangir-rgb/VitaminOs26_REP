@@ -29,6 +29,7 @@ static int shift_pressed;
 
 static void outb(unsigned short port, unsigned char val);
 static void set_cursor(int row, int col);
+static void cursor_shape(void);
 static void clear_screen(void);
 static void draw_char(int row, int col, unsigned char ch, unsigned char attr);
 static void draw_str(int row, int col, const char *s, unsigned char attr);
@@ -73,6 +74,7 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
     shift_pressed = 0;
 
     clear_screen();
+    cursor_shape();
 
     for (;;) {
         fill_row(0, 0x30);
@@ -383,11 +385,26 @@ static void outb(unsigned short port, unsigned char val) {
 }
 
 static void set_cursor(int row, int col) {
+    if (row < 0) row = 0;
+    if (row > 29) row = 29;
+    if (col < 0) col = 0;
+    if (col > COLS - 1) col = COLS - 1;
     int pos = row * 80 + col;
     outb(0x3D4, 0x0F);
     outb(0x3D5, pos & 0xFF);
     outb(0x3D4, 0x0E);
     outb(0x3D5, (pos >> 8) & 0xFF);
+}
+
+/* Форма аппаратного курсора: CRTC 0x0A — первая сканлиня, 0x0B — последняя.
+   Без явной установки курсор не виден: GRUB оставляет в 0x0A бит 5 — «курсор
+   выключен».
+   Подчёркивание в нижних 3 сканлинах — как в обычном терминале. */
+static void cursor_shape(void) {
+    outb(0x3D4, 0x0A);
+    outb(0x3D5, 13);
+    outb(0x3D4, 0x0B);
+    outb(0x3D5, 15);
 }
 
 static void clear_screen(void) {
