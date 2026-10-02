@@ -1,12 +1,19 @@
 // src/blockdev.rs
 //
-// Блочный слой поверх PIO ATA: логический блок 4 КиБ = 8 секторов по 512.
-// Здесь живут низкоуровневые порт-примитивы (переехали из disk.rs),
-// публичный API read_block/write_block и счётчики статистики.
+// Блочный слой: логический блок 4 КиБ = 8 секторов по 512. Здесь живут
+// низкоуровневые порт-примитивы ATA PIO (переехали из disk.rs), диспетчер
+// между бэкендами, публичный API read_block/write_block и счётчики статистики.
 //
-// Реентерабельность: все PIO-последовательности выполняются с запрещёнными
+// Бэкенд выбирается один раз при загрузке (см. init): если на шине есть
+// AHCI/SATA-контроллер с диском, работает он (DMA, LBA48), иначе - legacy
+// ATA PIO через порты 0x1F0. Наружу всегда смотрит один и тот же API.
+//
+// Реентерабельность: PIO-последовательности выполняются с запрещёнными
 // маскируемыми прерываниями, чтобы тик таймера не переключил задачу посреди
 // программирования контроллера (иначе порты перемешаются между задачами).
+// AHCI-путь полагается на то же самое: его вызывают из-под without_interrupts
+// (bcache, vitafs), а на случай прямого вызова у драйвера есть спин-лок.
+// Ожидание у обоих бэкендов ограничено по итерациям.
 
 use x86_64::instructions::interrupts;
 use x86_64::instructions::port::Port;
@@ -122,10 +129,54 @@ fn probe() -> bool {
     }
 }
 
+/// Бэкенд блочного доступа. До загрузки (если init() не вызывали) считаем,
+/// что работает legacy PIO, и тогда диск ищется лениво пробой порта.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Ahci,
+    AtaPio,
+}
+
 static mut DISK_PRESENT: Option<bool> = None;
+static mut BACKEND: Backend = Backend::AtaPio;
+
+/// Ищет AHCI/SATA-контроллер и поднимает порт. Возвращает выбранный бэкенд.
+/// Вызывается один раз при загрузке до первого обращения к ФС.
+pub fn init() -> Backend {
+    let backend = if crate::ahci::init() {
+        Backend::Ahci
+    } else {
+        Backend::AtaPio
+    };
+    unsafe {
+        BACKEND = backend;
+        if backend == Backend::AtaPio {
+            // Диск на портах 0x1F0 проверяем сразу: у AHCI такой пробы нет.
+            DISK_PRESENT = Some(probe());
+        }
+    }
+    backend
+}
+
+/// Активный бэкенд.
+pub fn backend() -> Backend {
+    unsafe { BACKEND }
+}
+
+/// Короткое имя бэкенда для диагностики.
+pub fn backend_name() -> &'static str {
+    match backend() {
+        Backend::Ahci => "ahci",
+        Backend::AtaPio => "ata-pio",
+    }
+}
 
 pub fn present() -> bool {
     unsafe {
+        match BACKEND {
+            Backend::Ahci => return crate::ahci::present(),
+            Backend::AtaPio => {}
+        }
         if let Some(p) = DISK_PRESENT {
             return p;
         }
@@ -163,8 +214,13 @@ pub fn capacity_blocks() -> Option<u32> {
         if let Some(c) = CAPACITY_BLOCKS {
             return Some(c);
         }
-        let sectors = ata_identify_sectors()?;
-        let blocks = sectors / SECTORS_PER_BLOCK;
+        let blocks = match BACKEND {
+            Backend::Ahci => crate::ahci::capacity_sectors()? / SECTORS_PER_BLOCK as u64,
+            Backend::AtaPio => (ata_identify_sectors()? / SECTORS_PER_BLOCK) as u64,
+        };
+        // Наружу отдаём u32: столько 4-КиБ блоков всё равно не адресуемо
+        // указателями в текущих потребителях.
+        let blocks = core::cmp::min(blocks, u32::MAX as u64) as u32;
         CAPACITY_BLOCKS = Some(blocks);
         Some(blocks)
     }
@@ -233,14 +289,61 @@ unsafe fn select_drive(lba: u32) {
     outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F) as u8);
 }
 
+/// Верхняя граница сектора для выбранного бэкенда. У AHCI адресация LBA48,
+/// у PIO - только 28 бит.
+fn last_sector() -> u64 {
+    match backend() {
+        Backend::Ahci => u64::MAX,
+        Backend::AtaPio => u32::MAX as u64,
+    }
+}
+
+/// Проверка адреса блока: не выходит ли он за адресуемое блочное устройство.
+fn block_ok(block_no: u64) -> bool {
+    let sector = match block_no.checked_mul(SECTORS_PER_BLOCK as u64) {
+        Some(s) => s,
+        None => return false,
+    };
+    sector <= last_sector()
+}
+
+/// Читает `count` секторов начиная с `sector` выбранным бэкендом.
+fn dispatch_read(sector: u64, count: u8, buf: &mut [u8]) -> Result<(), ()> {
+    if sector > last_sector() {
+        return Err(());
+    }
+    match backend() {
+        Backend::Ahci => crate::ahci::read_sectors(sector, count as u16, buf),
+        Backend::AtaPio => interrupts::without_interrupts(|| unsafe {
+            read_sectors_raw(sector as u32, count, buf)
+        }),
+    }
+}
+
+/// Пишет `count` секторов из buf выбранным бэкендом.
+fn dispatch_write(sector: u64, count: u8, buf: &[u8]) -> Result<(), ()> {
+    if sector > last_sector() {
+        return Err(());
+    }
+    match backend() {
+        Backend::Ahci => crate::ahci::write_sectors(sector, count as u16, buf),
+        Backend::AtaPio => interrupts::without_interrupts(|| unsafe {
+            write_sectors_raw(sector as u32, count, buf)
+        }),
+    }
+}
+
 /// Читает один 4-КиБ блок. lba - номер блока (не сектора).
 pub fn read_block(block_no: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), ()> {
-    if !present() || block_no > u32::MAX as u64 / SECTORS_PER_BLOCK as u64 {
+    if !present() || !block_ok(block_no) {
         bump_errors();
         return Err(());
     }
-    let sector = (block_no as u32).saturating_mul(SECTORS_PER_BLOCK);
-    let ok = interrupts::without_interrupts(|| unsafe { read_sectors_raw(sector, SECTORS_PER_BLOCK as u8, buf) });
+    let ok = dispatch_read(
+        block_no * SECTORS_PER_BLOCK as u64,
+        SECTORS_PER_BLOCK as u8,
+        buf,
+    );
     unsafe {
         let p = &mut STATS.reads as *mut u64;
         let v = core::ptr::read_volatile(p);
@@ -258,7 +361,7 @@ pub fn read_sectors_pub(lba: u32, count: u8, buf: &mut [u8]) -> Result<(), ()> {
         bump_errors();
         return Err(());
     }
-    let ok = interrupts::without_interrupts(|| unsafe { read_sectors_raw(lba, count, buf) });
+    let ok = dispatch_read(lba as u64, count, buf);
     unsafe {
         let p = &mut STATS.reads as *mut u64;
         let v = core::ptr::read_volatile(p);
@@ -276,7 +379,7 @@ pub fn write_sectors_pub(lba: u32, count: u8, buf: &[u8]) -> Result<(), ()> {
         bump_errors();
         return Err(());
     }
-    let ok = interrupts::without_interrupts(|| unsafe { write_sectors_raw(lba, count, buf) });
+    let ok = dispatch_write(lba as u64, count, buf);
     unsafe {
         let p = &mut STATS.writes as *mut u64;
         let v = core::ptr::read_volatile(p);
@@ -290,12 +393,15 @@ pub fn write_sectors_pub(lba: u32, count: u8, buf: &[u8]) -> Result<(), ()> {
 
 /// Пишет один 4-КиБ блок.
 pub fn write_block(block_no: u64, buf: &[u8; BLOCK_SIZE]) -> Result<(), ()> {
-    if !present() || block_no > u32::MAX as u64 / SECTORS_PER_BLOCK as u64 {
+    if !present() || !block_ok(block_no) {
         bump_errors();
         return Err(());
     }
-    let sector = (block_no as u32).saturating_mul(SECTORS_PER_BLOCK);
-    let ok = interrupts::without_interrupts(|| unsafe { write_sectors_raw(sector, SECTORS_PER_BLOCK as u8, buf) });
+    let ok = dispatch_write(
+        block_no * SECTORS_PER_BLOCK as u64,
+        SECTORS_PER_BLOCK as u8,
+        buf,
+    );
     unsafe {
         let p = &mut STATS.writes as *mut u64;
         let v = core::ptr::read_volatile(p);

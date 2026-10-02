@@ -88,3 +88,54 @@ pub fn find_device(vendor: u16, device: u16) -> Option<PciDev> {
     }
     None
 }
+
+/// SATA/AHCI-контроллер, найденный на шине.
+#[derive(Clone, Copy)]
+pub struct SataCtrl {
+    pub bus: u8,
+    pub slot: u8,
+    pub func: u8,
+    /// Физический базовый адрес регистров (BAR5, 64-битный memory BAR).
+    pub abar: u64,
+}
+
+/// Ищет AHCI/SATA-контроллер (класс 0x01, подкласс 0x06) на шине 0.
+///
+/// В отличие от find_device сканируются все функции слота, а не только нулевая:
+/// у Intel ICH9 контроллер живёт в 00:1f.2. BAR5 - это memory-BAR, и его адрес
+/// берётся прямо из конфигурационного пространства: контроллер настроен BIOS,
+/// но MMIO-окно в ядро мы маппим сами (см. paging::map_phys_in_kernel).
+pub fn find_sata() -> Option<SataCtrl> {
+    for slot in 0..32u8 {
+        let vendor0 = read_u16(0, slot, 0, 0);
+        if vendor0 == 0xFFFF {
+            continue; // пустой слот
+        }
+        let multifunction = read_u8(0, slot, 0, 0x0E) & 0x80 != 0;
+        let funcs = if multifunction { 8 } else { 1 };
+        for func in 0..funcs {
+            let vendor = if func == 0 { vendor0 } else { read_u16(0, slot, func, 0) };
+            if vendor == 0xFFFF {
+                continue;
+            }
+            if read_u8(0, slot, func, 0x0B) != 0x01 || read_u8(0, slot, func, 0x0A) != 0x06 {
+                continue;
+            }
+            let bar5 = read_u32(0, slot, func, 0x24);
+            if bar5 & 1 != 0 {
+                continue; // I/O-BAR: у AHCI BAR5 всегда memory
+            }
+            // BAR5 64-битный: младшие два бита 10 означают "64-битный memory BAR",
+            // старшая половина лежит в BAR6.
+            let mut abar = (bar5 & !0x0F) as u64;
+            if bar5 & 0x6 == 0x2 {
+                abar |= (read_u32(0, slot, func, 0x28) as u64) << 32;
+            }
+            if abar == 0 {
+                continue; // BAR не назначен BIOS
+            }
+            return Some(SataCtrl { bus: 0, slot, func, abar });
+        }
+    }
+    None
+}

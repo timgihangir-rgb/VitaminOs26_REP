@@ -5,7 +5,10 @@ use x86_64::{
         FrameAllocator, FrameDeallocator, MappedPageTable, Mapper, Page, PageTable,
         PageTableFlags, PhysFrame, Size4KiB, Translate,
     },
-    structures::paging::mapper::PageTableFrameMapping,
+    structures::paging::{
+        mapper::{MapToError, PageTableFrameMapping},
+        OffsetPageTable,
+    },
     PhysAddr, VirtAddr,
 };
 
@@ -219,6 +222,67 @@ unsafe fn copy_frame(src: PhysFrame, dst: PhysFrame) {
     let s = VirtAddr::new(PHYS_MEM_OFFSET + src.start_address().as_u64()).as_ptr::<u8>();
     let d = VirtAddr::new(PHYS_MEM_OFFSET + dst.start_address().as_u64()).as_mut_ptr();
     core::ptr::copy_nonoverlapping(s, d, 4096);
+}
+
+/// Окно MMIO в верхней половине адресного пространства ядра: физический BAR
+/// контроллера с адресом `p` отображается сюда по адресу
+/// `KERNEL_MMIO_BASE + p`. Нужно контроллерам с memory-BAR: ABAR SATA-контроллера
+/// стоит около 0xFEBF_1000, а это PCI-дыра вне RAM, и GRUB первые 4 ГиБ
+/// разворачивает huge-страницами строго по карте памяти - под MMIO там ничего
+/// нет, отображать его в PHYS_MEM_OFFSET нельзя.
+///
+/// Страницы помечаются NO_CACHE - содержимое MMIO не должно попадать в кэш CPU.
+///
+/// Окно должно быть отображено до создания адресных пространств задач: они
+/// зеркалят верхнюю половину ядра из активных таблиц на момент создания.
+pub const KERNEL_MMIO_BASE: u64 = 0xFFFF9000_00000000;
+
+/// Размер окна MMIO: 4 ГиБ физических адресов, столько нужно PCI- BAR'ам.
+pub const KERNEL_MMIO_SIZE: u64 = 0x1_0000_0000;
+
+/// Отображает MMIO-диапазон физической памяти в окно KERNEL_MMIO_BASE.
+/// Возвращает виртуальный адрес того же физического диапазона в ядре.
+/// Диапазон выравнивается по границе страницы вниз: адрес ABAR может быть
+/// не кратен 4 КиБ.
+pub unsafe fn map_phys_in_kernel(phys: u64, len: u64) -> Option<u64> {
+    let end = phys.checked_add(len)?;
+    if end > KERNEL_MMIO_SIZE {
+        dmap(&alloc::format!("mmio out of window: phys={:x} len={:x}", phys, len));
+        return None;
+    }
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
+    let mut pt = OffsetPageTable::new(active_level_4_table(), VirtAddr::new(PHYS_MEM_OFFSET));
+    let mut addr = phys & !0xFFF;
+    while addr < end {
+        // Адреса в нашем окне до этого ничем не заняты: отображаем без проверки.
+        let virt = VirtAddr::new(KERNEL_MMIO_BASE + addr);
+        let page: Page<Size4KiB> = match Page::from_start_address(virt) {
+            Ok(p) => p,
+            Err(_) => return None,
+        };
+        let frame: PhysFrame<Size4KiB> = PhysFrame::containing_address(PhysAddr::new(addr));
+        if let Err(e) = OffsetPageTable::map_to(&mut pt, page, frame, flags, &mut FRAME_ALLOC) {
+            dmap(&alloc::format!(
+                "mmio map phys={:x} free={} err={}",
+                addr,
+                FRAME_ALLOC.free_count(),
+                match e {
+                    MapToError::FrameAllocationFailed => "no-frame",
+                    MapToError::ParentEntryHugePage => "huge-page",
+                    MapToError::PageAlreadyMapped(_) => "already-mapped",
+                }
+            ));
+            return None;
+        }
+        addr += 0x1000;
+    }
+    Some(KERNEL_MMIO_BASE + phys)
+}
+
+fn dmap(msg: &str) {
+    crate::vga::serial_write_atomic("[P] ");
+    crate::vga::serial_write_atomic(msg);
+    crate::vga::serial_putchar(b'\n');
 }
 
 pub fn map_page(

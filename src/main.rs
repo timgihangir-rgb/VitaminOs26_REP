@@ -7,6 +7,7 @@ extern crate alloc;
 
 use core::panic::PanicInfo;
 
+mod ahci;
 mod bcache;
 mod blockdev;
 mod cursor;
@@ -75,6 +76,16 @@ pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
     // Загрузочный экран: баннер + статусы подсистем.
     splash::draw(&mut writer);
 
+    // Блочный бэкенд выбирается до первого обращения к диску: AHCI/SATA,
+    // если контроллер есть, иначе legacy ATA PIO.
+    blockdev::init();
+    if blockdev::present() {
+        let name = alloc::format!("block device: {}", blockdev::backend_name());
+        splash::step(&mut writer, name.as_str());
+    } else {
+        splash::fail(&mut writer, "block device: no disk found");
+    }
+
     let mem = sysinfo::MemInfo::from_memory_map(memory_regions);
     let mut vfs = vfs::Vfs::new();
 
@@ -133,7 +144,14 @@ fn stage0_diag() {
     // оставляли живой inode 1000 + блок 130 при откаченных битмапах, что
     // давало "[fsck] fixed" каждую загрузку и рассинхрон bcache/диска.
     // Запускать вручную при разработке ФС.
-    msg.push_str(" | blockdev selftest=");
+    msg.push_str(" | blockdev=");
+    msg.push_str(blockdev::backend_name());
+    msg.push_str(" cap=");
+    match blockdev::capacity_blocks() {
+        Some(b) => msg.push_str(&alloc::format!("{} blk", b)),
+        None => msg.push_str("?"),
+    }
+    msg.push_str(" selftest=");
     msg.push_str(if blockdev::selftest() { "OK" } else { "FAIL" });
     msg.push_str(" bcache selftest=");
     msg.push_str(if bcache::selftest() { "OK" } else { "FAIL" });
