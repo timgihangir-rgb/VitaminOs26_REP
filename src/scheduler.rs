@@ -284,6 +284,18 @@ pub fn task_count() -> usize {
     unsafe { TASKS.iter().filter(|s| s.is_some()).count() }
 }
 
+/// Сколько задач готово к запуску (размер очереди готовых, как load average
+/// в Linux). Считаем все, кроме текущей: она уже выполняется.
+pub fn ready_count() -> usize {
+    let cur = CURRENT.load(Ordering::SeqCst);
+    unsafe {
+        TASKS.iter()
+            .enumerate()
+            .filter(|(i, s)| *i != cur && s.as_ref().map_or(false, |t| t.state == TaskState::Ready))
+            .count()
+    }
+}
+
 /// Захват VFS_LOCK с уступкой CPU. Спин-лок нереентерабельный, а при
 /// вытесняющей многозадачности крутящийся на локе поток способен навсегда
 /// отобрать процессор у держателя лока (тикер не передаст ему управление,
@@ -851,7 +863,12 @@ extern "C" fn schedule() -> usize {
             }
         }
         t.state = TaskState::Running;
-        t.ticks += ticks - t.last_tick;
+        // Время выполнения уже учтено выше, в ветке уходящей задачи: там
+        // стоит `ticks += ticks - t.last_tick`. Здесь её `last_tick` уже
+        // равен текущему тику, и повторный += списывал бы на входящую
+        // задачу время, которое отработали другие: сумма %CPU по задачам
+        // доходила до 600% при шести задачах. Здесь только переносим начало
+        // отсчёта: с этого момента задача выполняется.
         t.last_tick = ticks;
         CURRENT_SAVE_SLOT = core::ptr::addr_of_mut!(t.saved_rsp) as usize;
         switch_to_task(t, next);
