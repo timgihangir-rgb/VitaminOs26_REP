@@ -10,6 +10,7 @@ use core::panic::PanicInfo;
 mod bcache;
 mod blockdev;
 mod cursor;
+mod desk;
 mod devices;
 mod elf;
 mod exec;
@@ -99,7 +100,10 @@ pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
     crate::vga::serial_write_atomic("[M] post-boot\n");
     splash::wait_enter(&mut writer);
     splash::finish(&mut writer);
-    shell::run_shell(&mut writer, mem, &mut vfs);
+    // Рабочие столы поднимаются до шелла: основной шелл — это стол 0, и его
+    // экран уже на дисплее, остальные стартуют приостановленными.
+    desk::boot(mem, &mut vfs);
+    shell::run_shell(&mut writer, mem, &mut vfs, 0);
     crate::vga::serial_write_atomic("[M] shell-exit\n");
 }
 

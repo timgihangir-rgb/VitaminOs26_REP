@@ -3,9 +3,38 @@ const VGA_BUFFER: *mut u8 = 0xb8000 as *mut u8;
 pub const SCREEN_WIDTH: usize = 80;
 pub const SCREEN_HEIGHT: usize = 30;
 
+/// Размер текстового экрана в байтах (символ + атрибут на ячейку).
+pub const SCREEN_BYTES: usize = SCREEN_WIDTH * SCREEN_HEIGHT * 2;
+
+/// Считывает текстовый экран из видеопамяти в `buf` — рабочему столу надо
+/// запомнить своё содержимое перед переключением на другой.
+pub fn screen_snapshot(buf: &mut [u8]) {
+    let n = SCREEN_BYTES.min(buf.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(VGA_BUFFER, buf.as_mut_ptr(), n);
+    }
+}
+
+/// Выводит `buf` на текстовый экран.
+pub fn screen_restore(buf: &[u8]) {
+    let n = SCREEN_BYTES.min(buf.len());
+    unsafe {
+        core::ptr::copy_nonoverlapping(buf.as_ptr(), VGA_BUFFER, n);
+    }
+}
+
+/// Заполняет `buf` пустым экраном (пробелы на чёрном, атрибут 0x07).
+pub fn screen_blank(buf: &mut [u8]) {
+    for cell in buf.chunks_exact_mut(2).take(SCREEN_WIDTH * SCREEN_HEIGHT) {
+        cell[0] = b' ';
+        cell[1] = 0x07;
+    }
+}
+
 pub const COLOR_LIGHT_GREEN: u8 = 0x0A;
 pub const COLOR_LIGHT_CYAN: u8 = 0x0B;
 pub const COLOR_WHITE: u8 = 0x0F;
+pub const COLOR_DARK_GREY: u8 = 0x08;
 
 const CRTC_INDEX: u16 = 0x3D4;
 const CRTC_DATA: u16 = 0x3D5;

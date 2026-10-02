@@ -90,6 +90,11 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
                 wputc('\n', 0x0F);
         }
     }
+    wputc('\n', 0x0F);
+
+    wputs("Keys:\n", 0x0B);
+    wputs("  Ctrl+C            interrupt the running program / cancel the line\n", 0x0F);
+    wputs("  Ctrl+Shift+1..4    switch desktop (1-4) in the prompt\n", 0x0F);
 
     EXIT_ROW = r;
     EXIT_COL = c;

@@ -3,11 +3,24 @@ use crate::fs;
 use crate::keyboard;
 use crate::sysinfo;
 use crate::vfs::Vfs;
-use crate::vga::{COLOR_LIGHT_CYAN, COLOR_WHITE, Writer};
+use crate::vga::{COLOR_DARK_GREY, COLOR_LIGHT_CYAN, COLOR_LIGHT_GREEN, COLOR_WHITE, Writer};
 use alloc::vec::Vec;
-pub fn run_shell(writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut Vfs) -> ! {
+pub fn run_shell(
+    writer: &mut Writer,
+    mem: sysinfo::MemInfo,
+    vfs: &mut Vfs,
+    desk_index: u8,
+) -> ! {
     let mut history = keyboard::History::new();
     loop {
+        // Номер рабочего стола — чтобы было видно, какой из четырёх
+        // терминалов активен (переключение: Ctrl+Shift+1..4).
+        writer.set_color(COLOR_DARK_GREY);
+        writer.write_string("[");
+        writer.set_color(COLOR_LIGHT_GREEN);
+        writer.write_string(alloc::format!("{}", desk_index + 1).as_str());
+        writer.set_color(COLOR_DARK_GREY);
+        writer.write_string("] ");
         writer.set_color(COLOR_LIGHT_CYAN);
         writer.write_string("vitamin_os26");
         writer.set_color(COLOR_WHITE);
@@ -19,6 +32,11 @@ pub fn run_shell(writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut Vfs) -> !
         writer.set_color(COLOR_WHITE);
 
         let input = keyboard::read_line(writer, &mut history);
+        if input.is_empty() {
+            // Пустая строка — и нажатие Ctrl+C: ничего не выполняем, но
+            // и историю не портим.
+            continue;
+        }
         #[cfg(debug_assertions)]
         {
             let msg = alloc::format!("shell got line: {:?}\n", input);
@@ -149,6 +167,18 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
     // крутиться на локе в это время.
     if let ["ping", addr] = args.as_slice() {
         crate::net::ping(writer, addr);
+        let _g = crate::scheduler::vfs_lock();
+        crate::vitafs::sync_all();
+        return true;
+    }
+
+    // `top` VFS не трогает, а держит терминал минутами — значит, под
+    // VFS_LOCK он столько же блокировал бы весь файловый доступ. Хуже: при
+    // переключении рабочего стола top приостанавливается, его guard остаётся
+    // лежать на стеке спящей задачи, и лок уже никто не снимет — все
+    // файловые команды зависнут навсегда. Выполняем БЕЗ лока.
+    if let ["top"] = args.as_slice() {
+        crate::top::run(writer);
         let _g = crate::scheduler::vfs_lock();
         crate::vitafs::sync_all();
         return true;
@@ -323,9 +353,6 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
         ["ps"] => {
             ps(writer);
         }
-        ["top"] => {
-            crate::top::run(writer);
-        }
         ["init", sub @ ..] => {
             crate::init::cmd(writer, vfs, sub);
         }
@@ -473,11 +500,15 @@ fn ps(writer: &mut Writer) {
     for p in &procs {
         let name_str = core::str::from_utf8(&p.name).unwrap_or("?");
         let name_str = name_str.split('\0').next().unwrap_or("");
+        // Приостановленные задачи (неактивные рабочие столы) показываем
+        // отдельным состоянием: их `ready` вводит в заблуждение — квантов
+        // CPU они не получают вовсе.
+        let state = if p.suspended { "paused" } else { p.state };
         writer.write_string(&alloc::format!(
             "{:>5}  {:<20}  {:<10}  {}\n",
             p.pid,
             name_str,
-            p.state,
+            state,
             p.ticks
         ));
     }

@@ -15,6 +15,25 @@ fn dbg(msg: &str) {
     }
 }
 
+/// Опрос клавиатуры, пока шелл ждёт foreground-программу.
+///
+/// Возвращает true — пора убить программу. Сейчас это только Ctrl+C:
+/// программы типа snake/web/vita Ctrl+C не понимают, поэтому перехватываем
+/// его в IRQ-обработчике клавиатуры (см. keyboard::HOTKEY_CTRL_C).
+///
+/// Переключение рабочих столов (Ctrl+Shift+1..4) здесь не прерывает
+/// ожидание — стол меняется, а программа просто засыпает вместе с ним.
+fn foreground_poll(_pid: usize) -> bool {
+    if crate::keyboard::take_hotkey(crate::keyboard::HOTKEY_CTRL_C) {
+        return true;
+    }
+    if crate::keyboard::take_hotkey(crate::keyboard::HOTKEY_DESK) {
+        let target = crate::keyboard::desk_target();
+        crate::desk::activate(target);
+    }
+    false
+}
+
 /// Готовит адресное пространство программы и запускает её в ring 3.
 /// ELF-файл (магия \x7fELF) грузится сегментами PT_LOAD по e_entry; иначе
 /// данные считаются legacy flat .bin и копируются целиком на USER_START.
@@ -166,8 +185,17 @@ pub fn run_program(writer: &mut Writer, args: &[&str], mem: sysinfo::MemInfo) ->
         };
 
         dbg("exec: spawned, waiting");
-        scheduler::wait_for(pid);
+        crate::desk::set_fg(pid);
+        let interrupted = scheduler::wait_for_polled(pid, foreground_poll);
+        crate::desk::clear_fg();
         dbg("exec: wait done");
+
+        if interrupted {
+            // Ctrl+C: kill() уже снял задачу, reap'уть нечего — слот и
+            // адресное пространство освобождены внутри kill.
+            writer.write_string(&alloc::format!("\n^C {} terminated\n", name));
+            return true;
+        }
 
         let exit_row = unsafe { core::ptr::read_volatile(0x708C as *const i32) };
         if exit_row >= 0 {

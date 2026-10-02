@@ -188,11 +188,19 @@ fn sample(prev: &mut Vec<(usize, u64)>, span: u64, running_pid: usize) -> Vec<Ro
             None if p.pid == running_pid => span,
             None => 0,
         };
+        // Приостановленные задачи (неактивные рабочие столы) не получают квантов
+        // CPU, поэтому их %CPU всегда 0, а слово состояния показываем
+        // явным `paused` — иначе `ready` выглядит как «сейчас считает».
+        let (letter, word) = if p.suspended {
+            ('P', "paused")
+        } else {
+            (state_letter(p.state), p.state)
+        };
         rows.push(Row {
             pid: p.pid,
             name: proc_name(&p),
-            state: state_letter(p.state),
-            state_word: p.state,
+            state: letter,
+            state_word: word,
             running: p.pid == running_pid,
             ticks: p.ticks,
             cpu_x10: (delta * 1000 / span) as u32,
@@ -279,12 +287,28 @@ pub fn run(writer: &mut Writer) {
     sample(&mut t.prev, 0, scheduler::current_pid());
     let mut total_before = start;
 
+    // top занимает весь экран, поэтому он обязан быть «foreground» своего
+    // стола: иначе переключение стола не приостановит его, и монитор
+    // продолжит рисовать поверх чужого терминала.
+    crate::desk::set_fg(scheduler::current_pid());
+
     let mut rows = Vec::new();
-    loop {
+    let mut quit = false;
+    while !quit {
         // ─── Ждём секунду, попутно реагируя на клавиши ───────────────────
         let deadline = total_before + REFRESH_TICKS;
-        let mut quit = false;
         while scheduler::ticks() < deadline {
+            // Клавиши ядра: Ctrl+C — выход, Ctrl+Shift+1..4 — смена стола.
+            // Их разбираем первыми: top — единственный потребитель клавиш,
+            // пока он на экране, и оставленная клавиша сработала бы позже.
+            if keyboard::poll_hotkeys() {
+                quit = true;
+                break;
+            }
+            // Пока активен другой стол, top не рисует. Обычно задача уже
+            // приостановлена переключением — этот цикл просто ждёт возврата.
+            crate::desk::wait_while_inactive();
+
             while keyboard::kb_hit() {
                 let sc = keyboard::kb_read();
                 // Модификаторы и break-коды (0x80) игнорируем, иначе `q`
@@ -326,6 +350,8 @@ pub fn run(writer: &mut Writer) {
 
         draw(writer, &rows, &t);
     }
+
+    crate::desk::clear_fg();
 
     // Убираем подсказку и возвращаем курсор вниз экрана под приглашение.
     for r in ROW_HELP..SCREEN_HEIGHT {

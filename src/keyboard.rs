@@ -10,18 +10,115 @@ const STATUS_PORT: u16 = 0x64;
 /// Прерывания на время обработчика выключены (interrupt gate).
 static KBD_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Горячие клавиши, которые обрабатываются ядром, а не строкой ввода.
+/// Вводят битовую маску HOTKEY_PENDING; забирает их тот, кто сейчас читает
+/// клавиатуру (см. `poll_hotkeys`): шелл в `read_line`, ожидающий
+/// foreground-программу в `scheduler::wait_for_polled` или `top`.
+pub const HOTKEY_CTRL_C: u8 = 1 << 0;
+pub const HOTKEY_DESK: u8 = 1 << 1;
+
+static HOTKEY_PENDING: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+static MOD_CTRL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static MOD_SHIFT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Номер рабочего стола из последнего Ctrl+Shift+1..4.
+static DESK_TARGET: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 extern "x86-interrupt" fn keyboard_irq_handler(_frame: x86_64::structures::idt::InterruptStackFrame) {
+    use core::sync::atomic::Ordering;
     use x86_64::instructions::port::Port;
     let status: u8 = unsafe { Port::new(STATUS_PORT).read() };
     if status & 0x1 != 0 {
         let sc: u8 = unsafe { Port::new(DATA_PORT).read() };
-        push_scancode(sc);
+        let ctrl = MOD_CTRL.load(Ordering::Relaxed);
+        let shift = MOD_SHIFT.load(Ordering::Relaxed);
+        let make = sc & 0x80 == 0;
+        // Горячие клавиши наружу не отдаём: ни строке ввода, ни тем более
+        // foreground-программе (snake/web Ctrl+C не понимают — а цифра от
+        // Ctrl+Shift+2 иначе вставлялась бы прямо в набираемую команду).
+        let mut consumed = false;
+        if make {
+            match sc {
+                0x1D => MOD_CTRL.store(true, Ordering::Relaxed),
+                0x2A | 0x36 => MOD_SHIFT.store(true, Ordering::Relaxed),
+                // Ctrl+C. Что с ней делать, решает потребитель: прервать
+                // foreground-программу или отменить строку ввода.
+                0x2E if ctrl => {
+                    HOTKEY_PENDING.fetch_or(HOTKEY_CTRL_C, Ordering::SeqCst);
+                    consumed = true;
+                    // Сбрасываем Ctrl: если пользователь держит его дальше
+                    // (скажем, выбирает текст Ctrl+Shift+стрелка), следующая
+                    // буква не должна считаться новой Ctrl-комбинацией.
+                    MOD_CTRL.store(false, Ordering::Relaxed);
+                }
+                // Ctrl+Shift+1..4 — переключение рабочих столов.
+                0x02..=0x05 if ctrl && shift => {
+                    DESK_TARGET.store(sc - 0x02, Ordering::SeqCst);
+                    HOTKEY_PENDING.fetch_or(HOTKEY_DESK, Ordering::SeqCst);
+                    consumed = true;
+                    MOD_CTRL.store(false, Ordering::Relaxed);
+                    MOD_SHIFT.store(false, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+        } else {
+            match sc {
+                0x9D => MOD_CTRL.store(false, Ordering::Relaxed),
+                0xAA | 0xB6 => MOD_SHIFT.store(false, Ordering::Relaxed),
+                _ => {}
+            }
+        }
+        if !consumed {
+            push_scancode(sc);
+        }
     }
     unsafe {
         let mut eoi = Port::new(0x20);
         eoi.write(0x20u8);
     }
     KBD_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Забирает «съеденную» горячую клавишу: true — была нажата (и теперь
+/// сброшена), false — не было. Два потребителя на одну клавишу не
+/// претендуют: кто первый позвонил, тот и обработал.
+pub fn take_hotkey(kind: u8) -> bool {
+    HOTKEY_PENDING.fetch_and(!kind, core::sync::atomic::Ordering::SeqCst) & kind != 0
+}
+
+/// Номер рабочего стола из последнего Ctrl+Shift+1..4 (0-based).
+pub fn desk_target() -> usize {
+    DESK_TARGET.load(core::sync::atomic::Ordering::SeqCst) as usize
+}
+
+/// Хук на горячие клавиши, которые не попадают в строку ввода. Ставится
+/// рабочими столами (см. `desk::boot`); аргумент — индекс стола.
+static mut HOTKEY_HOOK: Option<fn(usize)> = None;
+
+pub fn set_hotkey_hook(f: fn(usize)) {
+    unsafe { HOTKEY_HOOK = Some(f) }
+}
+
+/// Разбирает накопившиеся горячие клавиши. Возвращает true, если был
+/// обработан Ctrl+C (вызывающий должен прервать программу или отменить
+/// строку ввода).
+///
+/// Звать должен любой, кто читает клавиатуру: иначе неразобранная клавиша
+/// «залипнет» в HOTKEY_PENDING и сработает позже, когда её уже никто не
+/// ждал, — например Ctrl+Shift+2 напечатает «2» в следующую команду.
+pub fn poll_hotkeys() -> bool {
+    if take_hotkey(HOTKEY_DESK) {
+        let target = desk_target();
+        if let Some(f) = unsafe { HOTKEY_HOOK } {
+            f(target);
+        }
+    }
+    take_hotkey(HOTKEY_CTRL_C)
+}
+
+/// Сбрасывает все неразобранные горячие клавиши. Вызывается при старте
+/// рабочих столов, чтобы нажатие на экране загрузки не всплыло в промпте.
+pub fn clear_hotkeys() {
+    HOTKEY_PENDING.store(0, core::sync::atomic::Ordering::SeqCst);
 }
 
 pub fn kbd_irq_count() -> u64 {
@@ -291,6 +388,14 @@ impl LineEditor {
         }
     }
 
+    /// Стирает область ввода и забывает текст — для Ctrl+C.
+    fn discard(&mut self, writer: &mut Writer) {
+        writer.fill_rect(self.row, self.col, self.drawn.max(self.rows_needed()), SCREEN_WIDTH);
+        self.line.clear();
+        self.cursor = 0;
+        self.drawn = 0;
+    }
+
     fn redraw(&mut self, writer: &mut Writer) {
         let need = self.rows_needed();
         // Стираем прежний рисунок: первая строка — с якоря (промпт слева
@@ -369,6 +474,15 @@ pub fn read_line(writer: &mut Writer, history: &mut History) -> String {
     let mut e0 = false;
 
     loop {
+        // Горячие клавиши ядра: переключение рабочих столов не трогает
+        // строку ввода, а Ctrl+C отменяет её (как в терминале).
+        if poll_hotkeys() {
+            if echo_get() {
+                ed.discard(writer);
+                writer.write_string("^C\n");
+            }
+            return String::new();
+        }
         let scancode = match pop_scancode() {
             Some(sc) => sc,
             None => {

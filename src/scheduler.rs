@@ -23,7 +23,7 @@
 //! VFS общая для шелла и фоновых задач. Доступ к ней сериализуется
 //! глобальным `VFS_LOCK` (spinning, см. vfs_lock_yield). Шелл держит лок на
 //! время выполнения команды, фоновые задачи — на время своих операций через
-//! `with_vfs`. Лок отслеживает владельца (VFS_LOCK_OWNER), а kill()/reap()
+//! `with_vfs`. Лок отслеживает владельца, а kill()/reap()/pause()
 //! принудительно снимают его, если жертва держала лок (CRITICAL-3): иначе
 //! система навсегда зависла бы на vfs_lock_yield.
 
@@ -32,13 +32,15 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::interrupts::{KERNEL_CS, KERNEL_DS, USER_CS, USER_DS};
 use crate::paging::AddressSpace;
 use crate::vfs::Vfs;
 
-pub const MAX_TASKS: usize = 16;
+/// Слотов задач. Четыре шелла рабочих столов + супервизор + его службы +
+/// foreground-программы + фоновые задачи с запасом.
+pub const MAX_TASKS: usize = 24;
 pub const STACK_SIZE: usize = 64 * 1024;
 
 /// Размер стартового контекста на стеке задачи: 15 регистров + фрейм iretq.
@@ -84,16 +86,20 @@ struct Task {
     /// Адресное пространство user-задачи; освобождается при kill/reap.
     space: Option<AddressSpace>,
     /// Тик, после которого Blocked-задача автоматически станет Ready.
-    /// 0 — не просыпаться по таймеру (shell в wait_for будится только через
-    /// WAITING_ON/exit_current). Устанавливается `block_until_tick`/`sleep_until`.
+    /// 0 — не просыпаться по таймеру: задача выйдет из Blocked только явно
+    /// (`resume`). Устанавливается `block_until_tick`/`sleep_until`.
     wake_tick: u64,
+    /// Задача приостановлена и не участвует в ротации (см. `pause`/`resume`).
+    /// Нужна рабочим столам: неактивный терминал не должен получать кванты
+    /// CPU — иначе его шелл читал бы клавиатуру и писал бы в экран активного.
+    suspended: bool,
     #[allow(dead_code)]
     stack: Box<[u8]>,
 }
 
 static mut TASKS: [Option<Task>; MAX_TASKS] = [
-    None, None, None, None, None, None, None, None,
-    None, None, None, None, None, None, None, None,
+    None, None, None, None, None, None, None, None, None, None, None, None,
+    None, None, None, None, None, None, None, None, None, None, None, None,
 ];
 
 /// Индекс текущей (выполняющейся) задачи.
@@ -111,10 +117,6 @@ static TICKS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new
 /// возвращается планировщик при переключении на kernel-задачу.
 static mut BOOT_ROOT: u64 = 0;
 
-/// PID, который ждёт шелл (задача 0). 0 — никто не ждёт. Когда ждущая
-/// задача завершается, `exit_current` переводит шелл из Blocked в Ready.
-static WAITING_ON: AtomicUsize = AtomicUsize::new(0);
-
 /// Указатель на единственный экземпляр Vfs (устанавливается в init).
 static VFS_PTR: AtomicUsize = AtomicUsize::new(0);
 
@@ -127,64 +129,68 @@ static VFS_PTR: AtomicUsize = AtomicUsize::new(0);
 pub static VFS_LOCK: VfsLock = VfsLock::new();
 
 /// Атомарный spin-lock для VFS. Семантика та же, что у спинлока, плюс
-/// `force_unlock()` для принудительного снятия у убитой задачи.
+/// `force_unlock()` для принудительного снятия у задачи, которая лок уже не
+/// отпустит (убита или приостановлена).
+///
+/// Состояние и владелец живут в ОДНОМ атомике: 0 — свободен, иначе PID
+/// держателя. Раньше это были отдельные `locked: AtomicBool` и
+/// `VFS_LOCK_OWNER: AtomicUsize`, и «проверить, держит ли задача лок» было
+/// неатомарной парой — между чтениями владелец мог смениться, и принудительный
+/// сброс промахивался бы мимо настоящего держателя. С одним полем такая гонка
+/// невозможна по построению.
 pub struct VfsLock {
-    locked: AtomicBool,
+    owner: AtomicUsize,
 }
 
 impl VfsLock {
     pub const fn new() -> VfsLock {
         VfsLock {
-            locked: AtomicBool::new(false),
+            owner: AtomicUsize::new(0),
         }
     }
 
     fn try_lock(&self) -> Option<VfsLockGuard<'_>> {
-        if self
-            .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        let me = CURRENT.load(Ordering::SeqCst);
+        self.owner
+            .compare_exchange(0, me, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
-        {
-            Some(VfsLockGuard { lock: self })
-        } else {
-            None
-        }
+            .then(|| VfsLockGuard { lock: self, me })
     }
 
-    fn release(&self) {
-        self.locked.store(false, Ordering::Release);
+    fn release(&self, me: usize) {
+        // Снимаем лок, только если он всё ещё наш. CAS провалится, если нас
+        // уже сняли принудительно (kill/pause) и лок успел взять кто-то ещё —
+        // тогда guard не должен снимать чужой захват.
+        let _ = self.owner.compare_exchange(me, 0, Ordering::Release, Ordering::Relaxed);
     }
 
-    fn is_locked(&self) -> bool {
-        self.locked.load(Ordering::Relaxed)
+    /// PID текущего держателя (0 — лок свободен).
+    fn holder(&self) -> usize {
+        self.owner.load(Ordering::SeqCst)
     }
 
     /// Снимает лок ПРИНУДИТЕЛЬНО, игнорируя владельца. Вызов оправдан ТОЛЬКО
-    /// из kill_inner/reap_inner для задачи, которая больше никогда не
-    /// выполнится (слот освобождается, kernel-стек уничтожается) — её guard
-    /// не запустится и не сможет снять чужой захват.
+    /// для задачи, которая больше не снимет лок сама: её убили (kill/reap —
+    /// слот освобождается, стек уничтожается) или приостановили (pause —
+    /// guard лежит на стеке задачи, которая не идёт). Guard такой задачи при
+    /// возможном возобновлении окажется no-op: CAS не сойдётся, если лок к
+    /// тому моменту уже заняли другие.
     unsafe fn force_unlock(&self) {
-        self.locked.store(false, Ordering::Release);
+        self.owner.store(0, Ordering::Release);
     }
 }
 
-/// PID владельца VFS_LOCK (0 — нет/устарело). Пишется при КАЖДОМ успешном
-/// try_lock (атомарно с ним, под без-прерываний). При drop guard'а НЕ
-/// обнуляется намеренно: stale-значение безвредно, потому что kill() смотрит
-/// строго на пару «лок занят И владелец == pid», а вот дыра между unlock и
-/// записью владельца позволила бы kill() промахнуться мимо владельца и не
-/// снять лок (deadlock).
-static VFS_LOCK_OWNER: AtomicUsize = AtomicUsize::new(0);
-
-/// RAII-guard VFS_LOCKa: снимает лок при drop. Владельца не трогает
-/// (см. VFS_LOCK_OWNER). Живёт на стеке задачи, между задачами не передаётся.
+/// RAII-guard VFS_LOCK: снимает лок при drop, если лок всё ещё принадлежит
+/// той же задаче. Живёт на стеке задачи, между задачами не передаётся.
 pub struct VfsLockGuard<'a> {
     lock: &'a VfsLock,
+    /// PID, под которым лок был взят: по нему же идёт CAS при drop.
+    me: usize,
 }
 
 impl Drop for VfsLockGuard<'_> {
     fn drop(&mut self) {
-        self.lock.release();
+        self.lock.release(self.me);
     }
 }
 
@@ -257,6 +263,7 @@ pub fn init() {
             cr3: 0,
             space: None,
             wake_tick: 0,
+            suspended: false,
             stack,
         });
         CURRENT.store(0, Ordering::SeqCst);
@@ -272,6 +279,15 @@ pub fn set_vfs(vfs: &mut Vfs) {
 
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::SeqCst)
+}
+
+/// Сырой указатель на общий Vfs БЕЗ захвата лока — для долгоживущих
+/// владельцев. Так работает и основной шелл (`main` передаёт `&mut vfs` на
+/// всю сессию); тем же способом дополнительные шеллы рабочих столов держат
+/// свой `&mut Vfs`. Одновременно активен только один стол, поэтому
+/// пересечений по этой ссылке не возникает.
+pub fn vfs_ptr() -> *mut Vfs {
+    VFS_PTR.load(Ordering::SeqCst) as *mut Vfs
 }
 
 /// PID текущей (выполняющейся) задачи. Для диагностики (print в задачах).
@@ -303,16 +319,11 @@ pub fn ready_count() -> usize {
 /// ротируется, держатель завершает критическую секцию, лок освобождается.
 fn vfs_lock_yield() -> VfsLockGuard<'static> {
     loop {
-        // Захват + запись владельца — атомарно относительно kill(): между
-        // CAS и store(VFS_LOCK_OWNER) не должно быть точки вытеснения, иначе
-        // kill() не опознал бы владельца и не снял бы лок (CRITICAL-3).
-        if let Some(g) = x86_64::instructions::interrupts::without_interrupts(|| {
-            let g = VFS_LOCK.try_lock();
-            if g.is_some() {
-                VFS_LOCK_OWNER.store(CURRENT.load(Ordering::SeqCst), Ordering::SeqCst);
-            }
-            g
-        }) {
+        // Захват атомарен относительно kill()/pause(): владелец пишется тем же
+        // CAS, поэтому проверка «лок занят И владелец == pid» не может
+        // разъехаться (CRITICAL-3).
+        if let Some(g) = x86_64::instructions::interrupts::without_interrupts(|| VFS_LOCK.try_lock())
+        {
             return g;
         }
         // hlt до следующего тика: планировщик ротируется, держатель лока
@@ -330,13 +341,7 @@ pub fn vfs_lock() -> VfsLockGuard<'static> {
 /// (зависла/убита), шелл обязан остаться отзывчивым, чтобы её можно было
 /// `kill`'нуть (CRITICAL-3).
 pub fn try_vfs_lock() -> Option<VfsLockGuard<'static>> {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        let g = VFS_LOCK.try_lock();
-        if g.is_some() {
-            VFS_LOCK_OWNER.store(CURRENT.load(Ordering::SeqCst), Ordering::SeqCst);
-        }
-        g
-    })
+    x86_64::instructions::interrupts::without_interrupts(|| VFS_LOCK.try_lock())
 }
 
 /// Выполняет `f` с доступом к VFS (внутри глобального лока).
@@ -352,15 +357,26 @@ pub fn with_vfs<R>(f: impl FnOnce(&mut Vfs) -> R) -> R {
 /// Внимание: аллокации выполняются при включённых прерываниях (иначе дедлок
 /// с аллокатором, если фоновая задача была вытеснена посреди аллокации).
 pub fn spawn(name: &str, entry: Box<dyn FnOnce()>) -> Option<usize> {
+    spawn_flagged(name, entry, false)
+}
+
+/// Как `spawn`, но задача сразу приостановлена: в ротацию не попадает, пока
+/// не вызовут `resume`. Нужно рабочим столам — их шеллы стартуют незаметно,
+/// иначе первый же из них напечатал бы пригла поверх активного экрана.
+pub fn spawn_suspended(name: &str, entry: Box<dyn FnOnce()>) -> Option<usize> {
+    spawn_flagged(name, entry, true)
+}
+
+fn spawn_flagged(name: &str, entry: Box<dyn FnOnce()>, suspended: bool) -> Option<usize> {
     // Создание задачи атомарно против тиков: гонки спавна с вытеснением
     // приводили к порче контекстов (см. bigtodo, zero-writer).
     SCHED_FROZEN.fetch_add(1, Ordering::SeqCst);
-    let r = spawn_inner(name, entry);
+    let r = spawn_inner(name, entry, suspended);
     SCHED_FROZEN.fetch_sub(1, Ordering::SeqCst);
     r
 }
 
-fn spawn_inner(name: &str, entry: Box<dyn FnOnce()>) -> Option<usize> {
+fn spawn_inner(name: &str, entry: Box<dyn FnOnce()>, suspended: bool) -> Option<usize> {
     let idx = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         (1..MAX_TASKS).find(|&i| TASKS[i].is_none())
     })?;
@@ -404,6 +420,7 @@ fn spawn_inner(name: &str, entry: Box<dyn FnOnce()>) -> Option<usize> {
         cr3: 0,
         space: None,
         wake_tick: 0,
+        suspended,
         stack,
     };
 
@@ -497,6 +514,7 @@ fn spawn_user_inner(
         cr3: root,
         space: Some(space),
         wake_tick: 0,
+        suspended: false,
         stack,
     };
 
@@ -548,9 +566,8 @@ fn kill_inner(pid: usize) -> bool {
         // Исключение — сама текущая задача: её guard ещё жив, сбрасывать лок
         // нельзя (впрочем, kill текущей задачи невозможен — defensive).
         let cur = CURRENT.load(Ordering::SeqCst);
-        if pid != cur && VFS_LOCK.is_locked() && VFS_LOCK_OWNER.load(Ordering::SeqCst) == pid {
+        if pid != cur && VFS_LOCK.holder() == pid {
             VFS_LOCK.force_unlock();
-            VFS_LOCK_OWNER.store(0, Ordering::SeqCst);
             crate::vga::serial_write_atomic("[kill] VFS_LOCK held by target; forced release\n");
         }
         TASKS[pid].take()
@@ -581,9 +598,8 @@ fn reap_inner(pid: usize) {
         // но если между exit и reap случилось что-то нештатное — лок должен
         // быть снят, чтобы не повесить шелл.
         let cur = CURRENT.load(Ordering::SeqCst);
-        if pid != cur && VFS_LOCK.is_locked() && VFS_LOCK_OWNER.load(Ordering::SeqCst) == pid {
+        if pid != cur && VFS_LOCK.holder() == pid {
             VFS_LOCK.force_unlock();
-            VFS_LOCK_OWNER.store(0, Ordering::SeqCst);
             crate::vga::serial_write_atomic("[reap] VFS_LOCK held by reaped task; forced release\n");
         }
         TASKS[pid].take()
@@ -595,21 +611,22 @@ fn reap_inner(pid: usize) {
     }
 }
 
-/// Блокирует шелл (задачу 0) до завершения задачи `pid` (user-программы,
-/// запущенной в foreground). Шелл остаётся Blocked, таймер переключает CPU на
-/// user-задачу; когда та завершается (`exit`/фолт), `exit_current` будит шелл.
-pub fn wait_for(pid: usize) {
-    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
-        if CURRENT.load(Ordering::SeqCst) == 0 {
-            if let Some(t) = TASKS[0].as_mut() {
-                if t.state == TaskState::Running {
-                    t.state = TaskState::Blocked;
-                }
-                // wake_tick остаётся 0: шелл будит только exit_current.
-            }
-            WAITING_ON.store(pid, Ordering::SeqCst);
-        }
-    });
+/// Блокирует шелл до завершения foreground-задачи `pid`, отдавая CPU программе.
+///
+/// Каждый проход зовёт `poll(pid)`: вернул true — задача убивается, ожидание
+/// заканчивается. Возвращает true, если ожидание прервано, false — если
+/// программа завершилась сама.
+///
+/// Ждать приходится не «до упора», а по тику: шелл, ушедший в Blocked до конца
+/// программы, планировщиком больше не запускается, и `poll` (а с ним Ctrl+C) не
+/// выполнился бы никогда. 100 пробуждений в секунду — ровно столько же, сколько
+/// обычных preempt-переключений.
+///
+/// Прерываемость нужна шеллу: пока программа работает, шеллу некуда деться,
+/// а нажать Ctrl+C может быть нужно именно сейчас — snake/web/vita сами
+/// Ctrl+C не понимают.
+pub fn wait_for_polled(pid: usize, poll: fn(usize) -> bool) -> bool {
+    let mut interrupted = false;
     loop {
         let done = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
             match TASKS.get(pid).and_then(|t| t.as_ref()) {
@@ -620,11 +637,70 @@ pub fn wait_for(pid: usize) {
         if done {
             break;
         }
-        x86_64::instructions::hlt();
+        if poll(pid) {
+            kill(pid);
+            interrupted = true;
+            break;
+        }
+        // Ждём следующего тика, но остаёмся в ротации: задача, ушедшая в
+        // Blocked до конца программы, планировщиком больше не запускается —
+        // и poll (а с ним Ctrl+C) не выполнился бы никогда. Поэтому
+        // засыпаем ровно на тик и просыпаемся: это 100 раз в секунду, ровно
+        // столько же, сколько обычных preempt-переключений.
+        let target = TICKS.load(Ordering::SeqCst) + 1;
+        block_until_tick(target);
+        while TICKS.load(Ordering::SeqCst) < target {
+            x86_64::instructions::hlt();
+        }
     }
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        WAITING_ON.store(0, Ordering::SeqCst);
-    });
+    interrupted
+}
+
+/// Приостанавливает задачу: она исключается из ротации до `resume`.
+/// Состояние (Running/Ready/Blocked) не трогаем — задача просто перестаёт
+/// получать кванты CPU, но остаётся на своём месте стека и в своём адресном
+/// пространстве.
+///
+/// Если задача держит VFS_LOCK, лок снимается принудительно: guard лежит на
+/// стеке задачи, которая не пойдёт, и все остальные задачи (включая шеллы
+/// других рабочих столов) зависли бы в `vfs_lock_yield` навсегда. При
+/// `resume` guard вернённой задачи окажется no-op: CAS не сойдётся, если лок
+/// к тому моменту уже заняли другие (см. `VfsLock::release`).
+pub fn pause(pid: usize) -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        match TASKS.get_mut(pid).and_then(|t| t.as_mut()) {
+            Some(t) => {
+                t.suspended = true;
+                if VFS_LOCK.holder() == pid {
+                    VFS_LOCK.force_unlock();
+                    crate::vga::serial_write_atomic("[pause] VFS_LOCK held by target; forced release\n");
+                }
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// Возобновляет приостановленную задачу. Задача, замороженная в Running
+/// (её состояние не успело превратиться в Ready, потому что вытеснения не
+/// было), возвращается в ротацию. Спящая с wake_tick == 0 — тоже: шелл
+/// рабочего стола после `pause` лежит именно в таком состоянии.
+pub fn resume(pid: usize) -> bool {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        match TASKS.get_mut(pid).and_then(|t| t.as_mut()) {
+            Some(t) => {
+                t.suspended = false;
+                if (t.state == TaskState::Running || t.state == TaskState::Blocked)
+                    && t.wake_tick == 0
+                {
+                    t.state = TaskState::Ready;
+                }
+                true
+            }
+            None => false,
+        }
+    })
 }
 
 /// Помечает текущую задачу Blocked до тика `target`; планировщик переведёт её
@@ -665,13 +741,6 @@ pub fn exit_current() {
         if let Some(t) = TASKS[cur].as_mut() {
             if t.state != TaskState::Finished {
                 t.state = TaskState::Finished;
-            }
-        }
-        if WAITING_ON.load(Ordering::SeqCst) == cur {
-            if let Some(shell) = TASKS[0].as_mut() {
-                if shell.state == TaskState::Blocked {
-                    shell.state = TaskState::Ready;
-                }
             }
         }
     });
@@ -715,6 +784,8 @@ pub struct ProcInfo {
     pub pid: usize,
     pub name: [u8; 32],
     pub state: &'static str,
+    /// Приостановлена ли задача (`pause`) — у неактивных рабочих столов.
+    pub suspended: bool,
     pub ticks: u64,
 }
 
@@ -734,6 +805,7 @@ pub fn list(out: &mut Vec<ProcInfo>) {
                     pid: i,
                     name,
                     state: state_str(t.state),
+                    suspended: t.suspended,
                     ticks: t.ticks,
                 });
             }
@@ -816,7 +888,9 @@ extern "C" fn schedule() -> usize {
         for i in 1..=MAX_TASKS {
             let idx = (cur + i) % MAX_TASKS;
             if let Some(t) = TASKS[idx].as_ref() {
-                if t.state == TaskState::Ready {
+                // Приостановленные задачи (неактивные рабочие столы) из
+                // ротации выпадают.
+                if t.state == TaskState::Ready && !t.suspended {
                     next = idx;
                     break;
                 }
