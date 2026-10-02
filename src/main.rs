@@ -30,6 +30,7 @@ mod splash;
 mod syscall;
 mod sysinfo;
 mod tasks;
+mod top;
 mod vfs;
 mod vga;
 mod vitafs;

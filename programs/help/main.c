@@ -14,7 +14,7 @@ static void clear_screen(void);
 static const char COMMANDS[][8] = {
     "help", "pwd", "ls", "cd", "mkdir", "rmdir", "touch", "rm",
     "cat", "cp", "mv", "find", "echo", "run", "bg", "ps",
-    "kill", "init", "clear", "version",
+    "top", "kill", "init", "clear", "version",
 };
 
 static const char DESCS[][40] = {
@@ -24,8 +24,8 @@ static const char DESCS[][40] = {
     "Copy file or directory", "Move or rename file/directory",
     "Search filesystem for a file by name", "Echo text / redirect to file",
     "Run a program from VFS", "Run a background task", "List running tasks",
-    "Terminate a background task", "Manage init services", "Clear screen",
-    "Show OS version",
+    "Live task monitor, q to quit", "Terminate a background task",
+    "Manage init services", "Clear screen", "Show OS version",
 };
 
 #define NUM_COMMANDS ((int)(sizeof(COMMANDS) / sizeof(COMMANDS[0])))

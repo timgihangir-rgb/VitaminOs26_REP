@@ -15,6 +15,7 @@
 // without_interrupts: держатель лока кучи невытечем (см. bigtodo).
 
 use core::alloc::{GlobalAlloc, Layout};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use linked_list_allocator::LockedHeap;
 use x86_64::instructions::interrupts;
 
@@ -34,6 +35,28 @@ const TAIL_SIZE: usize = 8;
 
 static INNER: LockedHeap = LockedHeap::empty();
 
+// ─── Живая статистика кучи (для `top`) ────────────────────────────────────
+// Считаем только полезные размеры блоков, без заголовков и канареек: это
+// аналог «used» и не зависит от служебных накладных расходов.
+static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+static HEAP_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+/// Сколько байт данных сейчас выделено в куче.
+pub fn allocated_bytes() -> usize {
+    ALLOCATED.load(Ordering::Relaxed)
+}
+
+/// Пиковое значение `allocated_bytes` за всё время работы.
+pub fn peak_bytes() -> usize {
+    PEAK.load(Ordering::Relaxed)
+}
+
+/// Размер кучи, переданный в `Allocator::init`.
+pub fn heap_bytes() -> usize {
+    HEAP_SIZE.load(Ordering::Relaxed)
+}
+
 fn fail(msg: &str, ptr: usize, size: usize) -> ! {
     crate::vga::serial_write_atomic("\n[ralloc] ");
     crate::vga::serial_write_atomic(msg);
@@ -51,6 +74,7 @@ pub struct Allocator;
 
 impl Allocator {
     pub unsafe fn init(start: *mut u8, size: usize) {
+        HEAP_SIZE.store(size, Ordering::Relaxed);
         INNER.lock().init(start, size);
     }
 }
@@ -76,6 +100,8 @@ unsafe impl GlobalAlloc for Allocator {
             (*hdr).base = raw;
             let tail = (data + layout.size()) as *mut u64;
             *tail = TAIL_MAGIC;
+            let now = ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+            PEAK.fetch_max(now, Ordering::Relaxed);
             data as *mut u8
         })
     }
@@ -111,10 +137,14 @@ unsafe impl GlobalAlloc for Allocator {
                 crate::vga::serial_write_atomic("\n");
                 fail("OVERFLOW", ptr as usize, (*hdr).size);
             }
+            // size читаем ДО освобождения блока: после INNER.dealloc память заголовка
+            // уже не наша.
+            let freed = (*hdr).size;
             INNER.dealloc(
                 (*hdr).base,
                 Layout::from_size_align((*hdr).cap, 1).unwrap(),
             );
+            ALLOCATED.fetch_sub(freed, Ordering::Relaxed);
         })
     }
 

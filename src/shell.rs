@@ -323,6 +323,9 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
         ["ps"] => {
             ps(writer);
         }
+        ["top"] => {
+            crate::top::run(writer);
+        }
         ["init", sub @ ..] => {
             crate::init::cmd(writer, vfs, sub);
         }
