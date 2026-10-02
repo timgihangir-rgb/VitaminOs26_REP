@@ -87,9 +87,6 @@ struct Task {
     /// 0 — не просыпаться по таймеру (shell в wait_for будится только через
     /// WAITING_ON/exit_current). Устанавливается `block_until_tick`/`sleep_until`.
     wake_tick: u64,
-    /// Аппаратная позиция CRTC-курсора, сохранённая при вытеснении задачи.
-    /// `cursor::NO_POSITION` — задача ещё не сохраняла (не восстанавливать).
-    cursor_pos: u16,
     #[allow(dead_code)]
     stack: Box<[u8]>,
 }
@@ -260,7 +257,6 @@ pub fn init() {
             cr3: 0,
             space: None,
             wake_tick: 0,
-            cursor_pos: crate::cursor::NO_POSITION,
             stack,
         });
         CURRENT.store(0, Ordering::SeqCst);
@@ -396,7 +392,6 @@ fn spawn_inner(name: &str, entry: Box<dyn FnOnce()>) -> Option<usize> {
         cr3: 0,
         space: None,
         wake_tick: 0,
-        cursor_pos: crate::cursor::NO_POSITION,
         stack,
     };
 
@@ -490,7 +485,6 @@ fn spawn_user_inner(
         cr3: root,
         space: Some(space),
         wake_tick: 0,
-        cursor_pos: crate::cursor::NO_POSITION,
         stack,
     };
 
@@ -817,22 +811,15 @@ extern "C" fn schedule() -> usize {
             }
         }
 
-        // Сохраняем аппаратный курсор уходящей задачи, восстанавливаем —
-        // у входящей (в switch_to_task). Курсором владеют только задачи,
-        // работающие с дисплеем: шелл (pid 0) и user-задачи (cr3 != 0).
-        // Ядрёные демоны (ticker/init/clock-служба и т.п.) экран не трогают —
-        // для них save/restore только перезаписал бы CRTC устаревшим значением.
-        if next != cur {
-            let cur_owns_display = cur == 0
-                || TASKS[cur]
-                    .as_ref()
-                    .map_or(false, |t| t.cr3 != 0);
-            if cur_owns_display {
-                if let Some(t) = TASKS[cur].as_mut() {
-                    t.cursor_pos = crate::cursor::get_position();
-                }
-            }
-        }
+        // Аппаратный курсор планировщик НЕ трогает. Раньше он сохранялся при
+        // вытеснении задачи и восстанавливался при входе, но видеопамять и
+        // CRTC-курсор у всех задач общие, а значение «своё» у задачи не
+        // появляется само: как только сохранённое значение однажды устарело,
+        // петля «restore устаревшего → save устаревшего» замыкается навсегда.
+        // На практике курсор застревал в произвольной пустой клетке экрана и
+        // «пропадал» из промпта. Позицию курсора и так восстанавливает
+        // владелец экрана: шелл ставит её в Writer при каждом выводе, а
+        // exec.rs — после завершения программы (exit_row/exit_col).
 
         CURRENT.store(next, Ordering::SeqCst);
         let t = TASKS[next].as_mut().unwrap();
@@ -895,10 +882,7 @@ fn switch_to_task(t: &Task, pid: usize) {
         }
         crate::interrupts::set_tss_rsp0(t.kernel_stack_top as u64);
     }
-    // Restore только для владельцев дисплея (см. save в schedule).
-    if (pid == 0 || t.cr3 != 0) && t.cursor_pos != crate::cursor::NO_POSITION {
-        crate::cursor::set_raw(t.cursor_pos);
-    }
+    let _ = pid;
 }
 
 /// Точка входа фоновой задачи: вызывается с rdi = указатель на TaskClosure.
