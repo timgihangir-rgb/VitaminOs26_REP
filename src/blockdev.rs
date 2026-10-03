@@ -54,6 +54,10 @@ pub struct DeviceInfo {
     pub id: DeviceId,
     pub sectors: u64,
     pub blocks: u32,
+    /// Модель из IDENTIFY (слова 27-46). Пустая, если диск не ответил.
+    pub model: alloc::string::String,
+    /// Серийный номер из IDENTIFY (слова 10-19).
+    pub serial: alloc::string::String,
 }
 
 impl DeviceInfo {
@@ -63,6 +67,18 @@ impl DeviceInfo {
             DeviceId::Ahci(p) => alloc::format!("ahci{}", p),
             DeviceId::AtaPio(d) => alloc::format!("ata{}", d),
         }
+    }
+
+    /// Модель и серийный номер одной строкой; если диск не ответил на
+    /// IDENTIFY — пустая строка.
+    pub fn describe(&self) -> alloc::string::String {
+        if self.model.is_empty() && self.serial.is_empty() {
+            return alloc::string::String::new();
+        }
+        if self.serial.is_empty() {
+            return self.model.clone();
+        }
+        alloc::format!("{} ({})", self.model, self.serial)
     }
 }
 
@@ -117,12 +133,34 @@ unsafe fn outw(port: u16, value: u16) {
     p.write(value);
 }
 
+/// Аппаратный сброс интерфейса ATA (SRST в регистре устройства).
+///
+/// После ошибки (ERR/DF) или таймаута команда контроллер IDE может остаться
+/// «залипшей»: следующая команда не даст DRQ и система встанет намертво, пока
+/// не поможет сброс интерфейса. Вызывается из путей, где уже известно, что
+/// что-то пошло не так.
+unsafe fn reset_port() {
+    for _ in 0..5 {
+        let _ = inb(ATA_CONTROL);
+    }
+    outb(ATA_CONTROL, 0x04); // SRST = 1
+    for _ in 0..5 {
+        let _ = inb(ATA_CONTROL);
+    }
+    outb(ATA_CONTROL, 0x00); // SRST = 0
+    for _ in 0..5 {
+        let _ = inb(ATA_CONTROL);
+    }
+    let _ = wait_status(0x80, false);
+}
+
 /// Ждёт, пока в регистре статуса появится/исчезнет бит `mask`.
 /// Возвращает false при ошибке диска (ERR/DF) или по таймауту.
 unsafe fn wait_status(mask: u8, set: bool) -> bool {
     for _ in 0..50_000_000 {
         let st = inb(ATA_STATUS);
         if st & 0x01 != 0 || st & 0x20 != 0 {
+            reset_port();
             return false;
         }
         if st == 0 {
@@ -134,6 +172,7 @@ unsafe fn wait_status(mask: u8, set: bool) -> bool {
         }
         core::hint::spin_loop();
     }
+    reset_port();
     false
 }
 
@@ -280,10 +319,13 @@ pub fn scan() -> alloc::vec::Vec<DeviceInfo> {
         match BACKEND {
             Backend::Ahci => {
                 for (port, sectors) in crate::ahci::disks() {
+                    let _ = crate::ahci::select(port);
                     out.push(DeviceInfo {
                         id: DeviceId::Ahci(port),
                         sectors,
                         blocks: (sectors / SECTORS_PER_BLOCK as u64) as u32,
+                        model: crate::ahci::model(),
+                        serial: crate::ahci::serial(),
                     });
                 }
             }
@@ -300,11 +342,13 @@ pub fn scan() -> alloc::vec::Vec<DeviceInfo> {
                     if !present {
                         continue;
                     }
-                    if let Some(sectors) = ata_identify_sectors(drive) {
+                    if let Some((sectors, model, serial)) = ata_identify(drive) {
                         out.push(DeviceInfo {
                             id: DeviceId::AtaPio(drive),
                             sectors: sectors as u64,
                             blocks: sectors / SECTORS_PER_BLOCK,
+                            model,
+                            serial,
                         });
                     }
                 }
@@ -352,9 +396,9 @@ pub fn present() -> bool {
     }
 }
 
-/// ATA IDENTIFY DEVICE: число секторов LBA28 (words 60-61).
-/// None при отсутствии ответа или ошибке шины.
-fn ata_identify_sectors(drive: u8) -> Option<u32> {
+/// ATA IDENTIFY DEVICE: число секторов LBA28 (words 60-61), модель и
+/// серийный номер. None при отсутствии ответа или ошибке шины.
+fn ata_identify(drive: u8) -> Option<(u32, alloc::string::String, alloc::string::String)> {
     unsafe {
         outb(ATA_DRIVE, 0xA0 | ((drive & 1) << 4)); // CHS-режим, выбор drive
         outb(ATA_SECCOUNT, 0);
@@ -369,8 +413,35 @@ fn ata_identify_sectors(drive: u8) -> Option<u32> {
         for w in data.iter_mut() {
             *w = inw(ATA_BASE);
         }
-        Some((data[60] as u32) | ((data[61] as u32) << 16))
+        let word = |i: usize| data[i];
+        let sectors = (word(60) as u32) | ((word(61) as u32) << 16);
+        Some((
+            sectors,
+            ata_str(&word, 27, 20),
+            ata_str(&word, 10, 10),
+        ))
     }
+}
+
+/// Строка из полуслов IDENTIFY: `words` слов с `first`. ATA переставляет в
+/// этих полях байты, а хвост забит пробелами.
+fn ata_str(word: &dyn Fn(usize) -> u16, first: usize, words: usize) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    for i in 0..words * 2 {
+        let w = word(first + i / 2);
+        let b = if i % 2 == 0 { w >> 8 } else { w & 0xFF } as u8;
+        // Непечатные байты выбрасываем: мусор в модели читать хуже, чем ничего.
+        if b < 0x20 || b >= 0x7F {
+            continue;
+        }
+        out.push(b as char);
+    }
+    alloc::string::ToString::to_string(out.trim())
+}
+
+/// Число секторов выбранного ATA-диска (только ёмкость, без строк).
+fn ata_identify_sectors(drive: u8) -> Option<u32> {
+    ata_identify(drive).map(|(s, _, _)| s)
 }
 
 /// Число 4-КиБ блоков на устройстве (ёмкость). Кэшируется после первого

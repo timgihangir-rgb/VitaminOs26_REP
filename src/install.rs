@@ -278,11 +278,12 @@ pub fn run(writer: &mut Writer, vfs: &mut Vfs) -> bool {
         .into_iter()
         .filter(|d| d.id != active)
         .map(|d| {
-            let name = alloc::format!(
-                "{} ({} МиБ)",
-                d.name(),
-                d.sectors / 2048
-            );
+            let desc = d.describe();
+            let name = if desc.is_empty() {
+                alloc::format!("{} ({} МиБ)", d.name(), d.sectors / 2048)
+            } else {
+                alloc::format!("{} ({} МиБ, {})", d.name(), d.sectors / 2048, desc)
+            };
             (d.id, name)
         })
         .collect();

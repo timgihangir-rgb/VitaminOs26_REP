@@ -438,13 +438,19 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
             let active = crate::blockdev::active();
             for d in &list {
                 let mark = if d.id == active { "*" } else { " " };
+                let desc = d.describe();
                 writer.write_string(
                     alloc::format!(
-                        "{} {}: {} MiB ({} sectors)\n",
+                        "{} {}: {} MiB ({} sectors){}\n",
                         mark,
                         d.name(),
                         d.sectors / 2048,
-                        d.sectors
+                        d.sectors,
+                        if desc.is_empty() {
+                            alloc::string::String::new()
+                        } else {
+                            alloc::format!(" — {}", desc)
+                        }
                     )
                     .as_str(),
                 );

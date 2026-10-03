@@ -131,6 +131,19 @@ static mut PORT: usize = 0;
 /// Ёмкость каждого реализованного порта (в секторах 512 Б). None - порт пуст.
 const MAX_PORTS: usize = 32;
 static mut PORT_CAP: [Option<u64>; MAX_PORTS] = [None; MAX_PORTS];
+/// Модель и серийный номер диска за портом — из IDENTIFY при init().
+/// Держим сырыми байтами: String в статике требует inline-const, которого
+/// ещё нет в используемом тулчейне.
+const STR_LEN: usize = 48;
+static mut PORT_MODEL: [[u8; STR_LEN]; MAX_PORTS] = [[0; STR_LEN]; MAX_PORTS];
+static mut PORT_SERIAL: [[u8; STR_LEN]; MAX_PORTS] = [[0; STR_LEN]; MAX_PORTS];
+
+/// Что удалось узнать о диске из IDENTIFY.
+struct IdentifyInfo {
+    sectors: u64,
+    model: [u8; STR_LEN],
+    serial: [u8; STR_LEN],
+}
 /// Индекс выбранного порта; usize::MAX - ни один не выбран.
 static mut SELECTED: usize = usize::MAX;
 /// Сериализация команд на случай вызова без запрета прерываний.
@@ -451,11 +464,13 @@ pub fn init() -> bool {
                 diag(&alloc::format!("port {} did not start", index));
                 continue;
             }
-            match identify_sectors() {
-                Some(sectors) => {
-                    PORT_CAP[index] = Some(sectors);
+            match identify() {
+                Some(id) => {
+                    PORT_CAP[index] = Some(id.sectors);
+                    PORT_MODEL[index] = id.model;
+                    PORT_SERIAL[index] = id.serial;
                     found = true;
-                    diag(&alloc::format!("port {} disk, {} sectors", index, sectors));
+                    diag(&alloc::format!("port {} disk, {} sectors", index, id.sectors));
                 }
                 None => {
                     diag(&alloc::format!("port {} no disk (identify failed)", index));
@@ -479,6 +494,36 @@ pub fn init() -> bool {
 /// IDENTIFY DEVICE: 256 слов. Ёмкость - LBA48 (слова 100-103), если диск его
 /// держит, иначе LBA28 (слова 60-61).
 unsafe fn identify_sectors() -> Option<u64> {
+    identify().map(|id| id.sectors)
+}
+
+/// Строковые поля IDENTIFY: модель (слова 27-46) и серийный номер (10-19).
+/// В словах символы идут вперемешку старшим байтом, поэтому каждый байт
+/// берётся «через один».
+pub fn model() -> alloc::string::String {
+    unsafe { str_of(&PORT_MODEL[SELECTED]) }
+}
+
+pub fn serial() -> alloc::string::String {
+    unsafe { str_of(&PORT_SERIAL[SELECTED]) }
+}
+
+/// Санитайзер: непечатные байты выбрасываем, пробелы по краям поджимаем.
+unsafe fn str_of(b: &[u8; STR_LEN]) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    for &c in b.iter() {
+        if c == 0 {
+            break;
+        }
+        if c < 0x20 || c >= 0x7F {
+            continue;
+        }
+        out.push(c as char);
+    }
+    alloc::string::ToString::to_string(out.trim())
+}
+
+unsafe fn identify() -> Option<IdentifyInfo> {
     if run_cmd(ATA_IDENTIFY, 0, 0, 1, true).is_err() {
         return None;
     }
@@ -497,7 +542,32 @@ unsafe fn identify_sectors() -> Option<u64> {
     if sectors == 0 {
         return None;
     }
-    Some(sectors)
+    Some(IdentifyInfo {
+        sectors,
+        model: ata_string(&word, 27, 20),
+        serial: ata_string(&word, 10, 10),
+    })
+}
+
+/// Строка из полуслов IDENTIFY: `words` слов, начиная с `first`.
+/// ATA переставляет байты в этих полях, а хвост забит пробелами.
+pub fn ata_string(word: &dyn Fn(usize) -> u16, first: usize, words: usize) -> [u8; STR_LEN] {
+    let mut out = [0u8; STR_LEN];
+    let mut n = 0usize;
+    for i in 0..words * 2 {
+        if n >= STR_LEN {
+            break;
+        }
+        let w = word(first + i / 2);
+        let b = if i % 2 == 0 { w >> 8 } else { w & 0xFF } as u8;
+        // Непечатные байты не выводим: мусор в модели читать хуже, чем ничего.
+        if b < 0x20 || b >= 0x7F {
+            continue;
+        }
+        out[n] = b;
+        n += 1;
+    }
+    out
 }
 
 /// Есть ли диск за выбранным портом AHCI.
