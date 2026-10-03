@@ -38,6 +38,70 @@ fn identity_flags() -> PageTableFlags {
     PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::HUGE_PAGE
 }
 
+// Тень текстового экрана VGA: два 4 КиБ кадра, отображаемые на VA 0xB8000.
+// Экран 80x30x2 = 4800 байт, то есть страницы 0xB8000 и 0xB9000. Нужна потому,
+// что в графическом (VBE) режиме физический 0xB8000 — видеопамять, которая
+// текст не хранит: всё, что пишется в 0xB8000, должно попадать в RAM, а
+// композитор fb рисует из неё в линейный фреймбуфер.
+static mut VGA_SHADOW: Option<(u64, u64)> = None;
+
+pub fn vga_shadow() -> Option<(u64, u64)> {
+    unsafe { VGA_SHADOW }
+}
+
+/// Разбивает huge-страницу ядра 0..2 МиБ на 4 КиБ записи и подменяет текстовый
+/// экран 0xB8000/0xB9000 на свежие RAM-кадры. Возвращает их физические адреса.
+/// Вызывать один раз, до создания адресных пространств задач.
+pub unsafe fn install_vga_shadow() -> Option<(u64, u64)> {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(s) = VGA_SHADOW {
+            return Some(s);
+        }
+        let alloc = &mut FRAME_ALLOC;
+        let f0 = alloc.allocate_frame()?;
+        let f1 = alloc.allocate_frame()?;
+        zero_frame(f0);
+        zero_frame(f1);
+
+        let root = active_level_4_table();
+        let pdp0 = root[0].frame().ok()?;
+        let pd0 = table_of(pdp0)[0].frame().ok()?;
+        let pd0_t = table_of(pd0);
+        if pd0_t[0].flags().contains(PageTableFlags::HUGE_PAGE) {
+            let pt_frame = alloc.allocate_frame()?;
+            let pt = table_of(pt_frame);
+            pt.zero();
+            for i in 0..512usize {
+                let a = i as u64 * 0x1000;
+                pt[i].set_addr(
+                    PhysAddr::new(a),
+                    PageTableFlags::PRESENT | PageTableFlags::WRITABLE,
+                );
+            }
+            pd0_t[0].set_frame(pt_frame, table_flags());
+        }
+        let pt_frame = pd0_t[0].frame().ok()?;
+        let pt = table_of(pt_frame);
+        let s0 = f0.start_address().as_u64();
+        let s1 = f1.start_address().as_u64();
+        pt[0xB8].set_addr(PhysAddr::new(s0), shadow_leaf_flags());
+        pt[0xB9].set_addr(PhysAddr::new(s1), shadow_leaf_flags());
+        VGA_SHADOW = Some((s0, s1));
+        x86_64::instructions::tlb::flush(VirtAddr::new(0xB8000));
+        x86_64::instructions::tlb::flush(VirtAddr::new(0xB9000));
+        Some((s0, s1))
+    })
+}
+
+fn shadow_leaf_flags() -> PageTableFlags {
+    PageTableFlags::PRESENT | PageTableFlags::WRITABLE
+}
+
+unsafe fn zero_frame(frame: PhysFrame) {
+    let p = VirtAddr::new(PHYS_MEM_OFFSET + frame.start_address().as_u64()).as_mut_ptr::<u8>();
+    core::ptr::write_bytes(p, 0, 4096);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpaceError {
     OutOfRange,
@@ -108,7 +172,35 @@ pub fn create_address_space() -> Option<AddressSpace> {
         // (.text/.data/.bss, boot-стек): она видна по low-alias, но запись
         // из ring 3 запрещена. Иначе любая сбойная user-программа (crashy!)
         // затирает ядро нулями и указателями - случайная порча статики.
-        pd0[0].set_addr(PhysAddr::new(0x0), identity_flags() | PageTableFlags::USER_ACCESSIBLE);
+        // Низ 0..2 МиБ: если активна тень экрана, это обычная 4 КиБ таблица
+        // (identity, но 0xB8000/0xB9000 смотрят в RAM-тень), иначе — одна
+        // huge-страница. 4 КиБ вариант нужен, чтобы ring3-программы,
+        // жёстко зашитые на 0xB8000, писали в ту же тень, что и ядро.
+        if let Some((s0, s1)) = vga_shadow() {
+            let pt_frame = alloc.allocate_frame()?;
+            let pt = table_of(pt_frame);
+            pt.zero();
+            for i in 0..512usize {
+                let a = i as u64 * 0x1000;
+                pt[i].set_addr(
+                    PhysAddr::new(a),
+                    PageTableFlags::PRESENT
+                        | PageTableFlags::WRITABLE
+                        | PageTableFlags::USER_ACCESSIBLE,
+                );
+            }
+            pt[0xB8].set_addr(
+                PhysAddr::new(s0),
+                shadow_leaf_flags() | PageTableFlags::USER_ACCESSIBLE,
+            );
+            pt[0xB9].set_addr(
+                PhysAddr::new(s1),
+                shadow_leaf_flags() | PageTableFlags::USER_ACCESSIBLE,
+            );
+            pd0[0].set_frame(pt_frame, table_flags() | PageTableFlags::USER_ACCESSIBLE);
+        } else {
+            pd0[0].set_addr(PhysAddr::new(0x0), identity_flags() | PageTableFlags::USER_ACCESSIBLE);
+        }
         pd0[1].set_addr(PhysAddr::new(0x200000), identity_flags());
         pdp0[0].set_frame(pd0_frame, table_flags());
         root[0].set_frame(pdp0_frame, table_flags());
@@ -143,6 +235,15 @@ pub fn destroy_address_space(space: &mut AddressSpace) {
                     }
                     if e.flags().contains(PageTableFlags::HUGE_PAGE) {
                         continue; // shared identity mapping, not owned
+                    }
+                    if i == 0 && vga_shadow().is_some() {
+                        // Низ 0..2 МиБ с тенью экрана: записи — identity и два
+                        // общих кадра тени, они не принадлежат пространству.
+                        // Освобождаем только саму таблицу страниц.
+                        if let Ok(pt) = e.frame() {
+                            alloc.deallocate_frame(pt);
+                        }
+                        continue;
                     }
                     if let Some(pt) = e.frame().ok() {
                         let pt_t = table_of(pt);
@@ -194,6 +295,18 @@ pub fn copy_address_space(src: &AddressSpace) -> Option<AddressSpace> {
             if s_pd_e.flags().contains(PageTableFlags::HUGE_PAGE) {
                 // Shared identity mapping, reference it unchanged.
                 dst_pd_t[pd_idx].set_addr(s_pd_e.addr(), s_pd_e.flags());
+                continue;
+            }
+            if pd_idx == 0 && vga_shadow().is_some() {
+                // Тень экрана общая: копируем записи по ссылке в таблицу,
+                // которую уже выделил create_address_space.
+                let src_pt = s_pd_e.frame().ok()?;
+                let dst_pt = dst_pd_t[0].frame().ok()?;
+                let st = table_of(src_pt);
+                let dt = table_of(dst_pt);
+                for j in 0..512 {
+                    dt[j] = st[j].clone();
+                }
                 continue;
             }
             let src_pt = s_pd_e.frame().ok()?;
