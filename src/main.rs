@@ -157,6 +157,15 @@ fn stage0_diag() {
     // Запускать вручную при разработке ФС.
     msg.push_str(" | blockdev=");
     msg.push_str(blockdev::backend_name());
+    msg.push_str(" disks:");
+    for d in blockdev::scan() {
+        msg.push_str(&alloc::format!(
+            " {}={}blk{}",
+            d.name(),
+            d.blocks,
+            if d.id == blockdev::active() { "*" } else { "" }
+        ));
+    }
     msg.push_str(" cap=");
     match blockdev::capacity_blocks() {
         Some(b) => msg.push_str(&alloc::format!("{} blk", b)),

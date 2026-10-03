@@ -126,9 +126,13 @@ static mut DMA: DmaBuf = DmaBuf([0; DMA_SIZE]);
 
 // ─── Состояние драйвера ─────────
 static mut MMIO: usize = 0;
+/// Базовый адрес блока регистров ВЫБРАННОГО порта.
 static mut PORT: usize = 0;
-static mut CAPACITY: Option<u64> = None;
-static mut READY: bool = false;
+/// Ёмкость каждого реализованного порта (в секторах 512 Б). None - порт пуст.
+const MAX_PORTS: usize = 32;
+static mut PORT_CAP: [Option<u64>; MAX_PORTS] = [None; MAX_PORTS];
+/// Индекс выбранного порта; usize::MAX - ни один не выбран.
+static mut SELECTED: usize = usize::MAX;
 /// Сериализация команд на случай вызова без запрета прерываний.
 static BUSY: AtomicBool = AtomicBool::new(false);
 
@@ -378,7 +382,9 @@ unsafe fn port_recover() {
         prt_set(P_SERR, err);
     }
     if !port_start(index) {
-        READY = false;
+        if index < MAX_PORTS {
+            PORT_CAP[index] = None;
+        }
     }
 }
 
@@ -434,7 +440,10 @@ pub fn init() -> bool {
             max_ports,
             impl_mask
         ));
-        for index in 0..max_ports.min(32) {
+        // Сканируем ВСЕ реализованные порты, а не только первый с диском:
+        // установщику нужен список устройств, чтобы дать выбрать цель.
+        let mut found = false;
+        for index in 0..max_ports.min(MAX_PORTS) {
             if impl_mask & (1 << index) == 0 {
                 continue;
             }
@@ -444,16 +453,26 @@ pub fn init() -> bool {
             }
             match identify_sectors() {
                 Some(sectors) => {
-                    CAPACITY = Some(sectors);
-                    READY = true;
+                    PORT_CAP[index] = Some(sectors);
+                    found = true;
                     diag(&alloc::format!("port {} disk, {} sectors", index, sectors));
-                    return true;
                 }
-                None => diag(&alloc::format!("port {} no disk (identify failed)", index)),
+                None => {
+                    diag(&alloc::format!("port {} no disk (identify failed)", index));
+                    let _ = port_stop();
+                }
             }
-            let _ = port_stop();
         }
-        false
+        if found {
+            // Устройство по умолчанию - первый порт с диском.
+            for index in 0..MAX_PORTS {
+                if PORT_CAP[index].is_some() {
+                    select(index);
+                    break;
+                }
+            }
+        }
+        found
     }
 }
 
@@ -481,14 +500,55 @@ unsafe fn identify_sectors() -> Option<u64> {
     Some(sectors)
 }
 
-/// Есть ли диск за AHCI-контроллером.
+/// Есть ли диск за выбранным портом AHCI.
 pub fn present() -> bool {
-    unsafe { READY }
+    unsafe { SELECTED < MAX_PORTS && PORT_CAP[SELECTED].is_some() }
 }
 
-/// Ёмкость диска в секторах по 512 байт.
+/// Ёмкость выбранного диска в секторах по 512 байт.
 pub fn capacity_sectors() -> Option<u64> {
-    unsafe { CAPACITY }
+    unsafe {
+        if SELECTED < MAX_PORTS {
+            PORT_CAP[SELECTED]
+        } else {
+            None
+        }
+    }
+}
+
+/// Выбирает порт как активное устройство. Все порты уже подняты при init(),
+/// поэтому повторный port_start не нужен: достаточно переставить PORT.
+/// false - порт не реализован или за ним нет диска.
+pub fn select(index: usize) -> bool {
+    unsafe {
+        if index >= MAX_PORTS || MMIO == 0 || PORT_CAP[index].is_none() {
+            return false;
+        }
+        if SELECTED != index {
+            PORT = MMIO + PORT_BASE + index * PORT_STRIDE;
+            // Гасим возможные остатки ошибок PHY и IRQ прошлого порта.
+            let serr = prt(P_SERR);
+            if serr != 0 {
+                prt_set(P_SERR, serr);
+            }
+            prt_set(P_IS, 0xFFFF_FFFF);
+        }
+        SELECTED = index;
+        true
+    }
+}
+
+/// Порты с дисками: (индекс, ёмкость в секторах). Порядок - по индексу.
+pub fn disks() -> alloc::vec::Vec<(usize, u64)> {
+    let mut out = alloc::vec::Vec::new();
+    unsafe {
+        for index in 0..MAX_PORTS {
+            if let Some(sectors) = PORT_CAP[index] {
+                out.push((index, sectors));
+            }
+        }
+    }
+    out
 }
 
 /// Читает `count` секторов начиная с `lba` в buf. Длинные запросы режутся

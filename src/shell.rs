@@ -430,6 +430,26 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
             drop(_vfs_guard);
             crate::power::reboot(writer);
         }
+        ["disks"] => {
+            let list = crate::blockdev::scan();
+            if list.is_empty() {
+                writer.write_string("no block devices\n");
+            }
+            let active = crate::blockdev::active();
+            for d in &list {
+                let mark = if d.id == active { "*" } else { " " };
+                writer.write_string(
+                    alloc::format!(
+                        "{} {}: {} MiB ({} sectors)\n",
+                        mark,
+                        d.name(),
+                        d.sectors / 2048,
+                        d.sectors
+                    )
+                    .as_str(),
+                );
+            }
+        }
         _ => {
             // Неизвестная команда: пробуем .bin-программу в foreground.
             // VFS_LOCK освобождаем — программа сама работает с VFS через ABI.

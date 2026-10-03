@@ -37,8 +37,34 @@ const ATA_CMD_WRITE_PIO: u8 = 0x30;
 const ATA_CMD_CACHE_FLUSH: u8 = 0xE7;
 const ATA_CMD_IDENTIFY: u8 = 0xEC;
 
-/// Ёмкость диска, считанная через IDENTIFY (в 4-КиБ блоках); None - не снята.
+/// Ёмкость активного диска, считанная через IDENTIFY (в 4-КиБ блоках);
+/// None - ещё не снята. Сбрасывается при смене устройства.
 static mut CAPACITY_BLOCKS: Option<u32> = None;
+
+/// Идентификатор блочного устройства. AHCI - номер порта контроллера,
+/// ATA PIO - 0 (primary master) или 1 (primary slave).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DeviceId {
+    Ahci(usize),
+    AtaPio(u8),
+}
+
+/// Описание устройства для установщика и команды `disks`.
+pub struct DeviceInfo {
+    pub id: DeviceId,
+    pub sectors: u64,
+    pub blocks: u32,
+}
+
+impl DeviceInfo {
+    /// Человекочитаемое имя вида "ahci0" / "ata0".
+    pub fn name(&self) -> alloc::string::String {
+        match self.id {
+            DeviceId::Ahci(p) => alloc::format!("ahci{}", p),
+            DeviceId::AtaPio(d) => alloc::format!("ata{}", d),
+        }
+    }
+}
 
 /// Статистика блочного устройства. Счётчики монотонные, насыщаются.
 pub struct BlockStats {
@@ -119,11 +145,15 @@ unsafe fn wait_drq() -> bool {
     wait_status(0x08, true)
 }
 
-/// Проба наличия диска: выбираем primary master и читаем статус.
-/// 0xFF на шине означает "устройства нет".
-fn probe() -> bool {
+/// Проба наличия диска: выбираем drive (0 - master, 1 - slave) и читаем
+/// статус. 0xFF на шине означает "устройства нет".
+fn probe_drive(drive: u8) -> bool {
     unsafe {
-        outb(ATA_DRIVE, 0xA0);
+        outb(ATA_DRIVE, 0xA0 | ((drive & 1) << 4));
+        // 400 нс на переключение мультиплексора: 4 чтения alternate status.
+        for _ in 0..4 {
+            let _ = inb(ATA_CONTROL);
+        }
         let status = inb(ATA_STATUS);
         status != 0xFF
     }
@@ -137,8 +167,13 @@ pub enum Backend {
     AtaPio,
 }
 
-static mut DISK_PRESENT: Option<bool> = None;
+/// Наличие диска на ATA primary: [master, slave]. None - ещё не проверяли.
+static mut DISK_PRESENT: [Option<bool>; 2] = [None, None];
 static mut BACKEND: Backend = Backend::AtaPio;
+/// Выбранный ATA drive (0/1) для PIO-пути.
+static mut PIO_DRIVE: u8 = 0;
+/// Активное устройство, к которому обращены read/write_block.
+static mut ACTIVE: DeviceId = DeviceId::AtaPio(0);
 
 /// Смещение ФС в блоках от начала диска. Установленная система держит
 /// VITAFS в разделе 1 (LBA 32768), а не с нулевого блока; весь слой
@@ -168,12 +203,115 @@ pub fn init() -> Backend {
     };
     unsafe {
         BACKEND = backend;
-        if backend == Backend::AtaPio {
-            // Диск на портах 0x1F0 проверяем сразу: у AHCI такой пробы нет.
-            DISK_PRESENT = Some(probe());
+        match backend {
+            Backend::Ahci => {
+                // ahci::init() уже выбрал первый порт с диском; запоминаем его.
+                if let Some((port, _)) = crate::ahci::disks().into_iter().next() {
+                    ACTIVE = DeviceId::Ahci(port);
+                }
+            }
+            Backend::AtaPio => {
+                // Оба диска primary проверяем сразу: у AHCI такой пробы нет.
+                let master = probe_drive(0);
+                DISK_PRESENT[0] = Some(master);
+                let slave = probe_drive(1);
+                DISK_PRESENT[1] = Some(slave);
+                ACTIVE = if master {
+                    DeviceId::AtaPio(0)
+                } else {
+                    DeviceId::AtaPio(1)
+                };
+                PIO_DRIVE = match ACTIVE {
+                    DeviceId::AtaPio(d) => d,
+                    _ => 0,
+                };
+            }
         }
     }
     backend
+}
+
+/// Активное устройство.
+pub fn active() -> DeviceId {
+    unsafe { ACTIVE }
+}
+
+/// Имя устройства по идентификатору ("ahci0" / "ata0").
+pub fn device_name(id: DeviceId) -> alloc::string::String {
+    match id {
+        DeviceId::Ahci(port) => alloc::format!("ahci{}", port),
+        DeviceId::AtaPio(drive) => alloc::format!("ata{}", drive),
+    }
+}
+
+/// Имя активного устройства.
+pub fn active_name() -> alloc::string::String {
+    device_name(active())
+}
+
+/// Переключает активное устройство. false - такого диска нет. Сбрасывает
+/// кэш ёмкости и смещение ФС: вызывающий обязан сам сбросить bcache/inode-кэш.
+pub fn select(id: DeviceId) -> bool {
+    unsafe {
+        match id {
+            DeviceId::Ahci(port) => {
+                if BACKEND != Backend::Ahci || !crate::ahci::select(port) {
+                    return false;
+                }
+            }
+            DeviceId::AtaPio(drive) => {
+                if BACKEND != Backend::AtaPio || !probe_drive(drive) {
+                    return false;
+                }
+                PIO_DRIVE = drive & 1;
+            }
+        }
+        ACTIVE = id;
+        CAPACITY_BLOCKS = None;
+        BLOCK_OFFSET = 0;
+        true
+    }
+}
+
+/// Перечисляет диски текущего бэкенда для установщика.
+pub fn scan() -> alloc::vec::Vec<DeviceInfo> {
+    let mut out = alloc::vec::Vec::new();
+    unsafe {
+        match BACKEND {
+            Backend::Ahci => {
+                for (port, sectors) in crate::ahci::disks() {
+                    out.push(DeviceInfo {
+                        id: DeviceId::Ahci(port),
+                        sectors,
+                        blocks: (sectors / SECTORS_PER_BLOCK as u64) as u32,
+                    });
+                }
+            }
+            Backend::AtaPio => {
+                for drive in 0..2u8 {
+                    let present = match DISK_PRESENT[drive as usize] {
+                        Some(p) => p,
+                        None => {
+                            let p = probe_drive(drive);
+                            DISK_PRESENT[drive as usize] = Some(p);
+                            p
+                        }
+                    };
+                    if !present {
+                        continue;
+                    }
+                    if let Some(sectors) = ata_identify_sectors(drive) {
+                        out.push(DeviceInfo {
+                            id: DeviceId::AtaPio(drive),
+                            sectors: sectors as u64,
+                            blocks: sectors / SECTORS_PER_BLOCK,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Активный бэкенд.
@@ -191,24 +329,34 @@ pub fn backend_name() -> &'static str {
 
 pub fn present() -> bool {
     unsafe {
-        match BACKEND {
-            Backend::Ahci => return crate::ahci::present(),
-            Backend::AtaPio => {}
+        match ACTIVE {
+            DeviceId::Ahci(_) => {
+                if BACKEND == Backend::Ahci {
+                    crate::ahci::present()
+                } else {
+                    false
+                }
+            }
+            DeviceId::AtaPio(drive) => {
+                let i = (drive & 1) as usize;
+                match DISK_PRESENT[i] {
+                    Some(p) => p,
+                    None => {
+                        let p = probe_drive(drive);
+                        DISK_PRESENT[i] = Some(p);
+                        p
+                    }
+                }
+            }
         }
-        if let Some(p) = DISK_PRESENT {
-            return p;
-        }
-        let p = probe();
-        DISK_PRESENT = Some(p);
-        p
     }
 }
 
 /// ATA IDENTIFY DEVICE: число секторов LBA28 (words 60-61).
 /// None при отсутствии ответа или ошибке шины.
-fn ata_identify_sectors() -> Option<u32> {
+fn ata_identify_sectors(drive: u8) -> Option<u32> {
     unsafe {
-        outb(ATA_DRIVE, 0xA0); // primary master, CHS-режим
+        outb(ATA_DRIVE, 0xA0 | ((drive & 1) << 4)); // CHS-режим, выбор drive
         outb(ATA_SECCOUNT, 0);
         outb(ATA_LBA_LOW, 0);
         outb(ATA_LBA_MID, 0);
@@ -232,9 +380,9 @@ pub fn capacity_blocks() -> Option<u32> {
         if let Some(c) = CAPACITY_BLOCKS {
             return Some(c);
         }
-        let blocks = match BACKEND {
-            Backend::Ahci => crate::ahci::capacity_sectors()? / SECTORS_PER_BLOCK as u64,
-            Backend::AtaPio => (ata_identify_sectors()? / SECTORS_PER_BLOCK) as u64,
+        let blocks = match ACTIVE {
+            DeviceId::Ahci(_) => crate::ahci::capacity_sectors()? / SECTORS_PER_BLOCK as u64,
+            DeviceId::AtaPio(drive) => (ata_identify_sectors(drive)? / SECTORS_PER_BLOCK) as u64,
         };
         // Наружу отдаём u32: столько 4-КиБ блоков всё равно не адресуемо
         // указателями в текущих потребителях.
@@ -295,7 +443,7 @@ unsafe fn write_sectors_raw(lba: u32, count: u8, buf: &[u8]) -> Result<(), ()> {
         return Err(());
     }
     // Сброс внутреннего кэша диска, чтобы данные реально легли на носитель.
-    outb(ATA_DRIVE, 0xE0);
+    outb(ATA_DRIVE, 0xE0 | ((PIO_DRIVE & 1) << 4));
     outb(ATA_CMD, ATA_CMD_CACHE_FLUSH);
     if !wait_idle() {
         return Err(());
@@ -304,7 +452,11 @@ unsafe fn write_sectors_raw(lba: u32, count: u8, buf: &[u8]) -> Result<(), ()> {
 }
 
 unsafe fn select_drive(lba: u32) {
-    outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F) as u8);
+    // LBA-режим: бит 4 выбирает master (0) / slave (1).
+    outb(
+        ATA_DRIVE,
+        0xE0 | ((PIO_DRIVE & 1) << 4) | ((lba >> 24) & 0x0F) as u8,
+    );
 }
 
 /// Верхняя граница сектора для выбранного бэкенда. У AHCI адресация LBA48,
