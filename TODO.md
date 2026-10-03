@@ -10,13 +10,15 @@
 - [ ] Мелочи: модель/серийник в `disks`, сброс порта при ошибке.
 
 ## 2. Ввод: USB-клавиатура
-- [ ] PCI: найти UHCI (class 0x0C/03/00) и EHCI (0x0C/03/20).
-- [ ] UHCI: сброс, frame list, включение портов.
-- [ ] Перечисление: control transfers (device/config descriptors).
-- [ ] HID boot protocol: SET_PROTOCOL(0) + interrupt-IN опрос.
-- [ ] Отдавать события в `keyboard.rs` (единый поток с PS/2).
-- [ ] Оставить рабочим BIOS USB legacy (8042) как fallback.
-- [ ] Позже: OHCI/EHCI (USB 2.0).
+- [x] PCI: найти UHCI (класс 0x0C/03/00) и EHCI (0x0C/03/20).
+- [x] UHCI: сброс, frame list, включение портов.
+- [x] Перечисление: control transfers (device/config descriptors).
+- [x] HID boot protocol: SET_PROTOCOL(0) + interrupt-IN опрос.
+- [x] Отдавать события в `keyboard.rs` (единый поток с PS/2).
+- [x] Оставить рабочим BIOS USB legacy (8042) как fallback.
+- [x] Две разметки link pointer (спецификация UHCI и модель QEMU), выбор по
+  результату первого обмена — иначе не работает ни то, ни другое.
+- [ ] Позже: OHCI/EHCI (USB 2.0), SET_IDLE для отчётов по таймеру.
 
 ## 3. Дисплей: разрешение под монитор
 - [x] Разбор multiboot2-тега 8 (framebuffer) в ядре.
