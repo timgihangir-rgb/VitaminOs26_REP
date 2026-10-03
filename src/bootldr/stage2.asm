@@ -6,13 +6,23 @@
 ;
 ; Что делает:
 ;   1. включает A20 (stage1 уже включал - подтверждаем);
-;   2. снимает карту памяти через INT 15h AX=E820;
-;   3. переходит в защищённый режим;
-;   4. собирает multiboot2-инфо (тег 6 - карта, тег 4 - базовая информация,
-;      end-тег);
-;   5. разбирает ELF64 и кладёт каждый PT_LOAD по p_paddr, обнуляя .bss
+;   2. подбирает видеорежим через VBE (INT 10h 4F00/4F01/4F02), чтобы
+;      разрешение экрана соответствовало монитору, а не 80x30;
+;   3. снимает карту памяти через INT 15h AX=E820;
+;   4. переходит в защищённый режим;
+;   5. собирает multiboot2-инфо (тег 6 - карта, тег 4 - базовая информация,
+;      тег 8 - линейный фреймбуфер, end-тег);
+;   6. разбирает ELF64 и кладёт каждый PT_LOAD по p_paddr, обнуляя .bss
 ;      (p_memsz > p_filesz);
-;   6. прыгает во _start ядра с EAX = magic, EBX = указатель на инфо.
+;   7. прыгает во _start ядра с EAX = magic, EBX = указатель на инфо.
+;
+; Ограничение: перечисление режимов идёт через INT 10h, то есть через то, что
+; отдаёт BIOS. На машине с Award/AMI/Phoenix это полный список VBE-режимов и
+; выбор даёт нативное разрешение. У SeaBIOS (в QEMU) собственная реализация
+; VBE отдаёт один негодный режим, и stage2 остаётся в текстовом режиме -
+; там сработает тот же путь, что у GRUB, только разбирать ROM придётся
+; собственным кодом загрузчика. На live/installer ISO с этим всё в порядке:
+; их загружает GRUB.
 ;
 ; Чтение диска идёт через INT 13h, а он существует только в реальном
 ; режиме. Поэтому disk_to_phys, работая из pmode, зовёт bios_read - тот
@@ -41,10 +51,12 @@ stage2_start:
 
     call init_cursor
     call enable_a20
+    call ser_init
 
     mov si, msg_start
     call print_str
 
+    call setup_vbe
     call collect_e820
 
     ; --- переход в защищённый 32-битный режим ---
@@ -89,6 +101,254 @@ empty_8042:
     in al, 0x64
     test al, 0x02
     jnz empty_8042
+    ret
+
+; ---------------------------------------------------------------------------
+; Реальный режим: COM1
+;
+; Экранный вывод после включения графического режима не видно (текст в
+; 0xB8000 никто не показывает), а именно в этот момент нужно рассказать, что
+; произошло с видеорежимом. Поэтому загрузчик дублирует важные сообщения в
+; последовательный порт - там же их видно в headless-прогонах.
+; ---------------------------------------------------------------------------
+ser_init:
+    mov dx, 0x3F9
+    xor al, al
+    out dx, al                           ; прерывания UART выключены
+    mov dx, 0x3FB
+    mov al, 0x80
+    out dx, al                           ; доступ к регистрам делителя
+    mov dx, 0x3F8
+    mov al, 0x01
+    out dx, al                           ; делитель 1 -> 115200 бод
+    mov dx, 0x3F9
+    xor al, al
+    out dx, al
+    mov dx, 0x3FB
+    mov al, 0x03
+    out dx, al                           ; 8 бит, без чётности, стоп-бит 1
+    mov dx, 0x3FA
+    mov al, 0xC7
+    out dx, al                           ; включить и очистить FIFO
+    mov dx, 0x3FC
+    mov al, 0x0B
+    out dx, al                           ; DTR | RTS | OUT2
+    ret
+
+ser_putc:
+    push ax
+    push dx
+    mov dx, 0x3FD
+.wait:
+    in al, dx
+    test al, 0x20                       ; бит THRE: передатчик свободен
+    jnz .send
+    jmp .wait
+.send:
+    pop dx
+    pop ax
+    mov dx, 0x3F8
+    out dx, al
+    ret
+
+; AL = байт, две шестнадцатеричные цифры + пробел.
+ser_hex:
+    push ax
+    push bx
+    mov bl, al
+    shr al, 4
+    call .digit
+    mov al, bl
+    and al, 0x0F
+    call .digit
+    mov al, ' '
+    call ser_putc
+    pop bx
+    pop ax
+    ret
+.digit:
+    add al, '0'
+    cmp al, '9'
+    jbe .emit
+    add al, 7
+.emit:
+    jmp ser_putc
+
+; SI = строка с нулем на конце.
+ser_str:
+    push ax
+    push si
+.next:
+    lodsb
+    test al, al
+    jz .done
+    call ser_putc
+    jmp .next
+.done:
+    pop si
+    pop ax
+    ret
+
+
+; ---------------------------------------------------------------------------
+; Реальный режим: подбор видеорежима через VBE
+;
+; Свой загрузчик, в отличие от GRUB, не умеет спрашивать монитор по EDID, поэтому
+; режим выбирается из списка, который даёт BIOS: максимальное разрешение, а при
+; равенстве - больше бит на пиксель (текстовая сетка будет отрисована поверх как
+; есть). Ядро получает адрес кадра в multiboot2-теге 8 и само центрирует и
+; масштабирует сетку 80x30.
+;
+; Если VBE нет, ни один режим не подошёл или включение не удалось - остаётся
+; текстовый режим, тег 8 не пишется, и ядро работает как раньше (см. fb::probe).
+;
+; Поля VbeModeInfo берём по раскладке VBE 2.0 (таблица Mode Information
+; Structure): PhysBasePtr = +0x20, BytesPerScanLine = +0x02, XResolution = +0x04,
+; YResolution = +0x06, BitsPerPixel = +0x14, маски цветов +0x16..+0x1B.
+; ---------------------------------------------------------------------------
+setup_vbe:
+    mov word [VBE_OK], 0
+    mov word [VBE_BEST_MODE], 0xFFFF
+    ; BIOS мог не заполнить структуру (режим не найден, VBE нет) - тогда мы
+    ; читали бы прошлый мусор и выбрали бы несуществующий режим.
+    call vbe_clear
+
+    ; --- AX=4F00: сведения о контроллере ---
+    mov ax, 0x4F00
+    mov di, VBE_INFO
+    int 0x10
+    ; Результат сразу в память: ser_str использует lodsb и портит AX.
+    mov [VBE_RET], ax
+    mov si, msg_vbe
+    call ser_str
+    mov ax, [VBE_RET]
+    call ser_hex                         ; VBE отвечает AX=004Fh, печатаем AL
+    cmp ax, 0x004F
+    jne .no
+    cmp word [VBE_INFO + 0], 0x4556      ; 'VE' - младшие байты "VESA"
+    jne .no
+    cmp word [VBE_INFO + 2], 0x4153      ; 'SA' - старшие байты
+    jne .no
+
+    movzx eax, word [VBE_INFO + 10]       ; NumberOfModes
+    test ax, ax
+    jz .no
+    mov [VBE_MODE_CNT], ax
+    mov word [VBE_IDX], 0
+    mov si, msg_modes
+    call ser_str
+    mov al, al
+    call ser_hex                         ; сколько режимов перечислил BIOS
+
+.loop:
+    mov cx, [VBE_IDX]                     ; номер режима
+    mov ax, 0x4F01                        ; VBE сведения о режиме
+    mov di, VBE_MODES
+    int 0x10
+    mov [VBE_RET], ax
+    cmp ax, 0x004F                        ; BIOS не знает такой режим
+    jne .skip
+
+    ; ModeAttributes: бит 4 - графический, бит 7 - есть линейный кадр,
+    ; бит 16 - цветной. Без линейного кадра кадровый буфер нам не отдать.
+    ; Бит 16 в 16-битном непосредственном операнде не помещается, поэтому
+    ; читаем поле целиком в 32-битный регистр.
+    mov eax, [VBE_MODES + 0]
+    test eax, 0x00010090
+    jz .skip
+
+    mov al, [VBE_MODES + 0x14]            ; BitsPerPixel
+    cmp al, 16
+    jb .skip                              ; 8 бит - текст поверх рисовать нечем
+    movzx ebx, al
+
+    ; Площадь: XResolution * YResolution. Сравниваем только младшие 32 бита,
+    ; для мониторов это всегда достаточно.
+    movzx eax, word [VBE_MODES + 0x04]
+    movzx ecx, eax
+    movzx eax, word [VBE_MODES + 0x06]
+    imul ecx, eax
+
+    cmp ecx, [VBE_BEST_PIX]
+    jb .skip
+    je .tie
+    jmp .take
+.tie:
+    ; Одинаковое разрешение: предпочитаем более «толстый» пиксель.
+    cmp bl, [VBE_BEST_BPP]
+    jbe .skip
+.take:
+    mov [VBE_BEST_PIX], ecx
+    mov [VBE_BEST_BPP], bl
+    mov ax, [VBE_IDX]
+    mov [VBE_BEST_MODE], ax
+
+.skip:
+    inc word [VBE_IDX]
+    mov ax, [VBE_MODE_CNT]
+    cmp word [VBE_IDX], ax
+    jne .loop
+
+    cmp word [VBE_BEST_MODE], 0xFFFF
+    je .no
+    mov si, msg_best
+    call ser_str
+    mov ax, [VBE_BEST_MODE]
+    call ser_hex
+
+    ; --- AX=4F02: включить режим с линейным кадром ---
+    ; VBE просит передать структуру, полученную от 4F01 для этого же номера
+    ; режима, поэтому перечитываем её (режим мог смениться, буфер затёрт).
+    mov cx, [VBE_BEST_MODE]
+    mov ax, 0x4F01
+    mov di, VBE_MODES
+    int 0x10
+    cmp ax, 0x004F
+    jne .no
+
+    mov ax, 0x4F02
+    mov bx, [VBE_BEST_MODE]
+    or bx, 0x4000                         ; бит 14: использовать линейный кадр
+    mov di, VBE_MODES
+    int 0x10
+    mov [VBE_RET], ax
+    mov si, msg_set
+    call ser_str
+    mov ax, [VBE_RET]
+    call ser_hex
+    cmp ax, 0x004F
+    jne .no
+
+    ; Физический адрес кадра обязан быть ненулевым и кратен 4 КиБ: иначе
+    ; структура с адресом врёт, и лучше остаться в текстовом режиме.
+    mov eax, [VBE_MODES + 0x20]
+    mov si, msg_phys
+    call ser_str
+    mov eax, [VBE_MODES + 0x20]
+    mov al, al
+    call ser_hex
+    test eax, eax
+    jz .no
+    test eax, 0xFFF
+    jnz .no
+
+    mov word [VBE_OK], 1
+.no:
+    ret
+
+; Обнуляет оба буфера VBE (512 + 256 байт).
+vbe_clear:
+    push ax
+    push cx
+    push di
+    cld
+    xor ax, ax
+    mov cx, (VBE_INFO + 512 + VBE_MODES - VBE_INFO) / 2
+    mov di, VBE_INFO
+    rep stosw
+    pop di
+    pop cx
+    pop ax
     ret
 
 ; ---------------------------------------------------------------------------
@@ -211,6 +471,8 @@ build_mb_info:
     mov [edi + 12], eax
     add edi, 16
 
+    call build_fb_tag
+
     ; ---- end-тег ----
     mov dword [edi + 0], 0
     mov dword [edi + 4], 8
@@ -218,6 +480,52 @@ build_mb_info:
 
     sub edi, MB_INFO
     mov [MB_INFO + 0], edi
+    ret
+
+; ---------------------------------------------------------------------------
+; Тег 8: линейный фреймбуфер.
+;
+; Пишется, только если setup_vbe включила графический режим: без него ядро
+; останется в текстовом 80x30 (см. fb::probe, вызывается из boot.asm до
+; инициализации кучи).
+;
+; Раскладка - ровно та, которую разбирает src/fb.rs (проверено на теге от
+; GRUB): адрес +8, pitch +16, ширина +20, высота +24, глубина +28, тип +29,
+; маски цветов +32..+37. Размер 40 с учётом выравнивания до 8 байт.
+; ---------------------------------------------------------------------------
+build_fb_tag:
+    cmp word [VBE_OK], 0
+    je .done
+    mov dword [edi + 0], 8
+    mov dword [edi + 4], 40
+    mov eax, [VBE_MODES + 0x20]            ; PhysBasePtr
+    mov [edi + 8], eax
+    mov dword [edi + 12], 0               ; старшие 4 байта адреса: 0
+    movzx eax, word [VBE_MODES + 0x02]    ; BytesPerScanLine
+    mov [edi + 16], eax
+    movzx eax, word [VBE_MODES + 0x04]    ; XResolution
+    mov [edi + 20], eax
+    movzx eax, word [VBE_MODES + 0x06]    ; YResolution
+    mov [edi + 24], eax
+    mov al, [VBE_MODES + 0x14]            ; BitsPerPixel
+    mov [edi + 28], al
+    mov byte [edi + 29], 1                ; тип кадра: прямой цвет
+    mov word [edi + 30], 0                ; зарезервировано
+    mov al, [VBE_MODES + 0x17]            ; RedFieldPosition
+    mov [edi + 32], al
+    mov al, [VBE_MODES + 0x16]            ; RedMaskSize
+    mov [edi + 33], al
+    mov al, [VBE_MODES + 0x19]            ; GreenFieldPosition
+    mov [edi + 34], al
+    mov al, [VBE_MODES + 0x18]            ; GreenMaskSize
+    mov [edi + 35], al
+    mov al, [VBE_MODES + 0x1B]            ; BlueFieldPosition
+    mov [edi + 36], al
+    mov al, [VBE_MODES + 0x1A]            ; BlueMaskSize
+    mov [edi + 37], al
+    mov word [edi + 38], 0
+    add edi, 40
+.done:
     ret
 
 ; ---------------------------------------------------------------------------
@@ -539,6 +847,11 @@ pm_gdt_ptr:
 ; Сообщения и переменные
 ; ---------------------------------------------------------------------------
 msg_start:  db "VITOS: stage2", 13, 10, 0
+msg_vbe:    db "VBE4F00=", 0
+msg_modes:  db " modes=", 0
+msg_best:   db " best=", 0
+msg_set:    db " set=", 0
+msg_phys:   db " phys=", 0
 msg_mb:     db "VITOS: mb-info done", 13, 10, 0
 msg_elf:    db "VITOS: elf loaded", 13, 10, 0
 msg_jump:   db "VITOS: jumping to kernel", 13, 10, 0
