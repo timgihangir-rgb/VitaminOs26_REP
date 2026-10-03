@@ -24,51 +24,15 @@ static MOD_SHIFT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBoo
 static DESK_TARGET: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
 extern "x86-interrupt" fn keyboard_irq_handler(_frame: x86_64::structures::idt::InterruptStackFrame) {
-    use core::sync::atomic::Ordering;
     use x86_64::instructions::port::Port;
     let status: u8 = unsafe { Port::new(STATUS_PORT).read() };
     if status & 0x1 != 0 {
         let sc: u8 = unsafe { Port::new(DATA_PORT).read() };
-        let ctrl = MOD_CTRL.load(Ordering::Relaxed);
-        let shift = MOD_SHIFT.load(Ordering::Relaxed);
-        let make = sc & 0x80 == 0;
-        // Горячие клавиши наружу не отдаём: ни строке ввода, ни тем более
-        // foreground-программе (snake/web Ctrl+C не понимают — а цифра от
-        // Ctrl+Shift+2 иначе вставлялась бы прямо в набираемую команду).
-        let mut consumed = false;
-        if make {
-            match sc {
-                0x1D => MOD_CTRL.store(true, Ordering::Relaxed),
-                0x2A | 0x36 => MOD_SHIFT.store(true, Ordering::Relaxed),
-                // Ctrl+C. Что с ней делать, решает потребитель: прервать
-                // foreground-программу или отменить строку ввода.
-                0x2E if ctrl => {
-                    HOTKEY_PENDING.fetch_or(HOTKEY_CTRL_C, Ordering::SeqCst);
-                    consumed = true;
-                    // Сбрасываем Ctrl: если пользователь держит его дальше
-                    // (скажем, выбирает текст Ctrl+Shift+стрелка), следующая
-                    // буква не должна считаться новой Ctrl-комбинацией.
-                    MOD_CTRL.store(false, Ordering::Relaxed);
-                }
-                // Ctrl+Shift+1..4 — переключение рабочих столов.
-                0x02..=0x05 if ctrl && shift => {
-                    DESK_TARGET.store(sc - 0x02, Ordering::SeqCst);
-                    HOTKEY_PENDING.fetch_or(HOTKEY_DESK, Ordering::SeqCst);
-                    consumed = true;
-                    MOD_CTRL.store(false, Ordering::Relaxed);
-                    MOD_SHIFT.store(false, Ordering::Relaxed);
-                }
-                _ => {}
-            }
-        } else {
-            match sc {
-                0x9D => MOD_CTRL.store(false, Ordering::Relaxed),
-                0xAA | 0xB6 => MOD_SHIFT.store(false, Ordering::Relaxed),
-                _ => {}
-            }
-        }
-        if !consumed {
-            push_scancode(sc);
+        // Если клавиатура подключена по USB и обслуживается драйвером usb.rs,
+        // 8042 в BIOS с legacy-эмуляцией повторяет те же нажатия. Читаем
+        // порт, чтобы не переполнить буфер контроллера, но в поток не идём.
+        if !crate::usb::owns_keyboard() {
+            handle_scancode(sc);
         }
     }
     unsafe {
@@ -76,6 +40,59 @@ extern "x86-interrupt" fn keyboard_irq_handler(_frame: x86_64::structures::idt::
         eoi.write(0x20u8);
     }
     KBD_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Общая часть для обоих источников ввода (PS/2 по IRQ1 и USB по отчётам
+/// HID): модификаторы, горячие клавиши и отправка в кольцевой буфер.
+fn handle_scancode(sc: u8) {
+    use core::sync::atomic::Ordering;
+    let ctrl = MOD_CTRL.load(Ordering::Relaxed);
+    let shift = MOD_SHIFT.load(Ordering::Relaxed);
+    let make = sc & 0x80 == 0;
+    // Горячие клавиши наружу не отдаём: ни строке ввода, ни тем более
+    // foreground-программе (snake/web Ctrl+C не понимают — а цифра от
+    // Ctrl+Shift+2 иначе вставлялась бы прямо в набираемую команду).
+    let mut consumed = false;
+    if make {
+        match sc {
+            0x1D => MOD_CTRL.store(true, Ordering::Relaxed),
+            0x2A | 0x36 => MOD_SHIFT.store(true, Ordering::Relaxed),
+            // Ctrl+C. Что с ней делать, решает потребитель: прервать
+            // foreground-программу или отменить строку ввода.
+            0x2E if ctrl => {
+                HOTKEY_PENDING.fetch_or(HOTKEY_CTRL_C, Ordering::SeqCst);
+                consumed = true;
+                // Сбрасываем Ctrl: если пользователь держит его дальше
+                // (скажем, выбирает текст Ctrl+Shift+стрелка), следующая
+                // буква не должна считаться новой Ctrl-комбинацией.
+                MOD_CTRL.store(false, Ordering::Relaxed);
+            }
+            // Ctrl+Shift+1..4 — переключение рабочих столов.
+            0x02..=0x05 if ctrl && shift => {
+                DESK_TARGET.store(sc - 0x02, Ordering::SeqCst);
+                HOTKEY_PENDING.fetch_or(HOTKEY_DESK, Ordering::SeqCst);
+                consumed = true;
+                MOD_CTRL.store(false, Ordering::Relaxed);
+                MOD_SHIFT.store(false, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    } else {
+        match sc {
+            0x9D => MOD_CTRL.store(false, Ordering::Relaxed),
+            0xAA | 0xB6 => MOD_SHIFT.store(false, Ordering::Relaxed),
+            _ => {}
+        }
+    }
+    if !consumed {
+        push_scancode(sc);
+    }
+}
+
+/// Запись сканкода в общий поток из драйвера USB-клавиатуры (см. usb.rs).
+/// Прерывания глушим: состояние модификаторов общее с обработчиком IRQ1.
+pub fn push_scancode_usb(sc: u8) {
+    x86_64::instructions::interrupts::without_interrupts(|| handle_scancode(sc));
 }
 
 /// Забирает «съеденную» горячую клавишу: true — была нажата (и теперь

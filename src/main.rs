@@ -38,6 +38,7 @@ mod syscall;
 mod sysinfo;
 mod tasks;
 mod top;
+mod usb;
 mod vfs;
 mod vga;
 mod vitafs;
@@ -122,6 +123,9 @@ pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
     scheduler::init();
     scheduler::set_vfs(&mut vfs);
     interrupts::init();
+    // USB-клавиатура поднимается отдельной задачей: сброс порта по USB-специ
+    // требует паузы в десятки миллисекунд, а загрузку тормозить нельзя.
+    let _ = scheduler::spawn("usbkbd", alloc::boxed::Box::new(|| usb::run()));
     splash::step(&mut writer, "multitasking ready (PIT 100 Hz)");
 
     // ACPI нужен только ради `shutdown`/`reboot`, но искать FADT дешевле
@@ -240,6 +244,18 @@ fn stage0_diag() {
         " (rd={} wr={} err={})",
         st.reads, st.writes, st.errors
     );
+    // Ввод: usb=hid-kbd значит, что клавиатуру обслуживает драйвер UHCI, и
+    // 8042 в этом случае молчит (см. keyboard.rs). kbd_irq — счётчик IRQ1.
+    msg.push_str(" | usb=");
+    msg.push_str(if usb::owns_keyboard() {
+        "hid-kbd"
+    } else {
+        "none/ps2"
+    });
+    msg.push_str(" usb_reports=");
+    msg.push_str(&alloc::format!("{}", usb::reports()));
+    msg.push_str(" kbd_irq=");
+    msg.push_str(&alloc::format!("{}", keyboard::kbd_irq_count()));
     bcache::stats_line(&mut msg);
     for b in msg.bytes() {
         vga::serial_putchar(b);
