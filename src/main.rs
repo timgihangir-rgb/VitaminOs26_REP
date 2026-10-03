@@ -7,6 +7,7 @@ extern crate alloc;
 
 use core::panic::PanicInfo;
 
+mod acpi;
 mod ahci;
 mod bcache;
 mod blockdev;
@@ -23,6 +24,7 @@ mod memory;
 mod net;
 mod paging;
 mod pci;
+mod power;
 mod progabi;
 mod ralloc;
 mod rtc;
@@ -101,6 +103,14 @@ pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
     scheduler::set_vfs(&mut vfs);
     interrupts::init();
     splash::step(&mut writer, "multitasking ready (PIT 100 Hz)");
+
+    // ACPI нужен только ради `shutdown`/`reboot`, но искать FADT дешевле
+    // один раз на старте, чем по каждому вызову. На сплэше показываем, что
+    // нашлось: на настоящем железе это разница между «выключается» и
+    // «висит».
+    acpi::init();
+    splash::step(&mut writer, acpi::describe());
+
     crate::vga::serial_write_atomic("[M] pre-boot\n");
 
     // Диагностика этапа 0 (блочный слой, кэш, RTC) - в serial, экран не пачкаем.

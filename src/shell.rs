@@ -417,6 +417,19 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
                 writer.write_string("ioctl: unknown op (cursor|goto|clear|size|echo)\n");
             }
         },
+        // Выключение и перезагрузка. Синхронизируем ФС под локом (он у нас
+        // уже взят), а потом передаём управление в power: обе функции не
+        // возвращаются, и после sync_all() писать в ФС уже нельзя.
+        ["shutdown"] | ["poweroff"] => {
+            crate::vitafs::sync_all();
+            drop(_vfs_guard);
+            crate::power::shutdown(writer);
+        }
+        ["reboot"] => {
+            crate::vitafs::sync_all();
+            drop(_vfs_guard);
+            crate::power::reboot(writer);
+        }
         _ => {
             // Неизвестная команда: пробуем .bin-программу в foreground.
             // VFS_LOCK освобождаем — программа сама работает с VFS через ABI.
