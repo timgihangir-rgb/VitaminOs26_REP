@@ -450,6 +450,12 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
                 );
             }
         }
+        ["install"] => {
+            // Интерактивный установщик. Мы держим VFS_LOCK: во время установки
+            // blockdev переключается между устройствами, и параллельный доступ
+            // фоновых задач к ФС испортил бы кэш.
+            crate::install::run(writer, vfs);
+        }
         _ => {
             // Неизвестная команда: пробуем .bin-программу в foreground.
             // VFS_LOCK освобождаем — программа сама работает с VFS через ABI.

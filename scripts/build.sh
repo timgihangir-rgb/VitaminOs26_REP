@@ -5,7 +5,10 @@ PROGRAMS_DIR="programs"
 KERNEL_ELF="target/x86_64-unknown-none/debug/vitamin_os26"
 ISO_DIR="target/os.iso.dir"
 ISO="target/os.iso"
+ISO_LIVE="target/os-live.iso"
+ISO_INSTALLER="target/os-installer.iso"
 IMG="target/os.img"
+INST_IMG="target/installer.img"
 
 echo "================================="
 echo "Building VitaminOS26..."
@@ -153,32 +156,56 @@ echo ""
 echo "Kernel ELF: $KERNEL_ELF"
 
 ###############################################################################
-# 6. Build GRUB ISO
+# 6. Build GRUB ISOs (live + installer)
+#
+# Оба грузят один и тот же kernel ELF; маркер режима установщика лежит в
+# /etc/installer на installer.img (см. tools/mkfs.py --installer).
 ###############################################################################
+STRIPPED="target/vitamin_os26.stripped"
+
 echo ""
-echo "Building GRUB ISO..."
+echo "Stripping kernel for the installer image: $STRIPPED"
+strip -o "$STRIPPED" "$KERNEL_ELF"
 
-rm -rf "$ISO_DIR"
-mkdir -p "$ISO_DIR/boot/grub"
+build_iso() {
+    local iso="$1" cfg="$2"
+    rm -rf "$ISO_DIR"
+    mkdir -p "$ISO_DIR/boot/grub"
+    cp "$KERNEL_ELF" "$ISO_DIR/boot/vitamin_os26.elf"
+    cp "$cfg" "$ISO_DIR/boot/grub/grub.cfg"
+    grub-mkrescue -o "$iso" "$ISO_DIR" > /dev/null 2>&1
+    rm -rf "$ISO_DIR"
+    echo "  $iso"
+}
 
-cp "$KERNEL_ELF" "$ISO_DIR/boot/vitamin_os26.elf"
-cp grub.cfg "$ISO_DIR/boot/grub/grub.cfg"
-
-grub-mkrescue -o "$ISO" "$ISO_DIR" 2>&1
-rm -rf "$ISO_DIR"
+echo "Building GRUB ISOs..."
+build_iso "$ISO_LIVE" grub.cfg
+build_iso "$ISO_INSTALLER" grub-installer.cfg
+cp "$ISO_LIVE" "$ISO"
 
 ###############################################################################
-# 6.5. Disk image: VITAFS, пересобирается на каждой сборке (пересев /bin).
-# Пользовательские данные на os.img при пересборке теряются - это dev-flow.
+# 6.5. Disk images.
+# os.img        - рабочая (live) VITAFS 8 МиБ с /bin, ядро не хранится.
+# installer.img - установочная VITAFS 16 МиБ: /bin + /boot/vitamin_os26.elf
+#                 + маркер /etc/installer.
 ###############################################################################
 echo ""
 echo "Creating disk image: $IMG (VITAFS 8M, seeded with /bin programs)..."
 python3 tools/mkfs.py "$IMG" "$PROGRAM_LIST"
 
+echo "Creating installer image: $INST_IMG (VITAFS 16M, kernel + marker)..."
+python3 tools/mkfs.py "$INST_IMG" "$PROGRAM_LIST" \
+    --size 16777216 --kernel "$STRIPPED" --installer
+
 echo ""
 echo "================================="
 echo "Build SUCCESS!"
-echo "ISO: $ISO"
-echo "Disk: $IMG"
-echo "Run: qemu-system-x86_64 -cdrom $ISO -drive file=$IMG,format=raw,if=ide"
+echo "Live ISO:      $ISO_LIVE"
+echo "Installer ISO: $ISO_INSTALLER"
+echo "Disk (live):   $IMG"
+echo "Disk (inst):   $INST_IMG"
+echo "Run live: qemu-system-x86_64 -cdrom $ISO_LIVE -drive file=$IMG,format=raw,if=ide"
+echo "Run installer: qemu-system-x86_64 -cdrom $ISO_INSTALLER \\"
+echo "    -drive file=$INST_IMG,format=raw,if=ide \\"
+echo "    -drive file=target/blank.img,format=raw,if=ide"
 echo "================================="

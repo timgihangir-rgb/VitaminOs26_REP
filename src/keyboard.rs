@@ -172,6 +172,70 @@ pub fn kb_read() -> u8 {
     x86_64::instructions::interrupts::without_interrupts(|| pop_scancode().unwrap_or(0))
 }
 
+/// Клавиша для простых меню (установщик): стрелки/Esc/Tab/Space/Enter и
+/// печатный символ. Блокирующая: без клавиши уходит в hlt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Up,
+    Down,
+    Left,
+    Right,
+    Enter,
+    Space,
+    Tab,
+    Esc,
+    Char(u8),
+    Other,
+}
+
+/// Ждёт следующую клавишу (с учётом префикса E0). Горячие клавиши ядра
+/// (Ctrl+C, переключение столов) здесь не обрабатываются: установщик их
+/// игнорирует.
+pub fn read_key() -> Key {
+    let mut e0 = false;
+    loop {
+        let sc = match x86_64::instructions::interrupts::without_interrupts(pop_scancode) {
+            Some(s) => s,
+            None => {
+                x86_64::instructions::hlt();
+                continue;
+            }
+        };
+        if sc == 0xE0 {
+            e0 = true;
+            continue;
+        }
+        if e0 {
+            e0 = false;
+            if sc & 0x80 != 0 {
+                return Key::Other;
+            }
+            return match sc {
+                0x48 => Key::Up,
+                0x50 => Key::Down,
+                0x4B => Key::Left,
+                0x4D => Key::Right,
+                0x1C => Key::Enter, // Enter на цифровом блоке
+                _ => Key::Other,
+            };
+        }
+        if sc & 0x80 != 0 {
+            continue; // отпускание обычной клавиши пропускаем
+        }
+        match sc {
+            0x01 => return Key::Esc,
+            0x0F => return Key::Tab,
+            0x1C => return Key::Enter,
+            0x39 => return Key::Space,
+            _ => {
+                if let Some(c) = translate(sc, false) {
+                    return Key::Char(c);
+                }
+            }
+        }
+    }
+}
+
 /// Очищает буфер сканкодов (перед запуском foreground-программы, чтобы она
 /// не получила остатки от команд шелла).
 pub fn flush() {

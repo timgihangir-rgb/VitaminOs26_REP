@@ -30,6 +30,7 @@ MAGIC = b"VITAFS1\x00"
 JOURNAL_START = 1
 JOURNAL_BLOCKS = 64
 BLOCK_BITMAP_START = 65
+BLOCK_BITMAP_BLOCKS = 2
 INODE_BITMAP_START = 67
 INODE_TABLE_START = 69
 DATA_START = INODE_TABLE_START + 32  # 101
@@ -39,6 +40,7 @@ TOTAL_INODES = INODES_PER_BLOCK * 32  # 1024
 ROOT_INODE = 2
 DIRECT_BLOCKS = 12
 PTRS_PER_BLOCK = BLOCK // 4  # 1024
+KERNEL_NAME = "vitamin_os26.elf"
 
 TYPE_FILE = 1
 TYPE_DIR = 2
@@ -53,8 +55,9 @@ now = 0
 class FsBuilder:
     """Прямой формировщик образа VITAFS: иноды и блоки выдаёт по порядку."""
 
-    def __init__(self):
-        self.img = bytearray(IMG_SIZE)
+    def __init__(self, total_blocks):
+        self.total_blocks = total_blocks
+        self.img = bytearray(total_blocks * BLOCK)
         self.next_inode = ROOT_INODE + 1  # 0 и 1 зарезервированы, 2 - корень
         self.next_data = 0  # смещение от DATA_START
         # Резервные биты инодного битмапа 0..=2 - как в format_image ядра.
@@ -94,7 +97,7 @@ class FsBuilder:
     def alloc_data(self, data):
         """Кладёт блок данных, помечает в битмапе, возвращает его номер."""
         p = self.next_data
-        max_p = TOTAL_BLOCKS - DATA_START
+        max_p = self.total_blocks - DATA_START
         if p >= max_p:
             raise SystemExit("данные не помещаются на диск")
         self.next_data += 1
@@ -155,11 +158,18 @@ class FsBuilder:
         return self.alloc_inode(TYPE_DIR, size, direct=direct, ino=ino)
 
 
-def build_image(img_path, programs):
+def build_image(img_path, programs, size=IMG_SIZE, kernel=None, installer=False):
     global now
     import time
     now = int(time.time()) & 0xFFFFFFFF
-    fsb = FsBuilder()
+    total_blocks = size // BLOCK
+    if total_blocks * BLOCK != size:
+        raise SystemExit("размер образа должен быть кратен 4096")
+    max_blocks = DATA_START + BLOCK_BITMAP_BLOCKS * BLOCK * 8
+    if total_blocks > max_blocks:
+        raise SystemExit(f"образ слишком велик для фиксированных битмапов "
+                         f"(максимум {max_blocks * BLOCK} байт)")
+    fsb = FsBuilder(total_blocks)
 
     # Нумерация фиксирована: корень обязан быть инодом 2.
     n = len(programs)
@@ -167,6 +177,14 @@ def build_image(img_path, programs):
     ino_etc, ino_passwd = 4 + n, 5 + n
     ino_hostname, ino_rcconf = 6 + n, 7 + n
     ino_home, ino_tmp, ino_var, ino_log = 8 + n, 9 + n, 10 + n, 11 + n
+    nxt = 12 + n
+    ino_boot = ino_kernel = ino_marker = None
+    if kernel:
+        ino_boot, ino_kernel = nxt, nxt + 1
+        nxt += 2
+    if installer:
+        ino_marker = nxt
+        nxt += 1
 
     bin_entries = []
     for k, (name, path) in enumerate(programs):
@@ -183,13 +201,27 @@ def build_image(img_path, programs):
     fsb.write_dir([("log", ino_log)], ino=ino_var)
     fsb.write_dir([], ino=ino_log)
 
+    etc_entries = [("passwd", ino_passwd), ("hostname", ino_hostname),
+                   ("rc.conf", ino_rcconf)]
+    if installer:
+        fsb.write_file("installer", b"1\n", ino=ino_marker)
+        etc_entries.append(("installer", ino_marker))
+    root_entries = [("bin", ino_bin), ("etc", ino_etc), ("home", ino_home),
+                    ("tmp", ino_tmp), ("var", ino_var)]
+    if kernel:
+        with open(kernel, "rb") as f:
+            kdata = f.read()
+        if not kdata.startswith(b"\x7fELF"):
+            raise SystemExit(f"{kernel}: не ELF-файл")
+        fsb.write_file(KERNEL_NAME, kdata, ino=ino_kernel)
+        fsb.write_dir([(KERNEL_NAME, ino_kernel)], ino=ino_boot)
+        root_entries.append(("boot", ino_boot))
+
     fsb.write_dir(bin_entries, ino=ino_bin)
-    fsb.write_dir([("passwd", ino_passwd), ("hostname", ino_hostname),
-                   ("rc.conf", ino_rcconf)], ino=ino_etc)
+    fsb.write_dir(etc_entries, ino=ino_etc)
     fsb.write_dir([], ino=ino_home)
     fsb.write_dir([], ino=ino_tmp)
-    fsb.write_dir([("bin", ino_bin), ("etc", ino_etc), ("home", ino_home),
-                   ("tmp", ino_tmp), ("var", ino_var)], ino=ROOT_INODE)
+    fsb.write_dir(root_entries, ino=ROOT_INODE)
 
     # Суперблок - зеркально Superblock::for_image + encode.
     sb = bytearray(BLOCK)
@@ -197,7 +229,7 @@ def build_image(img_path, programs):
     fields = {
         8: 1,                    # VERSION
         12: BLOCK,               # BLOCK_SIZE
-        16: TOTAL_BLOCKS,        # TOTAL_BLOCKS
+        16: total_blocks,        # TOTAL_BLOCKS
         20: TOTAL_INODES,        # TOTAL_INODES
         24: TOTAL_INODES - sum(bin(b).count("1") for b in fsb.inode_bm),
         # FREE_INODES - по факту заселённости битмапа
@@ -215,18 +247,26 @@ def build_image(img_path, programs):
     with open(img_path, "wb") as f:
         f.write(fsb.img)
     used_blocks = DATA_START + fsb.next_data
-    print(f"Disk image: {img_path} ({TOTAL_BLOCKS} blocks, used up to block "
+    print(f"Disk image: {img_path} ({total_blocks} blocks, used up to block "
           f"{used_blocks}; {fsb.next_inode - 1} inodes; "
-          f"{len(programs)} program(s): {', '.join(n for n, _ in programs)})")
+          f"{len(programs)} program(s))")
 
 
 def main():
-    if len(sys.argv) != 3:
-        raise SystemExit(__doc__)
-    img_path, list_path = sys.argv[1], sys.argv[2]
+    import argparse
+    p = argparse.ArgumentParser(description="Собрать образ VITAFS")
+    p.add_argument("img")
+    p.add_argument("programs_list")
+    p.add_argument("--size", type=lambda s: int(s, 0), default=IMG_SIZE,
+                   help="размер образа в байтах (по умолчанию 8 МиБ)")
+    p.add_argument("--kernel", default=None,
+                   help="ELF ядра -> /boot/" + KERNEL_NAME)
+    p.add_argument("--installer", action="store_true",
+                   help="добавить маркер /etc/installer")
+    args = p.parse_args()
 
     programs = []
-    with open(list_path) as f:
+    with open(args.programs_list) as f:
         for line in f:
             line = line.rstrip("\n")
             if not line:
@@ -234,7 +274,8 @@ def main():
             name, path = line.split("\t")
             programs.append((name, path))
 
-    build_image(img_path, programs)
+    build_image(args.img, programs, size=args.size, kernel=args.kernel,
+                installer=args.installer)
 
 
 if __name__ == "__main__":

@@ -28,14 +28,10 @@ const MAX_RESTARTS: u32 = 5;
 const RESTART_WINDOW: u64 = 2000;
 const SUPERVISE_INTERVAL: u64 = 50;
 
-const DEFAULT_RC_CONF: &[u8] = b"\
-# VitaminOS26 init services\n\
-clock bin
-ticker builtin respawn
-crashy builtin respawn
-\
-ticker builtin respawn\n\
-crashy builtin respawn\n";
+// TEMP(3.2): clock/crashy исключены - латентная порча контекста при спавне
+// задач под вытеснением (см. bigtodo, блокер zero-ctx). Вернуть после фикса.
+// Держать синхронно с RC_CONF в tools/mkfs.py.
+const DEFAULT_RC_CONF: &[u8] = b"# VitaminOS26 init services\nticker builtin respawn\n";
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Kind {

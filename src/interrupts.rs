@@ -186,6 +186,9 @@ pub fn init() {
     init_idt();
     init_pic();
     init_pit();
+    // 8042 приводим в каноническое состояние ДО включения IRQ1: после GRUB
+    // контроллер может стоять в командном режиме и молча глотать нажатия.
+    crate::keyboard::controller_init();
     x86_64::instructions::interrupts::enable();
 }
 

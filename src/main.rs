@@ -18,6 +18,7 @@ mod elf;
 mod exec;
 mod fs;
 mod init;
+mod install;
 mod interrupts;
 mod keyboard;
 mod memory;
@@ -111,6 +112,15 @@ pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
     // «висит».
     acpi::init();
     splash::step(&mut writer, acpi::describe());
+
+    // Режим установщика: на установочной ФС лежит маркер /etc/installer.
+    // Тогда поднимаем не обычную систему, а интерактивный установщик.
+    if install::marker_present(&vfs) {
+        crate::vga::serial_write_atomic("[M] installer mode\n");
+        install::run(&mut writer, &mut vfs);
+        // После установки (или отмены) обычная система не нужна - перезагрузка.
+        power::reboot(&mut writer);
+    }
 
     crate::vga::serial_write_atomic("[M] pre-boot\n");
 
