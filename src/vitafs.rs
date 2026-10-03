@@ -1657,14 +1657,8 @@ pub fn format_image() -> bool {
     true
 }
 
-/// Монтирование: читает суперблок с диска и валидирует. При успехе
-/// восстанавливает журнал (recover) и запускает fsck-lite.
-pub fn try_mount() -> bool {
-    if !crate::blockdev::present() {
-        return false;
-    }
-    idrop_all();
-    crate::bcache::drop_all();
+/// Пытается смонтировать ФС с текущего смещения блоков.
+fn try_mount_at_current() -> bool {
     let mut buf = [0u8; BLOCK_SIZE];
     if crate::bcache::read(0, &mut buf).is_err() {
         return false;
@@ -1683,10 +1677,48 @@ pub fn try_mount() -> bool {
     }
 }
 
+/// Монтирование: читает суперблок с диска и валидирует. При успехе
+/// восстанавливает журнал (recover) и запускает fsck-lite.
+///
+/// Сначала пробуем блок 0 (live-образ и флешка без разметки), затем - если
+/// на диске есть MBR - базовый блок первого раздела: установленная система
+/// держит VITAFS в разделе 1, а не с начала диска.
+pub fn try_mount() -> bool {
+    if !crate::blockdev::present() {
+        return false;
+    }
+    crate::blockdev::set_block_offset(0);
+    idrop_all();
+    crate::bcache::drop_all();
+    if try_mount_at_current() {
+        return true;
+    }
+
+    if let Some(base) = crate::part::vitafs_base_blocks() {
+        if base != 0 {
+            crate::blockdev::set_block_offset(base);
+            idrop_all();
+            crate::bcache::drop_all();
+            if try_mount_at_current() {
+                return true;
+            }
+            // Не наша ФС в разделе - возвращаем нулевое смещение.
+            crate::blockdev::set_block_offset(0);
+            idrop_all();
+            crate::bcache::drop_all();
+        }
+    }
+    false
+}
+
 /// Монтирует ФС, форматируя при необходимости. Единая точка входа для загрузки.
+/// Диск с разметкой (MBR) не форматируем: затрём загрузчик и разделы.
 pub fn mount_or_format() -> bool {
     if try_mount() {
         return true;
+    }
+    if crate::part::mbr_present() {
+        return false;
     }
     format_image()
 }

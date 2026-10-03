@@ -23,6 +23,7 @@ mod keyboard;
 mod memory;
 mod net;
 mod paging;
+mod part;
 mod pci;
 mod power;
 mod progabi;

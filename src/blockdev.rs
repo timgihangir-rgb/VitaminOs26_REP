@@ -140,6 +140,24 @@ pub enum Backend {
 static mut DISK_PRESENT: Option<bool> = None;
 static mut BACKEND: Backend = Backend::AtaPio;
 
+/// Смещение ФС в блоках от начала диска. Установленная система держит
+/// VITAFS в разделе 1 (LBA 32768), а не с нулевого блока; весь слой
+/// ФС (bcache, WAL, суперблок) адресует блоки относительно начала ФС,
+/// поэтому смещение применяется здесь, в единственном месте. Секторные
+/// read/write_sectors_pub остаются абсолютными - ими пользуется
+/// таблица разделов.
+static mut BLOCK_OFFSET: u64 = 0;
+
+/// Задаёт смещение ФС в 4-КиБ блоках (0 - live-образ без MBR).
+pub fn set_block_offset(blocks: u64) {
+    unsafe { BLOCK_OFFSET = blocks };
+}
+
+/// Текущее смещение ФС в блоках.
+pub fn block_offset() -> u64 {
+    unsafe { BLOCK_OFFSET }
+}
+
 /// Ищет AHCI/SATA-контроллер и поднимает порт. Возвращает выбранный бэкенд.
 /// Вызывается один раз при загрузке до первого обращения к ФС.
 pub fn init() -> Backend {
@@ -335,12 +353,19 @@ fn dispatch_write(sector: u64, count: u8, buf: &[u8]) -> Result<(), ()> {
 
 /// Читает один 4-КиБ блок. lba - номер блока (не сектора).
 pub fn read_block(block_no: u64, buf: &mut [u8; BLOCK_SIZE]) -> Result<(), ()> {
-    if !present() || !block_ok(block_no) {
+    let abs = match block_no.checked_add(block_offset()) {
+        Some(a) => a,
+        None => {
+            bump_errors();
+            return Err(());
+        }
+    };
+    if !present() || !block_ok(abs) {
         bump_errors();
         return Err(());
     }
     let ok = dispatch_read(
-        block_no * SECTORS_PER_BLOCK as u64,
+        abs * SECTORS_PER_BLOCK as u64,
         SECTORS_PER_BLOCK as u8,
         buf,
     );
@@ -393,12 +418,19 @@ pub fn write_sectors_pub(lba: u32, count: u8, buf: &[u8]) -> Result<(), ()> {
 
 /// Пишет один 4-КиБ блок.
 pub fn write_block(block_no: u64, buf: &[u8; BLOCK_SIZE]) -> Result<(), ()> {
-    if !present() || !block_ok(block_no) {
+    let abs = match block_no.checked_add(block_offset()) {
+        Some(a) => a,
+        None => {
+            bump_errors();
+            return Err(());
+        }
+    };
+    if !present() || !block_ok(abs) {
         bump_errors();
         return Err(());
     }
     let ok = dispatch_write(
-        block_no * SECTORS_PER_BLOCK as u64,
+        abs * SECTORS_PER_BLOCK as u64,
         SECTORS_PER_BLOCK as u8,
         buf,
     );
