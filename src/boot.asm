@@ -19,7 +19,10 @@ mb_header_start:
     dd mb_header_end - mb_header_start  ; header length
     dd 0x100000000 - (0xE85250D6 + 0 + (mb_header_end - mb_header_start)) ; checksum
 
-    ; Information request tag: request memory map + basic meminfo
+    ; Information request tag: request memory map + basic meminfo.
+    ; Тег 8 (framebuffer) в запрос НЕ добавлять: GRUB 2.16 отвечает
+    ; "unsupported tag: 0x8" и отказывается грузить ядро. Режим и кадровый
+    ; буфер приходят через header-тег типа 5 ниже.
     align 8
     dw 1                                ; type: information request
     dw 0                                ; flags
@@ -28,6 +31,17 @@ info_req_start:
     dd 4                                ; request basic memory info
     dd 6                                ; request memory map
 info_req_end:
+
+    ; Framebuffer request tag (type 5): без него GRUB оставляет ядру только
+    ; EGA-текст (80x25), даже если его собственное меню в графике. С нулевыми
+    ; width/height/depth GRUB сам подбирает режим (в т.ч. по EDID монитора).
+    align 8
+    dw 5                                ; type: framebuffer
+    dw 0                                ; flags
+    dd 20                               ; size
+    dd 0                                ; preferred width  (0 = любой)
+    dd 0                                ; preferred height (0 = любой)
+    dd 0                                ; preferred depth  (0 = любой)
 
     ; End tag
     align 8
