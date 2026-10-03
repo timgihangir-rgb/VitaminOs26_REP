@@ -16,6 +16,7 @@ mod desk;
 mod devices;
 mod elf;
 mod exec;
+mod fb;
 mod fs;
 mod init;
 mod install;
@@ -53,8 +54,17 @@ static ALLOCATOR: Allocator = Allocator;
 #[no_mangle]
 pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
     let mut writer = vga::Writer::new();
-    vga::set_80x30();
+
+    // COM1 нужен раньше разбора тегов: диагностика fb идёт в serial.
     vga::clear_screen_com1();
+
+    // Если загрузчик поставил графический режим под монитор (GRUB + EDID,
+    // multiboot2-тег 8), CRTC не переводим в текст: текстовый буфер 0xB8000
+    // прочитает и отрисует модуль fb. Иначе — обычный текстовый режим 80x30.
+    let fb_raw = fb::probe(mb_info_ptr);
+    if fb_raw.is_none() {
+        vga::set_80x30();
+    }
     writer.clear_screen();
 
     let (phys_mem_offset, memory_regions) = unsafe { memory::boot_params(mb_info_ptr) };
@@ -69,6 +79,14 @@ pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
         Err(_) => {
             writer.write_string("KERNEL PANIC: heap initialization failed\n");
             halt_loop();
+        }
+    }
+
+    // Линейный фреймбуфер: отображается после инициализации аллокатора
+    // (map_phys_in_kernel берёт кадры), до создания адресных пространств задач.
+    if let Some(raw) = fb_raw {
+        if fb::init(raw) {
+            vga::serial_write_atomic("[N] framebuffer active\n");
         }
     }
 
@@ -130,6 +148,20 @@ pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
 
     init::boot(&mut writer);
     crate::vga::serial_write_atomic("[M] post-boot\n");
+
+    // Задача-композитор: раз в 2 тика дорисовывает изменившиеся строки в
+    // линейный фреймбуфер. В текстовом режиме не нужна.
+    if fb::active() {
+        let _ = scheduler::spawn(
+            "fbflush",
+            alloc::boxed::Box::new(|| loop {
+                scheduler::sleep_until(scheduler::ticks() + 2);
+                fb::tick();
+            }),
+        );
+        crate::vga::serial_write_atomic("[M] fb compositor task started\n");
+    }
+
     splash::wait_enter(&mut writer);
     splash::finish(&mut writer);
     // Рабочие столы поднимаются до шелла: основной шелл — это стол 0, и его
