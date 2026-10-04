@@ -180,10 +180,20 @@ pub fn init(raw: RawFb) -> bool {
 
     // В VBE-режиме физический 0xB8000 текст не хранит: до первого чтения
     // композитором подменяем его на RAM-тень (и в ядре, и в будущих задачах).
-    if unsafe { paging::install_vga_shadow() }.is_none() {
-        crate::vga::serial_write_atomic("[N] vga shadow failed\n");
-        return false;
-    }
+    let shadow = match unsafe { paging::install_vga_shadow() } {
+        Some(s) => s,
+        None => {
+            crate::vga::serial_write_atomic("[N] vga shadow failed\n");
+            return false;
+        }
+    };
+    // Адрес тени в serial: автотесты читают экран через pmemsave и после
+    // появления композитора физический 0xB8000 больше не содержит текст.
+    // Без этой строки им пришлось бы угадывать адрес. Печатаем с префиксом
+    // 0x: выражение HMP без него не разбирает адрес, начинающийся с буквы.
+    crate::vga::serial_write_atomic("[N] vga shadow phys=0x");
+    crate::vga::serial_write_atomic(hex32(shadow.0).as_str());
+    crate::vga::serial_putchar(b'\n');
 
     // Масштаб: максимальный целочисленный, одинаковый по обеим осям (иначе
     // шрифт растягивается по горизонтали), сетка центрируется. Верхняя
@@ -250,6 +260,24 @@ pub fn init(raw: RawFb) -> bool {
 
 pub fn active() -> bool {
     unsafe { FB.is_some() }
+}
+
+/// Восьмизначный hex без префикса: адрес тени в serial читают автотесты.
+fn hex32(v: u64) -> alloc::string::String {
+    const D: &[u8; 16] = b"0123456789abcdef";
+    let mut s = alloc::string::String::with_capacity(16);
+    let mut started = false;
+    for i in (0..16).rev() {
+        let d = ((v >> (i * 4)) & 0xF) as usize;
+        if d != 0 || started {
+            started = true;
+            s.push(D[d] as char);
+        }
+    }
+    if !started {
+        s.push('0');
+    }
+    s
 }
 
 unsafe fn pack(fb: &Fb, r: u8, g: u8, b: u8) -> u32 {
