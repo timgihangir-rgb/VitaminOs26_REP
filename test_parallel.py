@@ -10,6 +10,7 @@ Checks:
   - workers started together (barrier) and finished within a few ticks
     of each other -> evidence of preemptive concurrency
 """
+import re
 import subprocess
 import time
 import os
@@ -89,8 +90,27 @@ def type_line(s, text):
     time.sleep(0.9)
 
 
+SERIAL_LOG = "/tmp/par_serial.log"
+
+
+# Физический адрес экранного буфера.
+#
+# Когда загрузчик включает графический режим, ядро подменяет 0xB8000
+# RAM-тенью (paging::install_vga_shadow) и печатает её адрес в serial.
+# pmemsave по 0xB8000 тогда читает видеопамять, а не текст, поэтому адрес
+# берём из строки "[N] vga shadow phys=". Без неё остаётся 0xB8000 -
+# верно для текстового режима, где тени нет.
+def vga_addr():
+    try:
+        log = open(SERIAL_LOG, errors="replace").read()
+    except OSError:
+        return "0xb8000"
+    m = re.search(r"vga shadow phys=(0x[0-9a-fA-F]+)", log)
+    return m.group(1) if m else "0xb8000"
+
+
 def dump_vga(s):
-    qmp_hmp(s, f'pmemsave 0xb8000 9600 "{VGA_DUMP}"')
+    qmp_hmp(s, f'pmemsave {vga_addr()} 9600 "{VGA_DUMP}"')
     time.sleep(0.4)
 
 
@@ -123,11 +143,14 @@ img = "/tmp/par_os.img"
 qemu_cmd = [
     "qemu-system-x86_64",
     "-cdrom", iso,
+    # Без явного порядка SeaBIOS сначала пробует HDD и флоппи: загрузка
+    # занимает лишние 10-15 с, и тесты не дожидаются приглашения.
+    "-boot", "order=d",
     "-drive", f"file={img},format=raw,if=ide",
     "-display", "none",
     "-no-reboot",
     "-qmp", f"tcp:127.0.0.1:{QMP_PORT},server,nowait",
-    "-serial", "file:/tmp/par_serial.log",
+    "-serial", f"file:{SERIAL_LOG}",
 ]
 for p in ("/tmp/par_serial.log", VGA_DUMP):
     try:
@@ -150,6 +173,10 @@ try:
     for i in range(10):
         time.sleep(1)
         dump_vga(s)
+        # Загрузочный экран держится до Enter: без нажатия приглашения
+        # не будет, сколько бы тест ни ждал.
+        if "press Enter to continue" in screen_text():
+            fast_sendkey(s, "ret")
         if "vitamin_os26" in screen_text():
             print(f"  t={i+1}s: shell ready")
             break

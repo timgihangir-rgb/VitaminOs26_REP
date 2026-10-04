@@ -7,6 +7,7 @@ Verifies via the VGA framebuffer (pmemsave) that:
   3. typing inside Vita does not crash the system,
   4. Ctrl+Q -> n quits back to the shell.
 """
+import re
 import subprocess
 import time
 import os
@@ -69,10 +70,29 @@ def qemu_alive(qemu):
     return qemu.poll() is None
 
 
+SERIAL_LOG = "/tmp/vita_serial.log"
+
+
+# Физический адрес экранного буфера.
+#
+# Когда загрузчик включает графический режим, ядро подменяет 0xB8000
+# RAM-тенью (paging::install_vga_shadow) и печатает её адрес в serial.
+# pmemsave по 0xB8000 тогда читает видеопамять, а не текст, поэтому адрес
+# берём из строки "[N] vga shadow phys=". Без неё остаётся 0xB8000 -
+# верно для текстового режима, где тени нет.
+def vga_addr():
+    try:
+        log = open(SERIAL_LOG, errors="replace").read()
+    except OSError:
+        return "0xb8000"
+    m = re.search(r"vga shadow phys=(0x[0-9a-fA-F]+)", log)
+    return m.group(1) if m else "0xb8000"
+
+
 def dump_vga(s, path):
     """Dump physical VGA framebuffer to a file via HMP pmemsave."""
     # Quoted path: '/' is parsed as division by HMP's expression parser.
-    r = qmp_hmp(s, f'pmemsave 0xb8000 9600 "{path}"')
+    r = qmp_hmp(s, f'pmemsave {vga_addr()} 9600 "{path}"')
     time.sleep(0.4)
     return r
 
@@ -106,11 +126,14 @@ img = "/tmp/vita_os.img"
 qemu_cmd = [
     "qemu-system-x86_64",
     "-cdrom", iso,
+    # Без явного порядка SeaBIOS сначала пробует HDD и флоппи: загрузка
+    # занимает лишние 10-15 с, и тесты не дожидаются приглашения.
+    "-boot", "order=d",
     "-drive", f"file={img},format=raw,if=ide",
     "-display", "none",
     "-no-reboot",
     "-qmp", f"tcp:127.0.0.1:{QMP_PORT},server,nowait",
-    "-serial", "file:/tmp/vita_serial.log",
+    "-serial", f"file:{SERIAL_LOG}",
 ]
 for p in ("/tmp/vita_serial.log", VGA_DUMP1, VGA_DUMP2):
     try:
@@ -139,6 +162,10 @@ try:
             break
         dump_vga(s, VGA_DUMP1)
         lines = vga_text(VGA_DUMP1)
+        # Загрузочный экран держится до Enter: без нажатия приглашения
+        # не будет, сколько бы тест ни ждал.
+        if any("press Enter to continue" in ln for ln in lines):
+            qmp_sendkey(s, "ret")
         if any("vitamin_os26" in ln for ln in lines):
             print(f"  t={i+1}s: shell prompt found")
             shell_ready = True

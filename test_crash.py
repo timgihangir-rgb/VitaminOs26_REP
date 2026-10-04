@@ -39,6 +39,9 @@ def qemu_start(serial_log):
     cmd = [
         "qemu-system-x86_64",
         "-cdrom", ISO,
+        # Без явного порядка SeaBIOS сначала пробует HDD и флоппи: загрузка
+        # занимает лишние 10-15 с, и тесты не дожидаются приглашения.
+        "-boot", "order=d",
         "-drive", f"file={IMG},format=raw,if=ide",
         "-display", "none",
         "-qmp", f"tcp:127.0.0.1:{QMP_PORT},server,nowait",
@@ -119,6 +122,10 @@ def wait_for_prompt(s, attempts=25):
     for i in range(attempts):
         time.sleep(1)
         dump_vga(s)
+        # Загрузочный экран держится до Enter: без нажатия приглашения
+        # не будет, сколько бы тест ни ждал.
+        if "press Enter to continue" in screen_text():
+            fast_sendkey(s, "ret")
         if "vitamin_os26" in screen_text():
             print(f"  t={i + 1}s: shell ready")
             return True
