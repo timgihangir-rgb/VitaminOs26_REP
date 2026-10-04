@@ -9,6 +9,7 @@
 """
 import json
 import os
+import re
 import random
 import shutil
 import socket
@@ -23,7 +24,7 @@ SERIAL1 = "/tmp/crash_serial1.log"
 SERIAL2 = "/tmp/crash_serial2.log"
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-ISO = os.path.join(ROOT, "target", "os.img")
+# Загрузочный ISO (сырой образ диска загрузчиком не читается).
 ISO = os.path.join(ROOT, "target", "os.iso")
 
 failures = []
@@ -87,10 +88,22 @@ def type_line(s, text, gap=0.05):
     fast_sendkey(s, "ret")
 
 
-def dump_vga(s):
+# Физический адрес текстового буфера. Когда загрузчик включает графический
+# режим, ядро подменяет 0xB8000 RAM-тенью и печатает её адрес в serial, так
+# что читать надо оттуда (иначе экран пуст).
+def vga_addr(serial_log):
+    try:
+        log = open(serial_log, errors="replace").read()
+    except OSError:
+        return "0xb8000"
+    m = re.search(r"vga shadow phys=(0x[0-9a-fA-F]+)", log)
+    return m.group(1) if m else "0xb8000"
+
+
+def dump_vga(s, serial_log=SERIAL1):
     s.send((json.dumps({
         "execute": "human-monitor-command",
-        "arguments": {"command-line": f'pmemsave 0xb8000 9600 "{VGA_DUMP}"'},
+        "arguments": {"command-line": f'pmemsave {vga_addr(serial_log)} 9600 "{VGA_DUMP}"'},
     }) + "\n").encode())
     time.sleep(0.35)
     try:
@@ -114,19 +127,18 @@ def screen_text():
     return "\n".join(rows)
 
 
-def wait_for_prompt(s, attempts=25):
+def wait_for_prompt(s, attempts=40, serial_log=SERIAL1):
     """Сплэш держит экран до Enter: даём загрузке закончиться, жмём Enter,
     дальше обычный опрос промпта."""
-    time.sleep(9)
-    fast_sendkey(s, "ret")
     for i in range(attempts):
         time.sleep(1)
-        dump_vga(s)
-        # Загрузочный экран держится до Enter: без нажатия приглашения
-        # не будет, сколько бы тест ни ждал.
-        if "press Enter to continue" in screen_text():
+        dump_vga(s, SERIAL2)
+        t = screen_text()
+        # Меню GRUB и загрузочный экран ядра оба содержат "press Enter",
+        # поэтому жмём Enter, пока строка не исчезнет.
+        if "press Enter" in t:
             fast_sendkey(s, "ret")
-        if "vitamin_os26" in screen_text():
+        if "vitamin_os26" in t:
             print(f"  t={i + 1}s: shell ready")
             return True
     return False
@@ -180,7 +192,7 @@ except Exception:
 print("\n== boot 2 на том же образе (recover + fsck) ==")
 qemu2 = qemu_start(SERIAL2)
 s2 = qmp_connect(qemu2)
-check(wait_for_prompt(s2), "boot2: система поднялась после краша")
+check(wait_for_prompt(s2, serial_log=SERIAL2), "boot2: система поднялась после краша")
 
 ser2 = open(SERIAL2, "rb").read()
 check(b"[exc]" not in ser2, "boot2: нет исключений ядра")

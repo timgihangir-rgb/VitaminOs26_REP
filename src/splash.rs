@@ -1,5 +1,5 @@
 // src/splash.rs — загрузочный экран: ASCII-баннер + статусы подсистем.
-use crate::vga::{Writer, COLOR_LIGHT_CYAN, COLOR_LIGHT_GREEN, COLOR_WHITE, SCREEN_WIDTH};
+use crate::vga::{Writer, COLOR_LIGHT_CYAN, COLOR_LIGHT_GREEN, COLOR_LIGHT_RED, COLOR_WHITE, SCREEN_WIDTH};
 
 const BANNER: &[&str] = &[
     r" _   _ _ _                  _       _____       _____   ____ ",
@@ -41,7 +41,6 @@ pub fn step(writer: &mut Writer, name: &str) {
 
 /// Строка неудачи (красный `[ FAIL ]`) без паузы.
 pub fn fail(writer: &mut Writer, name: &str) {
-    const COLOR_LIGHT_RED: u8 = 0x0C;
     writer.set_color(COLOR_LIGHT_RED);
     writer.write_string("  [ FAIL ] ");
     writer.set_color(COLOR_WHITE);
@@ -55,15 +54,15 @@ pub fn finish(writer: &mut Writer) {
     writer.clear_screen();
 }
 
-/// Ждёт нажатия Enter перед переходом к промпту. Сначала очищает буфер
-/// сканкодов, чтобы нажатия во время загрузки не проскакивали мгновенно;
-/// break-коды (>=0x80) и прочие клавиши игнорируются. Ждёт через hlt,
-/// поэтому не грузит CPU (IF=1 — прерывания уже включены).
+/// Держит загрузочный экран на виду до нажатия Enter. Без этой паузы
+/// статусы подсистем и логотип проскакивают за один кадр, и загрузка
+/// выглядит как мгновенный переход в пустой шелл. Вызывается после старта
+/// композитора, иначе экран не успевает отрисоваться.
 pub fn wait_enter(writer: &mut Writer) {
     crate::keyboard::flush();
     writer.write_string("\n");
     writer.set_color(COLOR_LIGHT_CYAN);
-    centered(writer, "press Enter to continue...");
+    centered(writer, "press Enter for login...");
     writer.set_color(COLOR_WHITE);
     const ENTER_MAKE: u8 = 0x1C;
     loop {

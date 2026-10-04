@@ -17,6 +17,7 @@ pub fn list_files(writer: &mut Writer, vfs: &Vfs, path: &str) {
                 };
                 writer.write_string(&format!("{:<8} {:>6}  {}\n", kind, size, name));
             }
+
         }
         Some(_) => {
             writer.write_string("(empty)\n");

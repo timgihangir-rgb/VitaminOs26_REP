@@ -162,9 +162,8 @@ try:
             break
         dump_vga(s, VGA_DUMP1)
         lines = vga_text(VGA_DUMP1)
-        # Загрузочный экран держится до Enter: без нажатия приглашения
-        # не будет, сколько бы тест ни ждал.
-        if any("press Enter to continue" in ln for ln in lines):
+        # Загрузочный экран держится до Enter: без нажатия приглашения не будет.
+        if any("press Enter" in ln for ln in lines):
             qmp_sendkey(s, "ret")
         if any("vitamin_os26" in ln for ln in lines):
             print(f"  t={i+1}s: shell prompt found")
@@ -204,8 +203,8 @@ try:
     print("\n=== Vita screen before typing ===")
     print_screen(lines)
     check(any("Vita: /etc/hostname" in ln for ln in lines), "title bar shows file name 'Vita: /etc/hostname'")
-    check(any("Ctrl+Q: Quit" in ln for ln in lines), "hotkey bar shows 'Ctrl+Q: Quit'")
-    check(any("Ctrl+S: Save" in ln for ln in lines), "hotkey bar shows 'Ctrl+S: Save'")
+    check(any("Ctrl+Q Quit" in ln for ln in lines), "hotkey bar shows 'Ctrl+Q Quit'")
+    check(any("Ctrl+S Save" in ln for ln in lines), "hotkey bar shows 'Ctrl+S Save'")
 
     # Type inside Vita; a crash would kill QEMU.
     print("\nTyping 'hello' inside Vita...")

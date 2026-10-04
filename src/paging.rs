@@ -358,12 +358,32 @@ pub const KERNEL_MMIO_SIZE: u64 = 0x1_0000_0000;
 /// Диапазон выравнивается по границе страницы вниз: адрес ABAR может быть
 /// не кратен 4 КиБ.
 pub unsafe fn map_phys_in_kernel(phys: u64, len: u64) -> Option<u64> {
+    map_phys_flags(
+        phys,
+        len,
+        PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE,
+    )
+}
+
+/// То же окно, но с обычным кэшированием (write-back). Для линейного
+/// кадрового буфера это обязательно: видеопамять - обычная RAM, и каждая
+/// запись пикселя через NO_CACHE обходится в десятки раз дороже. На
+/// 1280x800 со scale=1 это 10 тысяч записей на строку текста, и композитор
+/// при такой цене успевает нарисовать одну строку за десятки миллисекунд -
+/// вывод выглядит построчным, а система кажется заторможенной.
+///
+/// Для настоящего MMIO (AHCI, сетевая карта) кэширование недопустимо -
+/// там остаётся `map_phys_in_kernel`.
+pub unsafe fn map_phys_cached(phys: u64, len: u64) -> Option<u64> {
+    map_phys_flags(phys, len, PageTableFlags::PRESENT | PageTableFlags::WRITABLE)
+}
+
+unsafe fn map_phys_flags(phys: u64, len: u64, flags: PageTableFlags) -> Option<u64> {
     let end = phys.checked_add(len)?;
     if end > KERNEL_MMIO_SIZE {
         dmap(&alloc::format!("mmio out of window: phys={:x} len={:x}", phys, len));
         return None;
     }
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_CACHE;
     let mut pt = OffsetPageTable::new(active_level_4_table(), VirtAddr::new(PHYS_MEM_OFFSET));
     let mut addr = phys & !0xFFF;
     while addr < end {

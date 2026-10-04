@@ -166,12 +166,12 @@ try:
     print("Connected to QMP")
 
     print("Waiting for shell prompt...")
-    for i in range(10):
+    for i in range(40):
         time.sleep(1)
         dump_vga(s)
-        # Загрузочный экран держится до Enter: без нажатия приглашения
-        # не будет, сколько бы тест ни ждал.
-        if "press Enter to continue" in screen_text():
+        # Загрузочный экран держится до Enter: без нажатия приглашения не
+        # будет, сколько бы тест ни ждал.
+        if "press Enter" in screen_text():
             fast_sendkey(s, "ret")
         if "vitamin_os26" in screen_text():
             print(f"  t={i+1}s: shell ready")

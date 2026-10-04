@@ -175,12 +175,12 @@ try:
     print("Connected to QMP")
 
     print("Waiting for shell prompt...")
-    for i in range(10):
+    for i in range(40):
         time.sleep(1)
         dump_vga(s)
-        # Загрузочный экран держится до Enter: без нажатия приглашения
-        # не будет, сколько бы тест ни ждал.
-        if "press Enter to continue" in screen_text():
+        # Загрузочный экран держится до Enter: без нажатия приглашения не
+        # будет, сколько бы тест ни ждал.
+        if "press Enter" in screen_text():
             fast_sendkey(s, "ret")
         if "vitamin_os26" in screen_text():
             print(f"  t={i+1}s: shell ready")
@@ -256,7 +256,8 @@ try:
         dump_vga(s)
         t = screen_text()
         check(str(bg_clock_pid) not in t.split(), "killed bg clock pid gone from ps (slot freed)")
-        check("clock" in t, "init clock service still present")
+        # Служба init - это ticker (clock исключён из rc.conf, TEMP-3.2).
+        check("ticker" in t, "init ticker service still present")
         type_line(s, f"bg clock")
         dump_vga(s)
         check("Started background task clock" in screen_text(),

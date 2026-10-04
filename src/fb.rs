@@ -70,6 +70,10 @@ struct Fb {
     scale_y: u32,
     off_x: u32,
     off_y: u32,
+    /// Промежуточный буфер на ширину текстовой строки. Пиксели копятся в
+    /// нём (это обычные записи в память) и оттуда уходят в кадр крупными
+    /// кусками: прямые записи каждого пикселя в LFB дороже всего остального.
+    rowbuf: *mut u32,
 }
 
 static mut FB: Option<Fb> = None;
@@ -170,7 +174,13 @@ pub fn probe(mb_info_ptr: u64) -> Option<RawFb> {
 /// под разрешение монитора. Возвращает false, если отобразить не удалось.
 pub fn init(raw: RawFb) -> bool {
     let len = raw.pitch as u64 * raw.height as u64;
-    let va = match unsafe { paging::map_phys_in_kernel(raw.phys, len) } {
+    // Кадровый буфер - обычная RAM (VBE линейный кадр), поэтому отображаем
+    // его с кэшированием. Через NO_CACHE каждая запись пикселя идёт мимо
+    // кэша CPU: на 1280x800 это тысячи записей на строку текста, и композитор
+    // не успевает рисовать - вывод выглядит построчным, а система кажется
+    // заторможенной. Настоящее MMIO (AHCI, сетевая карта) продолжает
+    // отображаться через paging::map_phys_in_kernel.
+    let va = match unsafe { paging::map_phys_cached(raw.phys, len) } {
         Some(v) => v,
         None => {
             crate::vga::serial_write_atomic("[N] fb map failed\n");
@@ -229,8 +239,14 @@ pub fn init(raw: RawFb) -> bool {
     crate::vga::serial_u64(raw.phys);
     crate::vga::serial_write_atomic("\n");
 
+    // Буфер строки живёт в куче: в bss места впритык (ядро грузится на 2 МиБ,
+    // а trampoline отображает первые 4 МиБ).
+    let rowbuf: &'static mut [u32] =
+        alloc::boxed::Box::leak(alloc::vec![0u32; TEXT_WIDTH * CELL_W * MAX_SCALE].into_boxed_slice());
+
     let fb = Fb {
         addr: va as *mut u8,
+        rowbuf: rowbuf.as_mut_ptr(),
         pitch: raw.pitch,
         width: raw.width,
         height: raw.height,
@@ -357,6 +373,81 @@ fn palette(i: u8) -> (u8, u8, u8) {
 }
 
 /// Рисует одну текстовую ячейку. `cursor` инвертирует цвета (курсор).
+/// Растеризует диапазон ячеек строки текста в промежуточный буфер и кладёт его
+/// в кадр. Заменяет вызов `render_cell` на каждую ячейку по трём причинам:
+///
+///  * палитра и цвета ячеек считаются ОДИН раз на строку, а не для каждой из
+///    16 строк глифа (раньше на строку уходило ~60 млн циклов);
+///  * в кадр идёт одна крупная запись на строку глифа вместо мелких по две
+///    пикселя - в LFB это самая дорогая операция;
+///  * `LAST` обновляется здесь же, из того же снимка текста, что попал в кадр.
+unsafe fn render_text_row(fb: &Fb, row: usize, first: usize, last: usize) {
+    if first > last || row >= TEXT_HEIGHT {
+        return;
+    }
+    let scale_x = fb.scale_x as usize;
+    let scale_y = fb.scale_y as usize;
+    let x0 = fb.off_x + first as u32 * CELL_W as u32 * fb.scale_x;
+    let y0 = fb.off_y + row as u32 * CELL_H as u32 * fb.scale_y;
+    if x0 >= fb.width || y0 >= fb.height {
+        return;
+    }
+    // Правый край может выйти за кадр: у неполной сетки такое бывает.
+    let px_w = ((last - first + 1) * CELL_W * scale_x).min((fb.width - x0) as usize);
+    let buf = fb.rowbuf;
+
+    // Символы и цвета читаем один раз на строку.
+    let mut fg = [0u32; TEXT_WIDTH];
+    let mut bg = [0u32; TEXT_WIDTH];
+    let mut ch = [0u8; TEXT_WIDTH];
+    for col in first..=last {
+        let off = (row * TEXT_WIDTH + col) * 2;
+        ch[col - first] = core::ptr::read_volatile(TEXT_BASE.add(off));
+        let attr = core::ptr::read_volatile(TEXT_BASE.add(off + 1));
+        // LAST обновляем здесь же: обновлять его отдельно, после отрисовки
+        // всей строки, нельзя - за это время шелл успевает дописать новые
+        // символы, и они будут помечены «уже нарисованными», то есть пропадут.
+        LAST[off] = ch[col - first];
+        LAST[off + 1] = attr;
+        let (fr, fgc, fb_) = palette(attr & 0x0F);
+        let (br, bgc, bb) = palette((attr >> 4) & 0x07);
+        fg[col - first] = pack(fb, fr, fgc, fb_);
+        bg[col - first] = pack(fb, br, bgc, bb);
+    }
+
+    for gy in 0..CELL_H {
+        let mut x = 0usize;
+        for col in first..=last {
+            let bits = FONT[ch[col - first] as usize * 16 + gy];
+            let f = fg[col - first];
+            let b = bg[col - first];
+            for gx in 0..CELL_W {
+                let v = if (bits >> (7 - gx)) & 1 != 0 { f } else { b };
+                for _ in 0..scale_x {
+                    buf.add(x).write(v);
+                    x += 1;
+                }
+            }
+        }
+        for dy in 0..scale_y {
+            let y = y0 + (gy * scale_y + dy) as u32;
+            if y >= fb.height {
+                break;
+            }
+            let dst = fb
+                .addr
+                .add(y as usize * fb.pitch as usize + x0 as usize * 4);
+            if fb.bpp == 32 {
+                copy_row(dst, core::slice::from_raw_parts(buf, px_w), px_w);
+            } else {
+                for gx in 0..px_w {
+                    put_px(fb, x0 + gx as u32, y, buf.add(gx).read());
+                }
+            }
+        }
+    }
+}
+
 unsafe fn render_cell(fb: &Fb, row: usize, col: usize, cursor: bool) {
     let off = (row * TEXT_WIDTH + col) * 2;
     let ch = core::ptr::read_volatile(TEXT_BASE.add(off));
@@ -443,8 +534,6 @@ pub fn tick() {
                 let ch = core::ptr::read_volatile(TEXT_BASE.add(base + i));
                 let at = core::ptr::read_volatile(TEXT_BASE.add(base + i + 1));
                 if LAST[base + i] != ch || LAST[base + i + 1] != at {
-                    LAST[base + i] = ch;
-                    LAST[base + i + 1] = at;
                     if col < first {
                         first = col;
                     }
@@ -454,9 +543,9 @@ pub fn tick() {
             if first > last {
                 continue;
             }
-            for col in first..=last {
-                render_cell(&fb, row, col, false);
-            }
+            // LAST обновляется внутри render_text_row, из того же снимка
+            // текста, который попал в кадр.
+            render_text_row(&fb, row, first, last);
         }
     }
 

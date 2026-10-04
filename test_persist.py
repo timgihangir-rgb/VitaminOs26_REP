@@ -138,11 +138,13 @@ def wait_for_prompt(s, attempts=20):
     for i in range(attempts):
         time.sleep(1)
         dump_vga(s)
-        # Загрузочный экран держится до Enter: без нажатия приглашения
-        # не будет, сколько бы тест ни ждал.
-        if "press Enter to continue" in screen_text():
+        # Загрузочный экран держится до Enter: без нажатия приглашения не
+        # будет, сколько бы тест ни ждал.
+        t = screen_text()
+        if "press Enter" in t:
+            print(f"  t={i + 1}s: splash, pressing Enter")
             fast_sendkey(s, "ret")
-        if "vitamin_os26" in screen_text():
+        if "vitamin_os26" in t:
             print(f"  t={i + 1}s: shell ready")
             return True
     return False

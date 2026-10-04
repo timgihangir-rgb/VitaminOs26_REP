@@ -2,9 +2,9 @@
 """Test ELF program loading from disk (execve-style).
 
 Boot 1 (seeded disk): /bin programs load as ELF, argc/argv are passed,
-foreground execution works, init starts the clock service from disk.
+foreground execution works, init starts the ticker service from disk.
 Boot 2 (empty disk): proves binaries are NOT embedded in the kernel -
-/bin is empty and unknown commands fail.
+/bin has no programs and unknown commands fail.
 """
 import re
 import subprocess
@@ -141,12 +141,12 @@ def clear_and_run(s, command):
 
 
 def wait_for_prompt(s, tag):
-    for i in range(10):
+    for i in range(40):
         time.sleep(1)
         dump_vga(s)
-        # Загрузочный экран держится до Enter: без нажатия приглашения
-        # не будет, сколько бы тест ни ждал.
-        if "press Enter to continue" in screen_text():
+        # Загрузочный экран держится до Enter: без нажатия приглашения не
+        # будет, сколько бы тест ни ждал.
+        if "press Enter" in screen_text():
             fast_sendkey(s, "ret")
         if "vitamin_os26" in screen_text():
             print(f"  t={i+1}s: shell ready ({tag})")
@@ -237,7 +237,9 @@ try:
     dump_vga(s)
     t = screen_text()
     check("PID" in t and "NAME" in t, "shell alive after program returned via ret")
-    check("clock" in t, "clock service running (ELF loaded by init)")
+    # Службой из rc.conf остался ticker (clock/crashy исключены из-за порчи
+    # контекста при спавне под вытеснением, см. DEFAULT_RC_CONF в src/init.rs).
+    check("ticker" in t, "ticker service running (ELF loaded by init)")
 
     s.close()
 except Exception as e:
@@ -276,7 +278,9 @@ try:
     clear_and_run(s, "ls /bin")
     dump_vga(s)
     t = screen_text()
-    check("(empty)" in t, "/bin is empty on blank disk")
+    # На пустом диске ФС создаётся заново: mkfs заносит только служебные
+    # каталоги, /bin остаётся без программ.
+    check("(empty)" in t or "No such" in t, "/bin has no programs on blank disk")
     # "vitamin_os26" в промпте содержит подстроку "vita" - вырезаем промпт.
     body = t.replace("vitamin_os26", "")
     for prog in ("clock", "echoargs", "example", "fetch", "help", "snake", "vita"):

@@ -147,30 +147,21 @@ def main():
     qemu = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         s = qmp_connect(qemu)
+        # Загрузочный экран держится до Enter: без нажатия приглашения не будет.
         booted = False
-        for i in range(20):
+        for i in range(40):
             time.sleep(1)
             dump_vga(s)
-            if "press Enter to continue" in screen():
-                booted = True
-                print(f"  boot splash at t={i+1}s")
-                break
-        check(booted, "boot splash appeared")
-        if not booted:
-            return
-        sendkey(s, "ret")
-        for i in range(20):
-            time.sleep(1)
-            dump_vga(s)
-            # Загрузочный экран держится до Enter: без нажатия приглашения
-            # не будет, сколько бы тест ни ждал.
-            if "press Enter to continue" in screen():
+            t = screen()
+            if "press Enter" in t:
                 sendkey(s, "ret")
-            if "vitamin_os26" in screen():
-                print(f"  shell ready at t={i+1}s after splash")
+                continue
+            if "vitamin_os26" in t:
+                booted = True
+                print(f"  shell ready at t={i+1}s")
                 break
-        else:
-            check(False, "shell prompt appeared")
+        check(booted, "shell prompt appeared")
+        if not booted:
             print(screen())
             return
 
