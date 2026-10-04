@@ -388,11 +388,6 @@ pub fn stage(bno: u64, buf: &[u8; BLOCK_SIZE]) -> bool {
     if dup {
         return true;
     }
-    crate::vga::serial_write_atomic("[st:nodup]\n");
-    let full_chk = with_wal(|w| w.staging.len()).unwrap_or(9999);
-    crate::vga::serial_write_atomic("[st:len]=");
-    crate::vga::serial_u64(full_chk as u64);
-    crate::vga::serial_write_atomic("\n");
 
     // 2) Порция полна - фиксируем накопленное (без аллокаций).
     let full = with_wal(|w| w.staging.len() >= MAX_STAGING).unwrap_or(true);
@@ -492,6 +487,17 @@ fn commit_all() -> bool {
 /// Аллокаций нет: указатели на буферы снимаются под guard'ом, порция
 /// удаляется из staging через drain(0..take) со сдвигом на месте
 /// (ёмкость зарезервирована, поэтому сдвиг не перевыделяет память).
+/// Сообщение о сорвавшейся фиксации. Печатается только при ошибке: прежние
+/// маркеры прогресса печатались на каждом коммите, заливали COM1 и заметно
+/// замедляли ввод (см. allerror.txt).
+fn commit_fail(where_: &str, seq: u64) {
+    crate::vga::serial_write_atomic("[wal] commit failed: ");
+    crate::vga::serial_write_atomic(where_);
+    crate::vga::serial_write_atomic(" seq=");
+    crate::vga::serial_u64(seq);
+    crate::vga::serial_putchar(b'\n');
+}
+
 fn commit_portion() -> bool {
     // Замораживаем ПЛАНИРОВАНИЕ (не прерывания!): staging недоступен другим
     // задачам, тики и клавиатура продолжают обрабатываться немедленно -
@@ -503,7 +509,6 @@ fn commit_portion() -> bool {
 }
 
 fn commit_portion_inner() -> bool {
-    crate::vga::serial_write_atomic("[cp:a]\n");
     // Стековый список затронутых слотов: <= MAX_STAGING записей.
     let mut touched: [(usize, u32, u32); MAX_STAGING] = [(0, 0, 0); MAX_STAGING];
     let mut n_touched = 0usize;
@@ -532,7 +537,6 @@ fn commit_portion_inner() -> bool {
         }
     });
 
-    crate::vga::serial_write_atomic("[cp:b]\n");
     // a) Payload'ы в слоты кольца (напрямую на диск, мимо bcache).
     for k in 0..take {
         let idx = (rp + k) % SLOTS;
@@ -540,15 +544,16 @@ fn commit_portion_inner() -> bool {
         if blockdev::write_block(SLOT_START + idx as u64, buf).is_err() {
             // Не зафиксировано: staging не трогаем, транзакция останется
             // незафиксированной и будет повторена следующим commit().
+            commit_fail("slot payload", seq as u64);
             return false;
         }
         touched[n_touched] = (idx, bnos[k] as u32, seq);
         n_touched += 1;
     }
 
-    crate::vga::serial_write_atomic("[cp:c]\n");
     // b) ТОЧКА ФИКСАЦИИ: LOGGED-дескрипторы в оба зеркала.
     if !write_jsuper(seq + 1, applied_old, &touched[..n_touched]) {
+        commit_fail("journal write", seq as u64);
         return false;
     }
 
@@ -563,7 +568,6 @@ fn commit_portion_inner() -> bool {
         // BISECT-B: синхронная дисковая запись отключена
     }
 
-    crate::vga::serial_write_atomic("[cp:d]\\n");
     // d) Закрытие: applied_seq = seq, дескрипторы слотов обнуляются -
     //    слоты снова можно переиспользовать.
     let _ = write_jsuper(seq + 1, seq, &[]);
