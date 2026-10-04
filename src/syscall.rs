@@ -26,6 +26,13 @@
 //!  10 net_send(buf, len) -> i32         (байт отправлено / -3 ошибка)
 //!  11 net_recv(buf, max) -> i32         (>0 байт / -2 нет данных / -1 EOF / -3)
 //!  12 net_close() -> i32
+//!  14 auth(password) -> 0/-1   (пароль самого вызывателя; успех = root)
+//!  15 getuid() -> i32
+//!  16 whoami(buf, max) -> i32
+//!  17 useradd(name, password) -> i32   (только root)
+//!  18 userdel(name) -> i32            (только root)
+//!  19 exec(path, argc, argv) -> pid   (от uid вызывающего)
+//!  20 wait(pid) -> 0                   (блокируется до конца задачи)
 //!
 //!   net_* — НЕ-блокирующие: ядро продвигает TCP-состояние и возвращает
 //!   NET_EAGAIN (-2), когда ждёт сети; программа сама повторяет вызов со
@@ -37,6 +44,7 @@
 //!   [0]=r15 [1]=r14 [2]=r13 [3]=r12 [4]=r11 [5]=r10 [6]=r9 [7]=r8
 //!   [8]=rbx [9]=rbp [10]=rdi [11]=rsi [12]=rdx [13]=rcx [14]=rax
 
+use alloc::string::ToString;
 use core::arch::global_asm;
 
 pub const SYS_TICKS: usize = 0;
@@ -53,6 +61,22 @@ pub const SYS_NET_SEND: usize = 10;
 pub const SYS_NET_RECV: usize = 11;
 pub const SYS_NET_CLOSE: usize = 12;
 pub const SYS_NET_RESOLVE: usize = 13;
+/// auth(password) -> 0 / -1. Проверяет пароль САМОГО вызывающего (uid берётся
+/// из его задачи) и, если он верный, делает задачу root. Отдельного "setuid"
+/// нет намеренно: иначе любая программа могла бы повысить себя до root.
+pub const SYS_AUTH: usize = 14;
+/// getuid() -> uid текущей задачи.
+pub const SYS_GETUID: usize = 15;
+/// whoami(buf, max) -> длина имени / -1.
+pub const SYS_WHOAMI: usize = 16;
+/// useradd(name, password) -> 0 / -1. Только от root.
+pub const SYS_USERADD: usize = 17;
+/// userdel(name) -> 0 / -1. Только от root.
+pub const SYS_USERDEL: usize = 18;
+/// exec(path, argc, argv) -> pid / -1. Запуск программы от текущего uid.
+pub const SYS_EXEC: usize = 19;
+/// wait(pid) -> 0. Блокируется до завершения задачи pid.
+pub const SYS_WAIT: usize = 20;
 
 global_asm!(
     ".global int80_entry",
@@ -194,6 +218,154 @@ extern "C" fn sys_vfs_read(regs: *mut u64) {
         }
         None => set_result(regs, -1i64 as u64),
     });
+}
+
+/// C-строка из адресного пространства вызывающей программы. `max` ограничивает
+/// чтение, чтобы кривой указатель не увёл нас далеко.
+fn read_user_str(ptr: u64, max: usize) -> Option<alloc::string::String> {
+    if !user_ptr_ok(ptr) {
+        return None;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, max) };
+    let n = bytes.iter().position(|&b| b == 0)?;
+    core::str::from_utf8(&bytes[..n])
+        .ok()
+        .map(|s| s.to_string())
+}
+
+/// auth: пароль самого вызывающего. Успех переводит задачу в root.
+extern "C" fn sys_auth(regs: *mut u64) {
+    let uid = crate::user::current_uid();
+    if uid == crate::user::ROOT_UID {
+        set_result(regs, 0); // уже root
+        return;
+    }
+    let pass = match read_user_str(unsafe { *regs.add(10) }, 128) {
+        Some(s) => s,
+        None => {
+            set_result(regs, -2i64 as u64);
+            return;
+        }
+    };
+    let account = match crate::user::lookup_uid(uid) {
+        Some(a) => a,
+        None => {
+            set_result(regs, -1i64 as u64);
+            return;
+        }
+    };
+    if crate::user::verify(&account.name, &pass) {
+        crate::user::set_current_uid(crate::user::ROOT_UID);
+        set_result(regs, 0);
+    } else {
+        set_result(regs, -1i64 as u64);
+    }
+}
+
+/// useradd/userdel: правка учётных записей, доступна только root.
+extern "C" fn sys_useradd(regs: *mut u64) {
+    if crate::user::current_uid() != crate::user::ROOT_UID {
+        set_result(regs, -1i64 as u64);
+        return;
+    }
+    let (Some(name), Some(pass)) = (
+        read_user_str(unsafe { *regs.add(10) }, 64),
+        read_user_str(unsafe { *regs.add(11) }, 128),
+    ) else {
+        set_result(regs, -2i64 as u64);
+        return;
+    };
+    if !crate::linein::valid_user_name(&name) {
+        set_result(regs, -3i64 as u64);
+        return;
+    }
+    let r = match crate::user::add_with_home(&name, &pass) {
+        Ok(_) => 0i64,
+        Err(e) => {
+            crate::vga::serial_write_atomic("[auth] useradd: ");
+            crate::vga::serial_write_atomic(e);
+            crate::vga::serial_write_atomic("\n");
+            -1i64
+        }
+    };
+    set_result(regs, r as u64);
+}
+
+extern "C" fn sys_userdel(regs: *mut u64) {
+    if crate::user::current_uid() != crate::user::ROOT_UID {
+        set_result(regs, -1i64 as u64);
+        return;
+    }
+    let Some(name) = read_user_str(unsafe { *regs.add(10) }, 64) else {
+        set_result(regs, -2i64 as u64);
+        return;
+    };
+    let r = match crate::user::remove(&name) {
+        Ok(()) => 0i64,
+        Err(_) => -1i64,
+    };
+    set_result(regs, r as u64);
+}
+
+/// exec(path, argc, argv): запускает программу от текущего uid вызывающего.
+/// Нужен `sudo`: подняв права себе, он запускает команду уже с uid 0.
+extern "C" fn sys_exec(regs: *mut u64) {
+    let path_ptr = unsafe { *regs.add(10) };
+    let argc = (unsafe { *regs.add(11) }) as usize;
+    let argv_ptr = unsafe { *regs.add(12) };
+    if argc == 0 || argc > 32 {
+        set_result(regs, -2i64 as u64);
+        return;
+    }
+    let Some(path) = read_user_str(path_ptr, 256) else {
+        set_result(regs, -2i64 as u64);
+        return;
+    };
+    if !user_ptr_ok(argv_ptr) {
+        set_result(regs, -2i64 as u64);
+        return;
+    }
+    // argv[0] заменяем на полный путь - так же, как это делает шелл.
+    let mut argv: alloc::vec::Vec<alloc::string::String> =
+        alloc::vec::Vec::with_capacity(argc);
+    for i in 0..argc {
+        let slot = unsafe { (argv_ptr as *const u64).add(i).read_volatile() };
+        let arg = if i == 0 {
+            path.clone()
+        } else {
+            match read_user_str(slot, 256) {
+                Some(s) => s,
+                None => {
+                    set_result(regs, -2i64 as u64);
+                    return;
+                }
+            }
+        };
+        argv.push(arg);
+    }
+    let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+    let binpath = if path.starts_with('/') {
+        path.clone()
+    } else {
+        alloc::format!("/bin/{}", path)
+    };
+    let data = crate::scheduler::with_vfs(|v| v.cat(&binpath).map(|d| d.to_vec()));
+    let Some(data) = data else {
+        set_result(regs, -1i64 as u64); // нет такой программы
+        return;
+    };
+    crate::progabi::install();
+    let refs: alloc::vec::Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    let uid = crate::user::current_uid();
+    match crate::exec::launch_user(&name, &data, &refs, 0, uid) {
+        Some(pid) => {
+            // Ребёнок становится передним планом стола: Ctrl+C должен
+            // доставать команду, а не ждущий sudo.
+            crate::desk::set_fg(pid);
+            set_result(regs, pid as u64);
+        }
+        None => set_result(regs, -1i64 as u64),
+    }
 }
 
 /// Диспетчер системных вызовов. Вызывается из asm `int80_entry` с rdi =
@@ -381,6 +553,51 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) -> usize {
                 set_result(regs, -1i64 as u64);
             }
             0
+        }
+        SYS_AUTH => {
+            sys_auth(regs);
+            0
+        }
+        SYS_GETUID => {
+            set_result(regs, crate::user::current_uid() as u64);
+            0
+        }
+        SYS_WHOAMI => {
+            let buf = unsafe { *regs.add(10) };
+            let max = (unsafe { *regs.add(11) }).min(64) as usize;
+            let name = crate::user::current_name();
+            let b = name.as_bytes();
+            if !user_ptr_ok(buf) || max == 0 {
+                set_result(regs, -1i64 as u64);
+            } else {
+                let n = b.len().min(max - 1);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(b.as_ptr(), buf as *mut u8, n);
+                    (buf as *mut u8).add(n).write_volatile(0);
+                }
+                set_result(regs, n as u64);
+            }
+            0
+        }
+        SYS_USERADD => {
+            sys_useradd(regs);
+            0
+        }
+        SYS_USERDEL => {
+            sys_userdel(regs);
+            0
+        }
+        SYS_EXEC => {
+            sys_exec(regs);
+            0
+        }
+        SYS_WAIT => {
+            let pid = unsafe { *regs.add(10) } as usize;
+            crate::scheduler::wait_for(pid);
+            crate::desk::clear_fg();
+            set_result(regs, 0);
+            // Ждали внутри вызова: задача уходит в Blocked, asm переключится.
+            1
         }
         SYS_EXIT => {
             crate::scheduler::exit_current();

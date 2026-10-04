@@ -93,6 +93,11 @@ struct Task {
     /// Нужна рабочим столам: неактивный терминал не должен получать кванты
     /// CPU — иначе его шелл читал бы клавиатуру и писал бы в экран активного.
     suspended: bool,
+    /// uid, под которым задача работает с файлами. Ядро и фоновые службы
+    /// стартуют с uid 0 (root), программы из /bin - с uid вызывающего.
+    /// Меняется только успешным `sys_auth` (см. syscall.rs): поднять права
+    /// можно, зная пароль, и никак иначе.
+    uid: u16,
     #[allow(dead_code)]
     stack: Box<[u8]>,
 }
@@ -264,6 +269,7 @@ pub fn init() {
             space: None,
             wake_tick: 0,
             suspended: false,
+            uid: crate::user::ROOT_UID,
             stack,
         });
         CURRENT.store(0, Ordering::SeqCst);
@@ -291,6 +297,52 @@ pub fn vfs_ptr() -> *mut Vfs {
 }
 
 /// PID текущей (выполняющейся) задачи. Для диагностики (print в задачах).
+/// uid текущей задачи: она же работает с файлами от этого пользователя.
+pub fn current_uid() -> u16 {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        TASKS.get(CURRENT.load(Ordering::SeqCst))
+            .and_then(|t| t.as_ref())
+            .map(|t| t.uid)
+            .unwrap_or(crate::user::ROOT_UID)
+    })
+}
+
+/// Меняет uid текущей задачи. Вызывается только ядром: после успешной
+/// проверки пароля (`sys_auth`) и при входе в систему. Из ring 3 напрямую
+/// недостижимо - отдельного setuid в ABI нет намеренно.
+pub fn set_current_uid(uid: u16) {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        if let Some(t) = TASKS
+            .get_mut(CURRENT.load(Ordering::SeqCst))
+            .and_then(|t| t.as_mut())
+        {
+            t.uid = uid;
+        }
+    });
+}
+
+/// Ждёт завершения задачи pid без опроса горячих клавиш: вызывается из
+/// системного вызова, где Ctrl+C должен доставать того, кто ждёт (сам sudo),
+/// а не запущенного им ребёнка.
+pub fn wait_for(pid: usize) {
+    loop {
+        let done = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+            match TASKS.get(pid).and_then(|t| t.as_ref()) {
+                None => true,
+                Some(t) => t.state == TaskState::Finished,
+            }
+        });
+        if done {
+            return;
+        }
+        let target = TICKS.load(Ordering::SeqCst) + 1;
+        block_until_tick(target);
+        while TICKS.load(Ordering::SeqCst) < target {
+            x86_64::instructions::hlt();
+        }
+    }
+}
+
 pub fn current_pid() -> usize {
     CURRENT.load(Ordering::SeqCst)
 }
@@ -421,6 +473,7 @@ fn spawn_inner(name: &str, entry: Box<dyn FnOnce()>, suspended: bool) -> Option<
         space: None,
         wake_tick: 0,
         suspended,
+        uid: crate::user::ROOT_UID,
         stack,
     };
 
@@ -447,9 +500,12 @@ pub fn spawn_user(
     rdi_val: u64,
     rsi_val: u64,
     rdx_val: u64,
+    uid: u16,
 ) -> Option<usize> {
     SCHED_FROZEN.fetch_add(1, Ordering::SeqCst);
-    let r = spawn_user_inner(name, space, entry_rip, user_rsp, rdi_val, rsi_val, rdx_val);
+    let r = spawn_user_inner(
+        name, space, entry_rip, user_rsp, rdi_val, rsi_val, rdx_val, uid,
+    );
     SCHED_FROZEN.fetch_sub(1, Ordering::SeqCst);
     r
 }
@@ -462,6 +518,7 @@ fn spawn_user_inner(
     rdi_val: u64,
     rsi_val: u64,
     rdx_val: u64,
+    uid: u16,
 ) -> Option<usize> {
     let idx = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
         (1..MAX_TASKS).find(|&i| TASKS[i].is_none())
@@ -515,6 +572,7 @@ fn spawn_user_inner(
         space: Some(space),
         wake_tick: 0,
         suspended: false,
+        uid,
         stack,
     };
 

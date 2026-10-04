@@ -21,7 +21,7 @@ use alloc::vec::Vec;
 use crate::blockdev::{self, DeviceId, BLOCK_SIZE, SECTORS_PER_BLOCK};
 use crate::keyboard::{self, Key};
 use crate::part::{self, Entry, ENTRY_COUNT, TYPE_VITAFS};
-use crate::vga::{COLOR_LIGHT_CYAN, COLOR_LIGHT_GREEN, COLOR_WHITE, Writer};
+use crate::vga::{COLOR_LIGHT_CYAN, COLOR_LIGHT_GREEN, COLOR_LIGHT_RED, COLOR_WHITE, Writer};
 use crate::vfs::Vfs;
 
 const STAGE2_LBA: u32 = 1;
@@ -65,7 +65,12 @@ fn write_at(lba: u32, data: &[u8]) -> Result<(), &'static str> {
 
 /// Основная операция: клонирует live-ФС на раздел цели, пишет загрузчик и
 /// ядро. `drop_programs` - имена в /bin, которые на цель НЕ ставить.
-pub fn install_to(target: DeviceId, drop_programs: &[String]) -> Result<(), &'static str> {
+pub fn install_to(
+    target: DeviceId,
+    drop_programs: &[String],
+    account_name: &str,
+    account_password: &str,
+) -> Result<(), &'static str> {
     let live = blockdev::active();
     if live == target {
         return Err("target is the live device");
@@ -196,6 +201,11 @@ pub fn install_to(target: DeviceId, drop_programs: &[String]) -> Result<(), &'st
                 }
             }
         }
+        // Учётная запись администратора: без неё на цели никто не войдёт.
+        // Пишем прямо в иноды целевой ФС, пока смонтирована цель: VFS
+        // сейчас смотрит на live-образ, а смены смонтированной ФС тут нет.
+        crate::vitafs::idrop_all();
+        setup_account(&tsb, account_name, account_password);
         crate::vitafs::sync_all();
     } else {
         ser("warn: cannot mount target to finalize");
@@ -271,6 +281,82 @@ fn confirm(writer: &mut Writer, question: &str) -> bool {
     }
 }
 
+/// Учётная запись, которую заводит установщик.
+pub struct NewAccount {
+    pub name: String,
+    pub password: String,
+}
+
+/// Спрашивает имя и пароль администратора. None - пользователь нажал Esc и
+/// установку отменил.
+///
+/// Имя и пароль набираются латиницей: раскладка клавиатуры в этой системе одна
+/// (US), а учётные записи должны переживать копирование образа на другой
+/// жесткий диск, где нет ни /etc/shadow, ни /etc/passwd.
+fn ask_account(writer: &mut Writer) -> Option<NewAccount> {
+    loop {
+        writer.clear_screen();
+        writer.set_color(COLOR_LIGHT_GREEN);
+        writer.write_string("VitaminOS26 Installer\n");
+        writer.set_color(COLOR_WHITE);
+        writer.write_string("\nУчётная запись администратора.\n\n");
+        writer.write_string("  Имя пользователя: ");
+        // Esc на пустом поле - отмена установки (диск ещё не тронут).
+        let Some(name) = crate::linein::read_line_cancelable(writer, true) else {
+            writer.write_string("\nУстановка отменена.\n");
+            ser("account: cancelled by user");
+            return None;
+        };
+        if !crate::linein::valid_user_name(&name) {
+            writer.set_color(COLOR_LIGHT_RED);
+            writer.write_string(
+                "Не подходит: латинская буква, дальше буквы, цифры, дефис,\n\
+                 подчёркивание; до 31 символа. Имя \"root\" занято.\n\n",
+            );
+            writer.set_color(COLOR_WHITE);
+            continue;
+        }
+
+        writer.write_string("\n  Пароль: ");
+        let p1 = crate::linein::read_line(writer, false);
+        writer.write_string("\n  Пароль ещё раз: ");
+        let p2 = crate::linein::read_line(writer, false);
+        if p1 != p2 {
+            writer.set_color(COLOR_LIGHT_RED);
+            writer.write_string("Пароли не совпадают.\n\n");
+            writer.set_color(COLOR_WHITE);
+            continue;
+        }
+        if !crate::user::password_acceptable(&p1) {
+            writer.set_color(COLOR_LIGHT_RED);
+            writer.write_string("Пароль короче 4 символов.\n\n");
+            writer.set_color(COLOR_WHITE);
+            continue;
+        }
+
+        writer.set_color(COLOR_LIGHT_GREEN);
+        writer.write_string(&alloc::format!(
+            "Готово: будет создан пользователь {} с домашним каталогом /home/{}.\n",
+            name, name
+        ));
+        writer.set_color(COLOR_WHITE);
+        ser(&alloc::format!("account: name={} (password hidden)", name));
+        return Some(NewAccount {
+            name,
+            password: p1,
+        });
+    }
+}
+
+/// Создаёт учётную запись и домашний каталог на смонтированной целевой ФС.
+/// Вызывается из `install_to`, пока цель смонтирована и текущий uid - root.
+fn setup_account(_sb: &crate::vitafs::Superblock, name: &str, password: &str) {
+    match crate::user::add_with_home(name, password) {
+        Ok(acc) => ser(&alloc::format!("account: created {} uid={}", acc.name, acc.uid)),
+        Err(e) => ser(&alloc::format!("account: ERR {}", e)),
+    }
+}
+
 /// Интерактивный сеанс установщика. true - установка выполнена.
 pub fn run(writer: &mut Writer, vfs: &mut Vfs) -> bool {
     let active = blockdev::active();
@@ -342,6 +428,11 @@ pub fn run(writer: &mut Writer, vfs: &mut Vfs) -> bool {
             Key::Enter => {
                 let target = menu.disks[disk_idx].0;
                 let name = menu.disks[disk_idx].1.clone();
+                // Учётную запись спрашиваем до стирания диска: если пароль
+                // не совпадёт, данные на цели останутся нетронутыми.
+                let Some(account) = ask_account(writer) else {
+                    return false;
+                };
                 if !confirm(
                     writer,
                     &alloc::format!("Стереть {} и установить VitaminOS26?", name),
@@ -361,7 +452,7 @@ pub fn run(writer: &mut Writer, vfs: &mut Vfs) -> bool {
                     name,
                     drop.len()
                 ));
-                match install_to(target, &drop) {
+                match install_to(target, &drop, &account.name, &account.password) {
                     Ok(()) => {
                         ser("install: OK");
                         writer.set_color(COLOR_LIGHT_GREEN);

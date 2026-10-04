@@ -319,7 +319,8 @@ fn start_bin_service(name: &str, vfs: Option<&mut Vfs>) -> Option<usize> {
         None => scheduler_with_vfs(|v| v.cat(&path).map(|d| d.to_vec())),
     }?;
     let argv = [path.as_str()];
-    crate::exec::launch_user(name, &code, &argv, 0)
+    // Службы из /etc/rc.conf поднимаются до входа в систему, поэтому от root.
+    crate::exec::launch_user(name, &code, &argv, 0, crate::user::ROOT_UID)
 }
 
 /// Оборачивает VFS-доступ общим локом (безопасно вне шелла и без вложения

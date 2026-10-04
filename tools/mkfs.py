@@ -13,11 +13,14 @@
                  u16 itype | u16 perms | u32 size | u32 links |
                  u32 atime | u32 mtime | u32 device_id |
                  direct[12] @24..72 | indirect1@72 | indirect2@76 | indirect3@80
+                 uid @84..86 (владелец; резерв 86..128)
   блоки 101.. : данные. Дирент = 64 Б: u32 ino | u8 len | имя (58 Б).
 
 Использование: mkfs.py <img> <programs.list>
 где programs.list — строки "имя<TAB>путь-к-elf".
 """
+import hashlib
+import os
 import struct
 import sys
 
@@ -41,6 +44,7 @@ ROOT_INODE = 2
 DIRECT_BLOCKS = 12
 PTRS_PER_BLOCK = BLOCK // 4  # 1024
 KERNEL_NAME = "vitamin_os26.elf"
+FIRST_UID = 1000
 
 TYPE_FILE = 1
 TYPE_DIR = 2
@@ -71,20 +75,23 @@ class FsBuilder:
         self.img[off:off + len(data)] = data
 
     def alloc_inode(self, itype, size, links=1, direct=None, indirect1=0,
-                    ino=None):
+                    ino=None, perms=None, uid=0):
         if ino is None:
             ino = self.next_inode
             self.next_inode += 1
         if ino >= TOTAL_INODES:
             raise SystemExit("иноды закончились")
+        if perms is None:
+            perms = 0o755 if itype == TYPE_DIR else 0o644
         raw = struct.pack(
-            "<HHIIIII", itype, 0o755 if itype == TYPE_DIR else 0o644,
-            size, links, now, now, 0)
+            "<HHIIIII", itype, perms, size, links, now, now, 0)
         d = list(direct or [])
         d += [0] * (DIRECT_BLOCKS - len(d))
         for i, v in enumerate(d[:DIRECT_BLOCKS]):
             raw += struct.pack("<I", v)
         raw += struct.pack("<III", indirect1, 0, 0)
+        # Байты 84..86 - владелец (см. DiskInode::uid в src/vitafs.rs).
+        raw += struct.pack("<H", uid)
         raw += b"\x00" * (INODE_SIZE - len(raw))
         assert len(raw) == INODE_SIZE
         tb_off = (INODE_TABLE_START * BLOCK) + ino * INODE_SIZE
@@ -133,7 +140,7 @@ class FsBuilder:
         return self.alloc_inode(TYPE_FILE, len(content), direct=direct,
                                 indirect1=indirect1, ino=ino)
 
-    def write_dir(self, entries, ino=None):
+    def write_dir(self, entries, ino=None, perms=None, uid=0):
         """entries: [(name, ino)] -> каталог с дирентами по 64 Б."""
         slots_per_block = BLOCK // 64
         blocks = []
@@ -155,10 +162,17 @@ class FsBuilder:
         blocks.append(bytes(cur))
         direct = [self.alloc_data(b) for b in blocks]
         size = (len(blocks) - 1) * slots_per_block * 64 + used * 64
-        return self.alloc_inode(TYPE_DIR, size, direct=direct, ino=ino)
+        return self.alloc_inode(TYPE_DIR, size, direct=direct, ino=ino,
+                                perms=perms, uid=uid)
 
 
-def build_image(img_path, programs, size=IMG_SIZE, kernel=None, installer=False):
+def build_image(img_path, programs, size=IMG_SIZE, kernel=None, installer=False,
+                users=None):
+    """users: [(name, password)] — учётные записи, зашитые прямо в образ.
+
+    Нужны, чтобы собрать «предустановленный» образ: без них система при
+    загрузке не спрашивает пароль (см. login.rs) и работает от root, и
+    проверять вход и права не на чем."""
     global now
     import time
     now = int(time.time()) & 0xFFFFFFFF
@@ -174,10 +188,10 @@ def build_image(img_path, programs, size=IMG_SIZE, kernel=None, installer=False)
     # Нумерация фиксирована: корень обязан быть инодом 2.
     n = len(programs)
     ino_bin, ino_elf_first = 3, 4
-    ino_etc, ino_passwd = 4 + n, 5 + n
-    ino_hostname, ino_rcconf = 6 + n, 7 + n
-    ino_home, ino_tmp, ino_var, ino_log = 8 + n, 9 + n, 10 + n, 11 + n
-    nxt = 12 + n
+    ino_etc, ino_passwd, ino_shadow = 4 + n, 5 + n, 6 + n
+    ino_hostname, ino_rcconf = 7 + n, 8 + n
+    ino_home, ino_tmp, ino_var, ino_log = 9 + n, 10 + n, 11 + n, 12 + n
+    nxt = 13 + n
     ino_boot = ino_kernel = ino_marker = None
     if kernel:
         ino_boot, ino_kernel = nxt, nxt + 1
@@ -195,14 +209,27 @@ def build_image(img_path, programs, size=IMG_SIZE, kernel=None, installer=False)
         bin_entries.append((name, fsb.write_file(name, data,
                                                  ino=ino_elf_first + k)))
 
-    fsb.write_file("passwd", b"", ino=ino_passwd)
+    # Учётные записи: /etc/passwd и /etc/shadow плюс домашний каталог с
+    # владельцем. Формат ровно тот, что читает user.rs: sha256(salt+пароль).
+    passwd_lines, shadow_lines, home_entries = [], [], []
+    fsb.next_inode = nxt
+    for i, (uname, upass) in enumerate(users or []):
+        uid = FIRST_UID + i
+        salt = os.urandom(16).hex()
+        digest = hashlib.sha256((salt + upass).encode()).hexdigest()
+        passwd_lines.append(f"{uname}:{uid}:/home/{uname}\n")
+        shadow_lines.append(f"{uname}:{salt}:{digest}\n")
+        home_entries.append((uname, fsb.alloc_inode(TYPE_DIR, 0, uid=uid)))
+
+    fsb.write_file("passwd", "".join(passwd_lines).encode(), ino=ino_passwd)
+    fsb.write_file("shadow", "".join(shadow_lines).encode(), ino=ino_shadow)
     fsb.write_file("hostname", b"VitaminOS26\n", ino=ino_hostname)
     fsb.write_file("rc.conf", RC_CONF.encode(), ino=ino_rcconf)
     fsb.write_dir([("log", ino_log)], ino=ino_var)
     fsb.write_dir([], ino=ino_log)
 
-    etc_entries = [("passwd", ino_passwd), ("hostname", ino_hostname),
-                   ("rc.conf", ino_rcconf)]
+    etc_entries = [("passwd", ino_passwd), ("shadow", ino_shadow),
+                   ("hostname", ino_hostname), ("rc.conf", ino_rcconf)]
     if installer:
         fsb.write_file("installer", b"1\n", ino=ino_marker)
         etc_entries.append(("installer", ino_marker))
@@ -219,8 +246,10 @@ def build_image(img_path, programs, size=IMG_SIZE, kernel=None, installer=False)
 
     fsb.write_dir(bin_entries, ino=ino_bin)
     fsb.write_dir(etc_entries, ino=ino_etc)
-    fsb.write_dir([], ino=ino_home)
-    fsb.write_dir([], ino=ino_tmp)
+    fsb.write_dir(home_entries, ino=ino_home)
+    # /tmp доступен всем на запись (как /tmp в настоящих системах): иначе
+    # пользователю негде складывать временные файлы.
+    fsb.write_dir([], ino=ino_tmp, perms=0o777)
     fsb.write_dir(root_entries, ino=ROOT_INODE)
 
     # Суперблок - зеркально Superblock::for_image + encode.
@@ -263,7 +292,17 @@ def main():
                    help="ELF ядра -> /boot/" + KERNEL_NAME)
     p.add_argument("--installer", action="store_true",
                    help="добавить маркер /etc/installer")
+    p.add_argument("--user", action="append", default=[], metavar="NAME:PASS",
+                   help="зашить учётную запись (uid %d+); можно указать "
+                        "несколько раз" % FIRST_UID)
     args = p.parse_args()
+
+    users = []
+    for spec in args.user:
+        name, _, password = spec.partition(":")
+        if not name or not password:
+            raise SystemExit("--user ожидает NAME:PASSWORD")
+        users.append((name, password))
 
     programs = []
     with open(args.programs_list) as f:
@@ -275,7 +314,7 @@ def main():
             programs.append((name, path))
 
     build_image(args.img, programs, size=args.size, kernel=args.kernel,
-                installer=args.installer)
+                installer=args.installer, users=users)
 
 
 if __name__ == "__main__":

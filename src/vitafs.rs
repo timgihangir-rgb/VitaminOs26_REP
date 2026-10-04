@@ -587,6 +587,9 @@ pub struct DiskInode {
     pub mtime: u32,
     /// Номер драйвера для chardev/blkdev.
     pub device_id: u32,
+    /// Владелец файла. Права на запись проверяются по нему, поэтому uid 0
+    /// означает "системный файл, обычному пользователю не писать".
+    pub uid: u16,
     /// Быстрый симлинк: цель в области указателей (24..84), как в ext2.
     pub target: [u8; SYMLINK_MAX],
     pub direct: [u32; DIRECT_BLOCKS],
@@ -606,6 +609,7 @@ impl DiskInode {
             atime: 0,
             mtime: 0,
             device_id: 0,
+            uid: 0,
             target: [0; SYMLINK_MAX],
             direct: [0; DIRECT_BLOCKS],
             indirect1: 0,
@@ -640,6 +644,7 @@ impl DiskInode {
             atime: g32(12),
             mtime: g32(16),
             device_id: g32(20),
+            uid: g16(84),
             target,
             direct,
             indirect1: g32(72),
@@ -682,6 +687,9 @@ impl DiskInode {
         out[72..76].copy_from_slice(&self.indirect1.to_le_bytes());
         out[76..80].copy_from_slice(&self.indirect2.to_le_bytes());
         out[80..84].copy_from_slice(&self.indirect3.to_le_bytes());
+        // Байты 84..128 были незанятым резервом: туда лег uid. Старые образы
+        // там нули, то есть читаются как принадлежащие root.
+        out[84..86].copy_from_slice(&self.uid.to_le_bytes());
         // Цель симлинка живёт в той же области, что и указатели (union).
         if self.itype == TYPE_SYMLINK {
             out[24..24 + SYMLINK_MAX].copy_from_slice(&self.target);
@@ -932,6 +940,7 @@ static mut ITABLE: [IEntry; INODE_CACHE_SLOTS] = [IEntry {
         atime: 0,
         mtime: 0,
         device_id: 0,
+        uid: 0,
         target: [0; SYMLINK_MAX],
         direct: [0; DIRECT_BLOCKS],
         indirect1: 0,
@@ -1105,6 +1114,26 @@ pub fn iput(_sb: &Superblock, ino: u32, node: &DiskInode) -> bool {
         e.stamp = itick();
         true
     })
+}
+
+/// Меняет владельца узла (uid в свободных байтах 84..86 инода).
+pub fn set_owner(sb: &Superblock, ino: u32, uid: u16) -> bool {
+    let mut node = match iget(sb, ino) {
+        Some(n) => n,
+        None => return false,
+    };
+    node.uid = uid;
+    iput(sb, ino, &node)
+}
+
+/// Меняет биты прав узла (поле perms, offset 2).
+pub fn set_perms(sb: &Superblock, ino: u32, perms: u16) -> bool {
+    let mut node = match iget(sb, ino) {
+        Some(n) => n,
+        None => return false,
+    };
+    node.perms = perms & 0o7777;
+    iput(sb, ino, &node)
 }
 
 /// Полная синхронизация: inode-кэш -> bcache -> диск.
@@ -1635,6 +1664,7 @@ pub fn format_image() -> bool {
         atime: now,
         mtime: now,
         device_id: 0,
+        uid: 0,
         direct: [0; DIRECT_BLOCKS],
         indirect1: 0,
         indirect2: 0,
@@ -1830,6 +1860,18 @@ pub fn file_write_all(sb: &Superblock, ino: u32, data: &[u8]) -> bool {
 /// Создаёт узел (файл/каталог) в каталоге parent_dir. Дубликаты запрещены.
 /// Возвращает номер нового inode.
 pub fn create_node(sb: &Superblock, parent_dir: u32, name: &str, itype: u16) -> Option<u32> {
+    create_node_as(sb, parent_dir, name, itype, crate::user::current_uid())
+}
+
+/// Как `create_node`, но с явным владельцем: вызывающий код (установщик,
+/// chown-подобные операции) задаёт uid сам.
+pub fn create_node_as(
+    sb: &Superblock,
+    parent_dir: u32,
+    name: &str,
+    itype: u16,
+    uid: u16,
+) -> Option<u32> {
     if dir_lookup(sb, parent_dir, name).is_some() {
         return None;
     }
@@ -1843,6 +1885,7 @@ pub fn create_node(sb: &Superblock, parent_dir: u32, name: &str, itype: u16) -> 
         atime: now,
         mtime: now,
         device_id: 0,
+        uid,
         direct: [0; DIRECT_BLOCKS],
         indirect1: 0,
         indirect2: 0,
@@ -1964,6 +2007,7 @@ pub fn fileops_selftest_disk() -> bool {
             atime: now,
             mtime: now,
             device_id: 0,
+            uid: 0,
             direct: [0; DIRECT_BLOCKS],
             indirect1: 0,
             indirect2: 0,

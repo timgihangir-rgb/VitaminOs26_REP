@@ -21,6 +21,18 @@ pub const NET_SEND_PTR: usize = 0x7848;
 pub const NET_RECV_PTR: usize = 0x7850;
 pub const NET_CLOSE_PTR: usize = 0x7858;
 pub const NET_RESOLVE_PTR: usize = 0x7860;
+pub const AUTH_PTR: usize = 0x7868;
+pub const GETUID_PTR: usize = 0x7870;
+pub const WHOAMI_PTR: usize = 0x7878;
+pub const USERADD_PTR: usize = 0x7880;
+pub const USERDEL_PTR: usize = 0x7888;
+pub const EXEC_PTR: usize = 0x7890;
+pub const WAIT_PTR: usize = 0x7898;
+
+/// Слот кода возврата программы (int32). Программа записывает его перед
+/// выходом; шелл читает после её завершения. Изначально ноль, так что
+/// программа, ничего не записавшая, возвращает "успех".
+pub const EXIT_CODE: usize = 0x7098;
 
 pub const EXIT_STUB: usize = 0x7100;
 pub const TICKS_STUB: usize = 0x7110;
@@ -36,6 +48,13 @@ pub const NET_SEND_STUB: usize = 0x7188;
 pub const NET_RECV_STUB: usize = 0x7190;
 pub const NET_CLOSE_STUB: usize = 0x7198;
 pub const NET_RESOLVE_STUB: usize = 0x71A0;
+pub const AUTH_STUB: usize = 0x71B0;
+pub const GETUID_STUB: usize = 0x71C0;
+pub const WHOAMI_STUB: usize = 0x71D0;
+pub const USERADD_STUB: usize = 0x71E0;
+pub const USERDEL_STUB: usize = 0x71F0;
+pub const EXEC_STUB: usize = 0x7200;
+pub const WAIT_STUB: usize = 0x7210;
 
 const SYS_TICKS: usize = 0;
 const SYS_HLT: usize = 1;
@@ -51,6 +70,13 @@ const SYS_NET_SEND: usize = 10;
 const SYS_NET_RECV: usize = 11;
 const SYS_NET_CLOSE: usize = 12;
 const SYS_NET_RESOLVE: usize = 13;
+const SYS_AUTH: usize = 14;
+const SYS_GETUID: usize = 15;
+const SYS_WHOAMI: usize = 16;
+const SYS_USERADD: usize = 17;
+const SYS_USERDEL: usize = 18;
+const SYS_EXEC: usize = 19;
+const SYS_WAIT: usize = 20;
 
 fn store_pointer(at: usize, f: usize) {
     unsafe {
@@ -94,6 +120,13 @@ pub fn install() {
     write_stub(NET_RECV_STUB, SYS_NET_RECV, true);
     write_stub(NET_CLOSE_STUB, SYS_NET_CLOSE, true);
     write_stub(NET_RESOLVE_STUB, SYS_NET_RESOLVE, true);
+    write_stub(AUTH_STUB, SYS_AUTH, true);
+    write_stub(GETUID_STUB, SYS_GETUID, true);
+    write_stub(WHOAMI_STUB, SYS_WHOAMI, true);
+    write_stub(USERADD_STUB, SYS_USERADD, true);
+    write_stub(USERDEL_STUB, SYS_USERDEL, true);
+    write_stub(EXEC_STUB, SYS_EXEC, true);
+    write_stub(WAIT_STUB, SYS_WAIT, true);
 
     store_pointer(TICKS_PTR, TICKS_STUB);
     store_pointer(HLT_PTR, HLT_STUB);
@@ -108,4 +141,11 @@ pub fn install() {
     store_pointer(NET_RECV_PTR, NET_RECV_STUB);
     store_pointer(NET_CLOSE_PTR, NET_CLOSE_STUB);
     store_pointer(NET_RESOLVE_PTR, NET_RESOLVE_STUB);
+    store_pointer(AUTH_PTR, AUTH_STUB);
+    store_pointer(GETUID_PTR, GETUID_STUB);
+    store_pointer(WHOAMI_PTR, WHOAMI_STUB);
+    store_pointer(USERADD_PTR, USERADD_STUB);
+    store_pointer(USERDEL_PTR, USERDEL_STUB);
+    store_pointer(EXEC_PTR, EXEC_STUB);
+    store_pointer(WAIT_PTR, WAIT_STUB);
 }

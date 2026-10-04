@@ -22,6 +22,8 @@ mod init;
 mod install;
 mod interrupts;
 mod keyboard;
+mod linein;
+mod login;
 mod memory;
 mod net;
 mod paging;
@@ -32,6 +34,7 @@ mod progabi;
 mod ralloc;
 mod rtc;
 mod scheduler;
+mod sha256;
 mod shell;
 mod splash;
 mod syscall;
@@ -39,6 +42,7 @@ mod sysinfo;
 mod tasks;
 mod top;
 mod usb;
+mod user;
 mod vfs;
 mod vga;
 mod vitafs;
@@ -159,15 +163,37 @@ pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
         let _ = scheduler::spawn(
             "fbflush",
             alloc::boxed::Box::new(|| loop {
-                scheduler::sleep_until(scheduler::ticks() + 2);
+                // Рисуем сразу, спим после: иначе между появлением текста в
+                // буфере и его отрисовкой проходит лишний тик, и большой
+                // вывод ложится на экран заметными ступеньками.
                 fb::tick();
+                scheduler::sleep_until(scheduler::ticks() + 1);
             }),
         );
         crate::vga::serial_write_atomic("[M] fb compositor task started\n");
     }
 
+    // Загрузочный экран держим до Enter: иначе логотип и статусы подсистем
+    // не успевают отрисоваться композитором и проскакивают за один кадр.
     splash::wait_enter(&mut writer);
     splash::finish(&mut writer);
+    // Вход в систему. Пока учётных записей нет (live-образ, свежий диск),
+    // login::login пропускает запрос и работаем от root; на установленной
+    // системе без верного пароля шелл не запускается вовсе.
+    match login::login(&mut writer) {
+        login::Outcome::LoggedIn(account) => {
+            // Рабочий каталог - домашний. Если его нет (удалённая запись в
+            // passwd), остаёмся в корне, а не падаем.
+            vfs.cd(&account.home);
+        }
+        login::Outcome::NoAccounts => {}
+        login::Outcome::Failed => {
+            // Пароль не введён - система остаётся закрытой. Шелл не запускаем:
+            // иначе несколько нажатий Enter дали бы полный доступ.
+            writer.write_string("\nSystem halted: no login.\n");
+            halt_loop();
+        }
+    }
     // Рабочие столы поднимаются до шелла: основной шелл — это стол 0, и его
     // экран уже на дисплее, остальные стартуют приостановленными.
     desk::boot(mem, &mut vfs);

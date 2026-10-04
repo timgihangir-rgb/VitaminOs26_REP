@@ -5,6 +5,41 @@ use crate::sysinfo;
 use crate::vfs::Vfs;
 use crate::vga::{COLOR_DARK_GREY, COLOR_LIGHT_CYAN, COLOR_LIGHT_GREEN, COLOR_WHITE, Writer};
 use alloc::vec::Vec;
+/// Восьмеричное число из строки ("755" -> 0o755). None, если в строке есть
+/// что-то кроме цифр 0..7.
+fn parse_octal(s: &str) -> Option<u16> {
+    if s.is_empty() || s.len() > 6 {
+        return None;
+    }
+    let mut v: u16 = 0;
+    for b in s.bytes() {
+        if !(b'0'..=b'7').contains(&b) {
+            return None;
+        }
+        v = v.checked_mul(8)?.checked_add((b - b'0') as u16)?;
+    }
+    Some(v)
+}
+
+/// Отказ команды. Отказ по правам отличаем от прочих ошибок: «permission
+/// denied» прямо подсказывает, что поможет sudo, а «no such file» - про
+/// другое, и смешивать их в одну формулировку незачем.
+fn refused(writer: &mut crate::vga::Writer, cmd: &str, action: &str, detail: &str) {
+    if crate::vfs::permission_denied() {
+        writer.write_string(cmd);
+        writer.write_string(": permission denied: ");
+        writer.write_string(detail);
+        writer.write_string("\n");
+    } else {
+        writer.write_string(cmd);
+        writer.write_string(": cannot ");
+        writer.write_string(action);
+        writer.write_string(" '");
+        writer.write_string(detail);
+        writer.write_string("'\n");
+    }
+}
+
 pub fn run_shell(
     writer: &mut Writer,
     mem: sysinfo::MemInfo,
@@ -25,6 +60,11 @@ pub fn run_shell(
         writer.write_string("vitamin_os26");
         writer.set_color(COLOR_WHITE);
         writer.write_string(":");
+        // Кто вошёл: иначе в приглашении не видно, под кем идёт работа.
+        writer.set_color(COLOR_LIGHT_GREEN);
+        writer.write_string(crate::user::current_name().as_str());
+        writer.set_color(COLOR_WHITE);
+        writer.write_string("@");
         writer.set_color(COLOR_LIGHT_CYAN);
         writer.write_string(vfs.pwd().as_str());
         writer.set_color(COLOR_WHITE);
@@ -108,6 +148,52 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
                 i += 1;
             }
         }
+    }
+
+    // sudo <команда>. Пароль проверяет настоящая программа /bin/sudo (она
+    // одна умеет спросить пароль и не может быть подменена: /bin принадлежит
+    // root), а сама команда выполняется уже с правами root.
+    //
+    // Права поднимаются на время одной команды и возвращаются обратно. Так
+    // работают и встроенные команды шелла (ls, rm, cp), которых в /bin нет,
+    // и настоящие программы (/bin/adduser) — последние дополнительно
+    // запускаются от uid 0 через exec::run_program.
+    if let ["sudo", rest @ ..] = args.as_slice() {
+        if rest.is_empty() {
+            writer.write_string("usage: sudo <command> [arguments...]\n");
+            return false;
+        }
+        // Редиректы разобраны выше; собираем внутреннюю команду заново,
+        // операторы можно поставить в конец - порядок для них безразличен.
+        let mut inner: Vec<&str> = rest.to_vec();
+        if let Some(f) = out_overwrite {
+            inner.push(">");
+            inner.push(f);
+        }
+        if let Some(f) = out_append {
+            inner.push(">>");
+            inner.push(f);
+        }
+        if let Some(f) = in_file {
+            inner.push("<");
+            inner.push(f);
+        }
+        // -v: только спросить пароль (sudo -v), без запуска команды.
+        let asked = exec::run_program(writer, &["sudo", "-v"], mem);
+        if !asked {
+            writer.write_string("sudo: cannot run /bin/sudo\n");
+            return false;
+        }
+        if exec::last_exit_code() != 0 {
+            return false;
+        }
+        let saved = crate::user::current_uid();
+        crate::user::set_current_uid(crate::user::ROOT_UID);
+        let ok = run_one(inner.as_slice(), writer, mem, vfs);
+        crate::user::set_current_uid(saved);
+        let _g = crate::scheduler::vfs_lock();
+        crate::vitafs::sync_all();
+        return ok;
     }
 
     // Foreground-программы (`run X` и неизвестные команды) исполняются БЕЗ
@@ -215,56 +301,60 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
         }
         ["mkdir", dirs @ ..] => {
             for dir in dirs {
-                if let Err(_) = fs::make_directory(vfs, dir) {
-                    writer.write_string("mkdir: cannot create directory '");
-                    writer.write_string(dir);
-                    writer.write_string("'\n");
+                if fs::make_directory(vfs, dir).is_err() {
+                    refused(writer, "mkdir", "create directory", dir);
                 }
             }
         }
         ["rmdir", dirs @ ..] => {
             for dir in dirs {
-                if let Err(_) = fs::remove_directory(vfs, dir) {
-                    writer.write_string("rmdir: failed to remove '");
-                    writer.write_string(dir);
-                    writer.write_string("'\n");
+                if fs::remove_directory(vfs, dir).is_err() {
+                    refused(writer, "rmdir", "remove directory", dir);
                 }
             }
         }
         ["touch", files @ ..] => {
             for file in files {
-                if let Err(_) = fs::create_file(vfs, file) {
-                    writer.write_string("touch: cannot touch '");
-                    writer.write_string(file);
-                    writer.write_string("'\n");
+                if fs::create_file(vfs, file).is_err() {
+                    refused(writer, "touch", "touch", file);
                 }
             }
         }
         ["rm", files @ ..] => {
             for file in files {
-                if let Err(_) = fs::remove_file(vfs, file) {
-                    writer.write_string("rm: cannot remove '");
-                    writer.write_string(file);
-                    writer.write_string("'\n");
+                if fs::remove_file(vfs, file).is_err() {
+                    refused(writer, "rm", "remove", file);
                 }
             }
         }
         ["cp", src, dst] => {
-            if let Err(_) = vfs.copy(src, dst) {
-                writer.write_string("cp: cannot copy '");
-                writer.write_string(src);
-                writer.write_string("' to '");
-                writer.write_string(dst);
-                writer.write_string("'\n");
+            if vfs.copy(src, dst).is_err() {
+                if crate::vfs::permission_denied() {
+                    writer.write_string("cp: permission denied: ");
+                    writer.write_string(src);
+                    writer.write_string("\n");
+                } else {
+                    writer.write_string("cp: cannot copy '");
+                    writer.write_string(src);
+                    writer.write_string("' to '");
+                    writer.write_string(dst);
+                    writer.write_string("'\n");
+                }
             }
         }
         ["mv", src, dst] => {
-            if let Err(_) = vfs.mv(src, dst) {
-                writer.write_string("mv: cannot move '");
-                writer.write_string(src);
-                writer.write_string("' to '");
-                writer.write_string(dst);
-                writer.write_string("'\n");
+            if vfs.mv(src, dst).is_err() {
+                if crate::vfs::permission_denied() {
+                    writer.write_string("mv: permission denied: ");
+                    writer.write_string(src);
+                    writer.write_string("\n");
+                } else {
+                    writer.write_string("mv: cannot move '");
+                    writer.write_string(src);
+                    writer.write_string("' to '");
+                    writer.write_string(dst);
+                    writer.write_string("'\n");
+                }
             }
         }
         ["find", name] => {
@@ -290,7 +380,7 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
                     vfs.write_file(file, msg.as_bytes())
                 };
                 if res.is_err() {
-                    writer.write_string("echo: write failed\n");
+                    refused(writer, "echo", "write to", file);
                 }
             } else {
                 writer.write_string(&rest.join(" "));
@@ -326,7 +416,7 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
                         vfs.write_file(out_path, &out_data)
                     };
                     if res.is_err() {
-                        writer.write_string("cat: write failed\n");
+                        refused(writer, "cat", "write to", out_path);
                     }
                 }
             } else {
@@ -357,11 +447,38 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
             crate::init::cmd(writer, vfs, sub);
         }
         ["ln", "-s", target, link] => {
-            match vfs.symlink(target, link) {
-                Ok(()) => {}
-                Err(()) => writer.write_string("ln: cannot create symlink\n"),
+            if vfs.symlink(target, link).is_err() {
+                refused(writer, "ln", "create symlink", link);
             }
         }
+        ["whoami"] => {
+            writer.write_string(crate::user::current_name().as_str());
+            writer.write_string("\n");
+        }
+        ["id"] => {
+            let uid = crate::user::current_uid();
+            writer.write_string(&alloc::format!(
+                "uid={} ({})\n",
+                uid,
+                crate::user::current_name()
+            ));
+        }
+        ["chown", path, uid] => match uid.parse::<u16>() {
+            Ok(u) => {
+                if vfs.chown(path, u).is_err() {
+                    refused(writer, "chown", "change owner of", path);
+                }
+            }
+            Err(_) => writer.write_string("chown: uid must be a number\n"),
+        },
+        ["chmod", path, mode] => match parse_octal(mode) {
+            Some(m) => {
+                if vfs.chmod(path, m).is_err() {
+                    refused(writer, "chmod", "change mode of", path);
+                }
+            }
+            None => writer.write_string("chmod: mode must be octal, e.g. 755\n"),
+        },
         ["chroot", path] => {
             if vfs.chroot(path) {
                 writer.write_string("chroot: new root is ");
@@ -519,7 +636,8 @@ fn bg_task(writer: &mut Writer, name: &str, args: &[&str]) {
         crate::net::tcp_reset();
         crate::progabi::install();
         let argv = [binpath.as_str()];
-        match crate::exec::launch_user(name, &code, &argv, 0) {
+        let uid = crate::user::current_uid();
+        match crate::exec::launch_user(name, &code, &argv, 0, uid) {
             Some(pid) => {
                 writer.write_string("Started background task ");
                 writer.write_string(name);

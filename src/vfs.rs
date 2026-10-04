@@ -13,8 +13,92 @@
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::vitafs;
+
+// ─── Права доступа ────────────────────────────────────────────────────────
+//
+// Каталоги и файлы несут владельца (inode.uid) и девять бит прав, как в
+// настоящей Unix-системе: биты владельца для хозяина файла, биты остальных
+// для всех прочих. Отдельных групп нет - их не просил��, да и края пока не
+// нужны. Права на каталог означают:
+//
+//   r  перечислить содержимое
+//   w  создавать и удалять внутри
+//   x  заходить внутрь (достаточно, чтобы дойти до вложенных имён)
+//
+// uid 0 (root) проходит мимо всех проверок: это делает установку и загрузку
+// простыми, а ограничение остаётся там, где оно нужно, - у обычного
+// пользователя.
+//
+// Ошибки различаем только в одном смысле: «нет прав» против прочих. Шеллу
+// нужно сказать «permission denied», остальное у него и так звучит одинаково
+// («not found», «is a directory»), и разбирать это должен пользователь, а не
+// ядро.
+
+const P_R: u16 = 4;
+const P_W: u16 = 2;
+const P_X: u16 = 1;
+
+/// Последняя ошибка доступа: 0 - нет, 1 - прав не хватило.
+static LAST_DENIED: AtomicU8 = AtomicU8::new(0);
+
+/// Сбрасывает флаг перед новой операцией.
+fn clear_denied() {
+    LAST_DENIED.store(0, Ordering::Relaxed);
+}
+
+/// Помечает операцию как отказ по правам.
+fn deny() {
+    LAST_DENIED.store(1, Ordering::Relaxed);
+}
+
+/// Отказала ли последняя операция по правам (для вывода в шелле).
+pub fn permission_denied() -> bool {
+    LAST_DENIED.load(Ordering::Relaxed) != 0
+}
+
+/// Какие биты применимы к пользователю uid на узле node: владельческие,
+/// если он хозяин, иначе чужие. root получает полный набор.
+fn bits(node: &vitafs::DiskInode, uid: u16) -> u16 {
+    if uid == crate::user::ROOT_UID {
+        return 0o7;
+    }
+    if node.uid == uid {
+        (node.perms >> 6) & 0o7
+    } else {
+        node.perms & 0o7
+    }
+}
+
+/// Есть ли у пользователя все запрошенные права на узел.
+fn allows(node: &vitafs::DiskInode, uid: u16, want: u16) -> bool {
+    bits(node, uid) & want == want
+}
+
+/// Проверка одного узла: при нехватке права помечает операцию как отказ.
+fn check(node: &vitafs::DiskInode, uid: u16, want: u16) -> bool {
+    if allows(node, uid, want) {
+        true
+    } else {
+        deny();
+        false
+    }
+}
+
+/// Права на узел по номеру инода; отсутствующий узел - тоже отказ.
+fn check_ino(sb: &vitafs::Superblock, ino: u32, uid: u16, want: u16) -> bool {
+    match vitafs::iget(sb, ino) {
+        Some(n) => check(&n, uid, want),
+        None => false,
+    }
+}
+
+/// Можно ли пользователю создавать/удалять записи в каталоге parent.
+fn check_dir_writable(sb: &vitafs::Superblock, parent: u32, uid: u16) -> bool {
+    check_ino(sb, parent, uid, P_W | P_X)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EntryType {
@@ -112,6 +196,12 @@ impl Vfs {
         let mut i = 0usize;
         while i < queue.len() {
             let parent = *chain.last()?;
+            // Заход в каталог требует права x: без него имя не видно.
+            // Проверяем на каждом шаге, поэтому "запрещено заходить" работает
+            // и для промежуточных каталогов, и для последнего.
+            if !check_ino(sb, parent, crate::user::current_uid(), P_X) {
+                return None;
+            }
             let child = vitafs::dir_lookup(sb, parent, &queue[i])?;
             let node = vitafs::iget(sb, child)?;
             if node.itype == vitafs::TYPE_SYMLINK {
@@ -202,7 +292,7 @@ impl Vfs {
         };
         if let Some((ino, _)) = Self::walk(&parts) {
             match vitafs::iget(sb, ino) {
-                Some(n) if n.itype == vitafs::TYPE_DIR => {
+                Some(n) if n.itype == vitafs::TYPE_DIR && allows(&n, crate::user::current_uid(), P_X) => {
                     self.root = Self::parts_to_path(&parts);
                     self.cwd = "/".to_string();
                     true
@@ -246,9 +336,13 @@ impl Vfs {
     /// Создаёт спецфайл устройства (TYPE_CHARDEV). Имя последней компоненты
     /// обязано быть зарегистрированным устройством.
     pub fn mknod(&mut self, path: &str) -> Result<(), ()> {
+        clear_denied();
         wal_txn(|| {
             let sb = vitafs::mounted_sb().ok_or(())?;
             let (parent, name) = self.split_parent(path).ok_or(())?;
+            if !check_dir_writable(sb, parent, crate::user::current_uid()) {
+                return Err(());
+            }
             let id = crate::devices::dev_id(&name).ok_or(())?;
             if let Some(existing) = vitafs::dir_lookup(sb, parent, &name) {
                 // Уже есть. Если это корректный chardev - успех; иначе
@@ -274,9 +368,13 @@ impl Vfs {
 
     /// Создаёт симлинк link_path -> target (fast-symlink, цель в иноде).
     pub fn symlink(&mut self, target: &str, link_path: &str) -> Result<(), ()> {
+        clear_denied();
         wal_txn(|| {
             let sb = vitafs::mounted_sb().ok_or(())?;
             let (parent, name) = self.split_parent(link_path).ok_or(())?;
+            if !check_dir_writable(sb, parent, crate::user::current_uid()) {
+                return Err(());
+            }
             if vitafs::dir_lookup(sb, parent, &name).is_some() {
                 return Err(());
             }
@@ -301,10 +399,14 @@ impl Vfs {
     }
 
     pub fn ls(&self, path: &str) -> Option<Vec<(String, EntryType, usize)>> {
+        clear_denied();
         let sb = vitafs::mounted_sb()?;
         let ino = self.resolve(path)?;
         let node = vitafs::iget(sb, ino)?;
         if node.itype != vitafs::TYPE_DIR {
+            return None;
+        }
+        if !check(&node, crate::user::current_uid(), P_R) {
             return None;
         }
         let entries = vitafs::dir_readdir(sb, ino)?;
@@ -323,6 +425,7 @@ impl Vfs {
     }
 
     pub fn cd(&mut self, path: &str) -> bool {
+        clear_denied();
         let parts = match self.canon_parts(path) {
             Some(p) => p,
             None => return false,
@@ -333,7 +436,7 @@ impl Vfs {
         };
         if let Some((ino, _)) = Self::walk(&parts) {
             match vitafs::iget(sb, ino) {
-                Some(n) if n.itype == vitafs::TYPE_DIR => {
+                Some(n) if n.itype == vitafs::TYPE_DIR && allows(&n, crate::user::current_uid(), P_X) => {
                     self.cwd = Self::parts_to_path(&parts);
                     return true;
                 }
@@ -344,18 +447,26 @@ impl Vfs {
     }
 
     pub fn mkdir(&mut self, path: &str) -> Result<(), ()> {
+        clear_denied();
         wal_txn(|| {
             let sb = vitafs::mounted_sb().ok_or(())?;
             let (parent, name) = self.split_parent(path).ok_or(())?;
+            if !check_dir_writable(sb, parent, crate::user::current_uid()) {
+                return Err(());
+            }
             vitafs::create_node(sb, parent, &name, vitafs::TYPE_DIR).ok_or(())?;
             Ok(())
         })
     }
 
     pub fn rmdir(&mut self, path: &str) -> Result<(), ()> {
+        clear_denied();
         wal_txn(|| {
             let sb = vitafs::mounted_sb().ok_or(())?;
             let (parent, name) = self.split_parent(path).ok_or(())?;
+            if !check_dir_writable(sb, parent, crate::user::current_uid()) {
+                return Err(());
+            }
             if vitafs::destroy_node(sb, parent, &name, vitafs::TYPE_DIR) {
                 Ok(())
             } else {
@@ -365,13 +476,19 @@ impl Vfs {
     }
 
     pub fn touch(&mut self, path: &str) -> Result<(), ()> {
+        clear_denied();
         wal_txn(|| {
             let sb = vitafs::mounted_sb().ok_or(())?;
             let (parent, name) = self.split_parent(path).ok_or(())?;
+            if !check_dir_writable(sb, parent, crate::user::current_uid()) {
+                return Err(());
+            }
             if let Some(existing) = vitafs::dir_lookup(sb, parent, &name) {
                 // Настоящий touch не стирает содержимое существующего файла.
                 return match vitafs::iget(sb, existing) {
-                    Some(n) if n.itype == vitafs::TYPE_FILE => Ok(()),
+                    Some(n) if n.itype == vitafs::TYPE_FILE => {
+                        if check(&n, crate::user::current_uid(), P_W) { Ok(()) } else { Err(()) }
+                    }
                     _ => Err(()),
                 };
             }
@@ -381,9 +498,13 @@ impl Vfs {
     }
 
     pub fn rm(&mut self, path: &str) -> Result<(), ()> {
+        clear_denied();
         wal_txn(|| {
             let sb = vitafs::mounted_sb().ok_or(())?;
             let (parent, name) = self.split_parent(path).ok_or(())?;
+            if !check_dir_writable(sb, parent, crate::user::current_uid()) {
+                return Err(());
+            }
             // Файл, спецфайл или симлинк - сносим любой не-каталог.
             if vitafs::destroy_node(sb, parent, &name, vitafs::TYPE_FILE)
                 || vitafs::destroy_node(sb, parent, &name, vitafs::TYPE_CHARDEV)
@@ -397,9 +518,13 @@ impl Vfs {
     }
 
     pub fn cat(&self, path: &str) -> Option<Vec<u8>> {
+        clear_denied();
         let sb = vitafs::mounted_sb()?;
         let (ino, name) = self.resolve_named(path)?;
         let node = vitafs::iget(sb, ino)?;
+        if !check(&node, crate::user::current_uid(), P_R) {
+            return None;
+        }
         match node.itype {
             vitafs::TYPE_FILE => vitafs::file_read_all(sb, ino),
             // Спецфайлы: содержимое генерирует драйвер по имени устройства.
@@ -409,14 +534,21 @@ impl Vfs {
     }
 
     pub fn write_file(&mut self, path: &str, data: &[u8]) -> Result<(), ()> {
+        clear_denied();
         wal_txn(|| {
             let sb = vitafs::mounted_sb().ok_or(())?;
             let (parent, name) = self.split_parent(path).ok_or(())?;
+            if !check_dir_writable(sb, parent, crate::user::current_uid()) {
+                return Err(());
+            }
             match vitafs::dir_lookup(sb, parent, &name) {
                 Some(existing) => {
                     let node = vitafs::iget(sb, existing).ok_or(())?;
                     match node.itype {
                         vitafs::TYPE_FILE => {
+                            if !check(&node, crate::user::current_uid(), P_W) {
+                                return Err(());
+                            }
                             if !vitafs::file_write_all(sb, existing, data) {
                                 return Err(());
                             }
@@ -444,8 +576,12 @@ impl Vfs {
 
     /// Дозаписывает данные в конец файла (создаёт файл, если его нет).
     pub fn append(&mut self, path: &str, data: &[u8]) -> Result<(), ()> {
+        clear_denied();
         wal_txn(|| {
             let mut existing = self.cat(path).unwrap_or_default();
+            if permission_denied() && self.resolve(path).is_some() {
+                return Err(());
+            }
             existing.extend_from_slice(data);
             self.write_file(path, &existing)
         })
@@ -457,6 +593,7 @@ impl Vfs {
     /// с сохранением своего имени. Если по целевому пути уже лежит файл —
     /// он перезаписывается (только файл поверх файла).
     pub fn copy(&mut self, src: &str, dst: &str) -> Result<(), ()> {
+        clear_denied();
         wal_txn(|| self.copy_inner(src, dst))
     }
 
@@ -465,6 +602,9 @@ impl Vfs {
         let src_parts = self.canon_parts(src).ok_or(())?;
         let src_ino = Self::walk(&src_parts).ok_or(())?.0;
         let src_node = vitafs::iget(sb, src_ino).ok_or(())?;
+        if !check(&src_node, crate::user::current_uid(), P_R) {
+            return Err(());
+        }
 
         // Куда именно копируем: либо dst как есть, либо внутрь каталога dst.
         let mut dst_parts = self.canon_parts(dst).ok_or(())?;
@@ -484,11 +624,17 @@ impl Vfs {
         let (dst_parent_ino, _) =
             Self::walk(&dst_parts[..dst_parts.len() - 1]).ok_or(())?;
         let dst_name = dst_parts.last().ok_or(())?.clone();
+        if !check_dir_writable(sb, dst_parent_ino, crate::user::current_uid()) {
+            return Err(());
+        }
 
         if let Some(target) = vitafs::dir_lookup(sb, dst_parent_ino, &dst_name) {
             // Разрешена только замена файла файлом.
             let tnode = vitafs::iget(sb, target).ok_or(())?;
             if tnode.itype != vitafs::TYPE_FILE || src_node.itype != vitafs::TYPE_FILE {
+                return Err(());
+            }
+            if !check(&tnode, crate::user::current_uid(), P_W) {
                 return Err(());
             }
             let data = vitafs::file_read_all(sb, src_ino).ok_or(())?;
@@ -508,6 +654,7 @@ impl Vfs {
     /// с сохранением своего имени. Файл-цель перезаписывается, директория-цель
     /// не трогается.
     pub fn mv(&mut self, src: &str, dst: &str) -> Result<(), ()> {
+        clear_denied();
         wal_txn(|| self.mv_inner(src, dst))
     }
 
@@ -517,6 +664,9 @@ impl Vfs {
         let (src_ino, chain) = Self::walk(&src_parts).ok_or(())?;
         let src_node = vitafs::iget(sb, src_ino).ok_or(())?;
         let src_parent_ino = *chain.get(chain.len() - 2).ok_or(())?;
+        if !check_dir_writable(sb, src_parent_ino, crate::user::current_uid()) {
+            return Err(());
+        }
 
         let mut dst_parts = self.canon_parts(dst).ok_or(())?;
         if let Some((dst_ino, _)) = Self::walk(&dst_parts) {
@@ -539,6 +689,9 @@ impl Vfs {
         let (dst_parent_ino, _) =
             Self::walk(&dst_parts[..dst_parts.len() - 1]).ok_or(())?;
         let dst_name = dst_parts.last().ok_or(())?.clone();
+        if !check_dir_writable(sb, dst_parent_ino, crate::user::current_uid()) {
+            return Err(());
+        }
 
         // Цель-файл перезаписывается, цель-каталог блокирует перемещение.
         if let Some(target) = vitafs::dir_lookup(sb, dst_parent_ino, &dst_name) {
@@ -571,12 +724,48 @@ impl Vfs {
         Ok(())
     }
 
+    /// Меняет владельца узла. Только root: смена владельца - привилегия
+    /// администратора, иначе пользователь просто отдал бы чужой файл себе.
+    pub fn chown(&mut self, path: &str, uid: u16) -> Result<(), ()> {
+        clear_denied();
+        if crate::user::current_uid() != crate::user::ROOT_UID {
+            deny();
+            return Err(());
+        }
+        let sb = vitafs::mounted_sb().ok_or(())?;
+        let ino = self.resolve(path).ok_or(())?;
+        if vitafs::set_owner(sb, ino, uid) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    /// Меняет биты прав узла (chmod). Только root.
+    pub fn chmod(&mut self, path: &str, perms: u16) -> Result<(), ()> {
+        clear_denied();
+        if crate::user::current_uid() != crate::user::ROOT_UID {
+            deny();
+            return Err(());
+        }
+        let sb = vitafs::mounted_sb().ok_or(())?;
+        let ino = self.resolve(path).ok_or(())?;
+        if vitafs::set_perms(sb, ino, perms) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
     /// Ищет по всему диску (рекурсивно от корня) все файлы и директории
     /// с именем `name` и возвращает их полные пути.
     pub fn find(&self, name: &str) -> Vec<String> {
+        clear_denied();
         let mut out = Vec::new();
         if let Some(sb) = vitafs::mounted_sb() {
-            find_from(sb, vitafs::ROOT_INODE, "", name, &mut out);
+            // find не отказывает целиком: каталог, в который не пускают,
+            // просто пропускается (нечего искать там, куда нельзя войти).
+            find_from(sb, vitafs::ROOT_INODE, "", name, crate::user::current_uid(), &mut out);
         }
         out
     }
@@ -630,7 +819,14 @@ fn copy_tree(sb: &vitafs::Superblock, src_ino: u32, dst_parent: u32, name: &str)
     Ok(())
 }
 
-fn find_from(sb: &vitafs::Superblock, dir_ino: u32, prefix: &str, name: &str, out: &mut Vec<String>) {
+fn find_from(
+    sb: &vitafs::Superblock,
+    dir_ino: u32,
+    prefix: &str,
+    name: &str,
+    uid: u16,
+    out: &mut Vec<String>,
+) {
     let entries = match vitafs::dir_readdir(sb, dir_ino) {
         Some(e) => e,
         None => return,
@@ -645,8 +841,9 @@ fn find_from(sb: &vitafs::Superblock, dir_ino: u32, prefix: &str, name: &str, ou
             out.push(path.clone());
         }
         if let Some(node) = vitafs::iget(sb, e.ino) {
-            if node.itype == vitafs::TYPE_DIR {
-                find_from(sb, e.ino, &path, name, out);
+            // Спускаемся только туда, куда пускают (r на каталог).
+            if node.itype == vitafs::TYPE_DIR && allows(&node, uid, P_R | P_X) {
+                find_from(sb, e.ino, &path, name, uid, out);
             }
         }
     }

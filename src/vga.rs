@@ -33,6 +33,7 @@ pub fn screen_blank(buf: &mut [u8]) {
 
 pub const COLOR_LIGHT_GREEN: u8 = 0x0A;
 pub const COLOR_LIGHT_CYAN: u8 = 0x0B;
+pub const COLOR_LIGHT_RED: u8 = 0x0C;
 pub const COLOR_WHITE: u8 = 0x0F;
 pub const COLOR_DARK_GREY: u8 = 0x08;
 

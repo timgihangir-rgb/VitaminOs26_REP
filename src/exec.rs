@@ -43,7 +43,16 @@ fn foreground_poll(_pid: usize) -> bool {
 ///   .bin: rdi=vga_offset, rsi=rdx=0 (старая конвенция)
 ///
 /// Возвращает PID или None (нет свободного слота / битый образ / нет памяти).
-pub fn launch_user(name: &str, data: &[u8], argv: &[&str], vga_offset: u64) -> Option<usize> {
+/// uid — под кем запускать программу. Обычно это uid вызывающего (программа
+/// идёт от имени пользователя), но после `sys_auth` вызывающий сам root, и
+/// тогда запущенная им программа тоже работает с полными правами.
+pub fn launch_user(
+    name: &str,
+    data: &[u8],
+    argv: &[&str],
+    vga_offset: u64,
+    uid: u16,
+) -> Option<usize> {
     if !crate::scheduler::slot_free() {
         return None;
     }
@@ -75,7 +84,7 @@ pub fn launch_user(name: &str, data: &[u8], argv: &[&str], vga_offset: u64) -> O
     } else {
         (vga_offset, 0, 0)
     };
-    crate::scheduler::spawn_user(name, space, entry, stack.rsp, rdi, rsi, rdx)
+    crate::scheduler::spawn_user(name, space, entry, stack.rsp, rdi, rsi, rdx, uid)
 }
 
 /// Запускает .bin-программу в foreground (ring 3, собственное адресное
@@ -86,6 +95,14 @@ pub fn launch_user(name: &str, data: &[u8], argv: &[&str], vga_offset: u64) -> O
 /// исполняется БЕЗ лока: она может обращаться к VFS через ABI-функции
 /// (with_vfs), а лок нереентерабельный. Вызывается из шелла без удержания
 /// VFS_LOCK (шелль освобождает его перед запуском программы).
+/// Код возврата последней запущенной программы (слот EXIT_CODE). Значим
+/// сразу после `run_program`: следующий запуск его перезапишет.
+static mut LAST_EXIT: i32 = 0;
+
+pub fn last_exit_code() -> i32 {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe { LAST_EXIT })
+}
+
 pub fn run_program(writer: &mut Writer, args: &[&str], mem: sysinfo::MemInfo) -> bool {
     if args.is_empty() {
         return false;
@@ -154,10 +171,13 @@ pub fn run_program(writer: &mut Writer, args: &[&str], mem: sysinfo::MemInfo) ->
         }
 
         // Общий протокол: программа может сообщить ядру, куда поставить курсор
-        // после выхода (EXIT_ROW < 0 - не трогать позицию).
+        // после выхода (EXIT_ROW < 0 - не трогать позицию) и какой код
+        // возврата она выдаёт (например, sudo -v сообщает им об успешной
+        // проверке пароля).
         unsafe {
             core::ptr::write_volatile(0x708C as *mut i32, -1);
             core::ptr::write_volatile(0x7090 as *mut i32, 0);
+            core::ptr::write_volatile(crate::progabi::EXIT_CODE as *mut i32, 0);
         }
 
         // Клавиатура: сбрасываем буфер сканкодов, чтобы foreground-программа не
@@ -176,7 +196,8 @@ pub fn run_program(writer: &mut Writer, args: &[&str], mem: sysinfo::MemInfo) ->
         }
 
         let vga_offset = writer.vga_offset() as u64;
-        let pid = match launch_user(name, &data, &argv, vga_offset) {
+        let uid = crate::user::current_uid();
+        let pid = match launch_user(name, &data, &argv, vga_offset, uid) {
             Some(pid) => pid,
             None => {
                 writer.write_string("exec: cannot load (no free task slot or out of memory)\n");
@@ -195,6 +216,10 @@ pub fn run_program(writer: &mut Writer, args: &[&str], mem: sysinfo::MemInfo) ->
             // адресное пространство освобождены внутри kill.
             writer.write_string(&alloc::format!("\n^C {} terminated\n", name));
             return true;
+        }
+
+        unsafe {
+            LAST_EXIT = core::ptr::read_volatile(crate::progabi::EXIT_CODE as *const i32);
         }
 
         let exit_row = unsafe { core::ptr::read_volatile(0x708C as *const i32) };
