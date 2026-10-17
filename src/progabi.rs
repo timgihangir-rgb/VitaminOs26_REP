@@ -29,6 +29,43 @@ pub const USERDEL_PTR: usize = 0x7888;
 pub const EXEC_PTR: usize = 0x7890;
 pub const WAIT_PTR: usize = 0x7898;
 
+/// Размер текстовой сетки в ячейках (u32 каждый), по соседству с блоком
+/// указателей, но в отдельных слотах — здесь лежат значения, а не адреса
+/// функций. Пока программа их не читает (значения по умолчанию 80x30), она
+/// рисует по старой сетке; как только композитор посчитал сетку под
+/// разрешение монитора, он опубликовал её здесь, и программы подхватили её
+/// при старте (см. `publish_grid`).
+///
+/// Отдельные u32, а не одна упакованная пара, как в ioctl 4: программа
+/// читает оба слова одним 64-битным чтением и разбирает их сама, а лишний
+/// syscall на старте каждой программы не нужен.
+pub const GRID_COLS: usize = 0x78A0;
+pub const GRID_ROWS: usize = 0x78A4;
+pub const NET_STATE_PTR: usize = 0x78A8;
+
+/// Публикует сетку для ring 3. Зовёт композитор (и `exec` — на случай
+/// запуска программы до того, как сетка посчитана).
+pub fn publish_grid(cols: u32, rows: u32) {
+    unsafe {
+        (GRID_COLS as *mut u32).write_volatile(cols);
+        (GRID_ROWS as *mut u32).write_volatile(rows);
+    }
+}
+
+/// Сетка, объявленная для ring 3. Ноль означает «ядро не считало» — тогда
+/// программа ведёт себя как раньше, по 80x30.
+pub fn grid() -> (u32, u32) {
+    unsafe {
+        let c = (GRID_COLS as *const u32).read_volatile();
+        let r = (GRID_ROWS as *const u32).read_volatile();
+        if c == 0 || r == 0 {
+            (crate::vga::DEFAULT_COLS as u32, crate::vga::DEFAULT_ROWS as u32)
+        } else {
+            (c, r)
+        }
+    }
+}
+
 /// Слот кода возврата программы (int32). Программа записывает его перед
 /// выходом; шелл читает после её завершения. Изначально ноль, так что
 /// программа, ничего не записавшая, возвращает "успех".
@@ -55,6 +92,7 @@ pub const USERADD_STUB: usize = 0x71E0;
 pub const USERDEL_STUB: usize = 0x71F0;
 pub const EXEC_STUB: usize = 0x7200;
 pub const WAIT_STUB: usize = 0x7210;
+pub const NET_STATE_STUB: usize = 0x7220;
 
 const SYS_TICKS: usize = 0;
 const SYS_HLT: usize = 1;
@@ -77,6 +115,7 @@ const SYS_USERADD: usize = 17;
 const SYS_USERDEL: usize = 18;
 const SYS_EXEC: usize = 19;
 const SYS_WAIT: usize = 20;
+const SYS_NET_STATE: usize = 34;
 
 fn store_pointer(at: usize, f: usize) {
     unsafe {
@@ -106,6 +145,10 @@ fn write_stub(at: usize, syscall: usize, ret: bool) {
 /// Ставит трамплины в низкую память и заполняет блок указателей. Вызывается
 /// перед запуском .bin-программы (и в `run`, и в `bg`).
 pub fn install() {
+    // Сетку публикуем на каждой установке: она считается композитором, но
+    // если программа запустится раньше (или после `clear`-а), значения в
+    // слотах всё равно должны быть настоящими.
+    publish_grid(crate::vga::screen_cols() as u32, crate::vga::screen_rows() as u32);
     write_stub(EXIT_STUB, SYS_EXIT, false);
     write_stub(TICKS_STUB, SYS_TICKS, true);
     write_stub(HLT_STUB, SYS_HLT, true);
@@ -127,6 +170,7 @@ pub fn install() {
     write_stub(USERDEL_STUB, SYS_USERDEL, true);
     write_stub(EXEC_STUB, SYS_EXEC, true);
     write_stub(WAIT_STUB, SYS_WAIT, true);
+    write_stub(NET_STATE_STUB, SYS_NET_STATE, true);
 
     store_pointer(TICKS_PTR, TICKS_STUB);
     store_pointer(HLT_PTR, HLT_STUB);
@@ -148,4 +192,5 @@ pub fn install() {
     store_pointer(USERDEL_PTR, USERDEL_STUB);
     store_pointer(EXEC_PTR, EXEC_STUB);
     store_pointer(WAIT_PTR, WAIT_STUB);
+    store_pointer(NET_STATE_PTR, NET_STATE_STUB);
 }

@@ -46,9 +46,10 @@ pub const STACK_SIZE: usize = 64 * 1024;
 /// Размер стартового контекста на стеке задачи: 15 регистров + фрейм iretq.
 const CONTEXT_SIZE: usize = 20 * 8;
 
-/// RFLAGS при входе в ring 3: IF=1 (прерывания разрешены), IOPL=3 (программы
-/// используют прямой in/out для PS/2-клавиатуры и CMOS RTC), бит 1 всегда 1.
-const USER_RFLAGS: u64 = 0x3202;
+/// RFLAGS при входе в ring 3: IF=1 (прерывания разрешены), IOPL=0
+/// (ring-3 НЕ имеет доступа к портам, кроме разрешённых в I/O bitmap TSS),
+/// бит 1 всегда 1.
+const USER_RFLAGS: u64 = 0x0202;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskState {
@@ -545,7 +546,7 @@ fn spawn_user_inner(
             p.add(12).write(rdx_val);             // rdx = vga_offset | 0
             p.add(15).write(entry_rip);           // rip = e_entry | USER_START
             p.add(16).write(USER_CS as u64);      // cs (ring 3)
-            p.add(17).write(USER_RFLAGS);         // rflags: IF=1, IOPL=3
+            p.add(17).write(USER_RFLAGS);         // rflags: IF=1, IOPL=0
             p.add(18).write(user_rsp);            // rsp: setup_user_stack вернул
                                                   // rsp, указывающий на слот
                                                   // exit-стаба (ret из _start
@@ -612,7 +613,20 @@ pub fn kill(pid: usize) -> bool {
 
 fn kill_inner(pid: usize) -> bool {
     let removed = x86_64::instructions::interrupts::without_interrupts(|| unsafe {
-        if pid == 0 || pid >= MAX_TASKS {
+        // Отказ убить САМУЮ СЕБЯ обязателен, а не «defensive»: TASKS[cur].take()
+        // убрал бы задачу из таблицы, а drop' Task' на строке ниже освободил бы
+        // kernel-стек (64 КиБ), на котором CPU исполняется прямо сейчас. Задача
+        // продолжает писать в освобождённую память до конца кванта, CURRENT
+        // указывает на пустой слот (следующий schedule() падает на unwrap или
+        // теряет слот молча), и ps больше не показывает задачу, так что reap
+        // её уже не заберёт. Главный шелл спасался лишь тем, что его pid == 0,
+        // а 0 отбрасывается проверкой выше; у desk-шеллов pid ненулевой, и
+        // `kill <свой pid>` вводится руками. Единственная честная защита —
+        // проверка здесь.
+        if pid == 0 || pid >= MAX_TASKS || pid == CURRENT.load(Ordering::SeqCst) {
+            crate::vga::serial_write_atomic("[kill] refusing self-kill pid=");
+            crate::vga::serial_u64(pid as u64);
+            crate::vga::serial_write_atomic("\n");
             return None;
         }
         // CRITICAL-3: жертва могла держать VFS_LOCK. init-супервизор и шелл
@@ -621,8 +635,6 @@ fn kill_inner(pid: usize) -> bool {
         // остальные задачи навсегда застряли бы в vfs_lock_yield. Снимаем
         // лок принудительно — жертва больше не выполнится (слот освобождается,
         // стек уничтожается), её guard не запустится и не затрёт чужой захват.
-        // Исключение — сама текущая задача: её guard ещё жив, сбрасывать лок
-        // нельзя (впрочем, kill текущей задачи невозможен — defensive).
         let cur = CURRENT.load(Ordering::SeqCst);
         if pid != cur && VFS_LOCK.holder() == pid {
             VFS_LOCK.force_unlock();
@@ -642,6 +654,7 @@ fn kill_inner(pid: usize) -> bool {
 /// Забирает завершившуюся задачу у планировщика: освобождает kernel-стек и
 /// адресное пространство. Вызывается шеллом после `wait_for`.
 pub fn reap(pid: usize) {
+    crate::net::close_sockets_of(pid);
     SCHED_FROZEN.fetch_add(1, Ordering::SeqCst);
     reap_inner(pid);
     SCHED_FROZEN.fetch_sub(1, Ordering::SeqCst);
@@ -908,10 +921,38 @@ extern "C" fn schedule() -> usize {
     if SCHED_FROZEN.load(Ordering::SeqCst) != 0 {
         unsafe {
             let cur = CURRENT.load(Ordering::SeqCst);
-            if let Some(t) = TASKS[cur].as_mut() {
-                t.ticks += 1;
+            match TASKS[cur].as_mut() {
+                Some(t) => {
+                    t.ticks += 1;
+                    return t.saved_rsp;
+                }
+                // Слот CURRENT пуст (kill/reap успели снять задачу). unwrap
+                // здесь был тройным фолтом: schedule() вызывается из
+                // обработчика таймера, у него нет собственного стека для
+                // паники. Откатываемся на задачу 0 — если и она недоступна,
+                // возвращаем её saved_rsp через fallback ниже.
+                None => {
+                    crate::vga::serial_write_atomic("[sched] CURRENT slot empty, fallback\n");
+                    if let Some(rsp) = TASKS[0].as_ref().map(|t| t.saved_rsp) {
+                        return rsp;
+                    }
+                    // Fallback не нашел и задачу 0: больше подменящих
+                    // сохранённых нет. Возврат 0 как rsp — гарантированный
+                    // тройной фолт (see MD), поэтому берём rbp любой живой
+                    // задачи, а если нигде нет — hlt, чтобы не вернуть 0.
+                    for i in 1..MAX_TASKS {
+                        if let Some(t) = TASKS[i].as_ref() {
+                            if t.saved_rsp != 0 {
+                                return t.saved_rsp;
+                            }
+                        }
+                    }
+                    crate::vga::serial_write_atomic("[sched] ALL slots dead, hlt-loop\n");
+                    loop {
+                        x86_64::instructions::hlt()
+                    }
+                }
             }
-            return TASKS[cur].as_ref().unwrap().saved_rsp;
         }
     }
     unsafe {
@@ -972,9 +1013,27 @@ extern "C" fn schedule() -> usize {
         // Нули там = чужая запись. Печатаем адрес жертвы и встаём на int3:
         // под gdb это останов с полным контекстом, без gdb - видный сбой.
         {
+            // Границы проверяем через checked_sub/checked_add: условие
+            // rsp >= base позволяло прочитать 8 байт ПЕРЕД выделением
+            // (saved_rsp == base), а rsp + 160 переполнялся usize и проскакивал
+            // проверку на битом saved_rsp - детектор, который должен спасать
+            // от падения, сам мог его вызвать.
+            //
+            // Само значение poison оставлено как есть (== 0) НАМЕРЕННО: ядро
+            // 0xBE имеет смысл только у СВЕЖЕГО, сконструированного spawn_inner
+            // контекста. После первого же тика таймер перезаписывает контекст
+            // по ЖИВОМУ rsp задачи, и восемь байт под ним - обычная локальная
+            // переменная, а не 0xBE. Проверка poison != 0xBEBEBEBEBEBEBEBE
+            // срабатывала на ticker при первой же переключении и роняла
+            // систему через int3 -> #DB -> halt_loop.
             let base = t.stack.as_ptr() as usize;
+            let len = t.stack.len();
             let rsp = t.saved_rsp;
-            if rsp >= base && rsp + 160 <= base + t.stack.len() {
+            let in_range = rsp
+                .checked_sub(base)
+                .map(|off| off >= 8 && rsp.checked_add(160).map_or(false, |e| e <= base + len))
+                .unwrap_or(false);
+            if in_range {
                 unsafe {
                     let rip = *((rsp + 120) as *const u64);
                     let poison = *((rsp - 8) as *const u64);
@@ -988,7 +1047,6 @@ extern "C" fn schedule() -> usize {
                         crate::vga::serial_write_atomic(" poison=");
                         crate::vga::serial_u64(poison);
                         crate::vga::serial_write_atomic("\n");
-                        t.state = TaskState::Running;
                         core::arch::asm!("int3", options(nomem));
                     }
                 }

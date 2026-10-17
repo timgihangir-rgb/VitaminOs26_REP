@@ -59,7 +59,9 @@ def sendkey(s, key, pause=0.06):
     time.sleep(pause)
 
 
-KEY_MAP = {" ": "spc", "-": "minus", ".": "dot", "/": "slash", ":": "shift-semicolon"}
+KEY_MAP = {" ": "spc", "-": "minus", ".": "dot", "/": "slash",
+           ":": "shift-semicolon", ">": "shift-dot", "_": "shift-minus",
+           "=": "equal", "#": "shift-3"}
 
 
 def type_line(s, text, settle=0.9):
@@ -88,8 +90,27 @@ def vga_addr():
     return m.group(1) if m else "0xb8000"
 
 
+def grid():
+    """Размер текстовой сетки в ячейках.
+
+    Сетку больше не 80x30 на все случаи: композитор выбирает её под
+    разрешение монитора (см. `fit_grid` в src/fb.rs), и на 1280x800 это
+    80x25 в масштабе 2x - буквы вдвое крупнее и занимают весь кадр. Ядро
+    печатает итог в serial строкой "[N] fb WxH scale=N grid=CxR", по ней и
+    читаем, сколько колонок и строк разбирать из дампа экрана. Нет такой
+    строки - композитор не включился, система в текстовом режиме, и сетка
+    историческая.
+    """
+    try:
+        log = open(SERIAL_LOG, errors="replace").read()
+    except OSError:
+        return 80, 30
+    m = re.search(r"grid=(\d+)x(\d+)", log)
+    return (int(m.group(1)), int(m.group(2))) if m else (80, 30)
+
+
 def dump_vga(s):
-    qmp_hmp(s, f'pmemsave {vga_addr()} 9600 "{VGA_DUMP}"')
+    qmp_hmp(s, f'pmemsave {vga_addr()} 65536 "{VGA_DUMP}"')
     time.sleep(0.4)
 
 
@@ -99,10 +120,11 @@ def vga_text():
     except FileNotFoundError:
         return []
     out = []
-    for row in range(30):
+    cols, rows_ = grid()
+    for row in range(rows_):
         chars = []
-        for col in range(80):
-            ch = data[row * 160 + col * 2]
+        for col in range(cols):
+            ch = data[row * cols * 2 + col * 2]
             chars.append(chr(ch) if 32 <= ch < 127 else " ")
         out.append("".join(chars))
     return out
@@ -113,7 +135,36 @@ def screen():
 
 
 def status_line():
-    return vga_text()[29]
+    """Строка состояния - последняя строка сетки (не 29-я: сетка по монитору)."""
+    return vga_text()[-1]
+
+
+def vga_attr(row, col):
+    """Атрибут (цвет) клетки - для проверки color = off."""
+    try:
+        data = open(VGA_DUMP, "rb").read()
+    except FileNotFoundError:
+        return -1
+    cols, _ = grid()
+    return data[row * cols * 2 + col * 2 + 1]
+
+
+def max_line_len(rows=None):
+    """Самая длинная непустая строка из первых `rows` строк экрана.
+
+    По умолчанию - весь документ, то есть все строки выше строки состояния."""
+    if rows is None:
+        rows = len(vga_text()) - 1
+    lines = vga_text()[:rows]
+    return max((len(l.rstrip()) for l in lines), default=0)
+
+
+def doc_attrs(rows=None):
+    """Множество атрибутов первых `rows` строк (документ)."""
+    cols, all_rows = grid()
+    if rows is None:
+        rows = all_rows - 1
+    return {vga_attr(r, c) for r in range(rows) for c in range(cols)}
 
 
 def main():
@@ -304,6 +355,171 @@ def main():
         type_line(s, "echo back-in-shell")
         dump_vga(s)
         check("back-in-shell" in screen(), "q returns control to the shell")
+
+        # ─── 10. Конфиг /etc/web.conf ────────────────────────────────────
+        print("\n== /etc/web.conf ==")
+        type_line(s, "cat /etc/web.conf", settle=1.5)
+        dump_vga(s)
+        t = screen()
+        check("start_url" in t, "web.conf documents start_url")
+        check("user_agent" in t and "VitaminOS-web/1.0" in t,
+              "web.conf ships the default user_agent")
+        check("key_quit" in t and "show_headers" in t,
+              "web.conf lists key_quit and show_headers")
+
+        # ─── 11. Справка: web --help и web без аргументов ─────────────────
+        print("\n== web --help ==")
+        type_line(s, "web --help", settle=2.0)
+        dump_vga(s)
+        t = screen()
+        check("usage: web" in t, "--help prints the usage line")
+        check("-c, --config PATH" in t, "--help documents -c/--config")
+        check("start_url" in t and "max_download" in t,
+              "--help lists the config keys")
+        check("key_quit / key_back / key_goto" in t,
+              "--help lists the key bindings")
+
+        print("\n== web with no arguments (empty start_url) ==")
+        type_line(s, "web", settle=2.0)
+        dump_vga(s)
+        t = screen()
+        check("usage: web" in t,
+              "no args + empty start_url falls back to the help text")
+        type_line(s, "echo help-is-not-a-browser", settle=1.0)
+        dump_vga(s)
+        check("help-is-not-a-browser" in screen(),
+              "web without a URL returns to the shell")
+
+        # ─── 12. Свой конфиг: start_url + user_agent + show_headers ───────
+        print("\n== custom config: start_url, user_agent, show_headers ==")
+        type_line(s, "echo start_url = http://10.0.2.2:8080/echo > /tmp/w.conf",
+                  settle=1.2)
+        type_line(s, "echo user_agent = VitaminOS-CFG/9.9 >> /tmp/w.conf",
+                  settle=1.2)
+        type_line(s, "echo show_headers = on >> /tmp/w.conf", settle=1.2)
+        type_line(s, "cat /tmp/w.conf", settle=1.2)
+        dump_vga(s)
+        check("start_url = http://10.0.2.2:8080/echo" in screen(),
+              "config file written through shell redirects")
+        type_line(s, "web -c /tmp/w.conf", settle=5.0)
+        dump_vga(s)
+        t = screen()
+        check("Echo" in t, "start_url from the config was opened")
+        check("VitaminOS-CFG/9.9" in t,
+              "user_agent from the config reached the server")
+        check("HTTP/1.0 200 OK" in t,
+              "show_headers = on prints the response status line")
+        check("Content-Type" in t, "show_headers = on prints response headers")
+        sendkey(s, "q")
+        time.sleep(1.5)
+        type_line(s, "echo cfg1-done", settle=1.0)
+        dump_vga(s)
+        check("cfg1-done" in screen(), "q quits after a config-driven load")
+
+        # ─── 13. link_numbers = off и status_bar = off ────────────────────
+        print("\n== config: link_numbers off, status_bar off ==")
+        type_line(s, "echo start_url = http://10.0.2.2:8080/ > /tmp/w2.conf",
+                  settle=1.2)
+        type_line(s, "echo link_numbers = off >> /tmp/w2.conf", settle=1.2)
+        type_line(s, "echo status_bar = off >> /tmp/w2.conf", settle=1.2)
+        type_line(s, "web -c /tmp/w2.conf", settle=5.0)
+        dump_vga(s)
+        t = screen()
+        check("VitaminOS test site" in t, "index page loaded with status_bar off")
+        check("[1]" not in t, "link_numbers = off removes the [N] markers")
+        check("Lnk" not in status_line(),
+              "status_bar = off leaves the last row to the document")
+        check("Page 2 relative" in t,
+              "link labels still render without the [N] suffix")
+        sendkey(s, "q")
+        time.sleep(1.5)
+        type_line(s, "echo cfg2-done", settle=1.0)
+        dump_vga(s)
+        check("cfg2-done" in screen(), "status_bar = off still allows quitting")
+
+        # ─── 14. width из конфига ─────────────────────────────────────────
+        print("\n== config: width = 50 ==")
+        type_line(s, "echo start_url = http://10.0.2.2:8080/test.html > /tmp/w3.conf",
+                  settle=1.2)
+        type_line(s, "echo width = 50 >> /tmp/w3.conf", settle=1.2)
+        type_line(s, "web -c /tmp/w3.conf", settle=6.0)
+        dump_vga(s)
+        # Подпись [NN] вставляется в строку текста и сдвигает хвост вправо,
+        # поэтому допускаем width + 6, а не ровно width.
+        w = max_line_len()
+        check(w <= 56, f"width = 50 wraps the text (longest row {w})")
+        sendkey(s, "q")
+        time.sleep(1.5)
+
+        # ─── 15. default_port = 8080: адрес без порта ─────────────────────
+        print("\n== config: default_port = 8080 ==")
+        type_line(s, "echo default_port = 8080 > /tmp/w4.conf", settle=1.2)
+        type_line(s, "web -c /tmp/w4.conf 10.0.2.2", settle=5.0)
+        dump_vga(s)
+        check("VitaminOS test site" in screen(),
+              "default_port lets a bare host name find port 8080")
+        sendkey(s, "q")
+        time.sleep(1.5)
+
+        # ─── 16. key_quit = x ─────────────────────────────────────────────
+        print("\n== config: key_quit = x ==")
+        type_line(s, "echo start_url = http://10.0.2.2:8080/ > /tmp/w5.conf",
+                  settle=1.2)
+        type_line(s, "echo key_quit = x >> /tmp/w5.conf", settle=1.2)
+        type_line(s, "web -c /tmp/w5.conf", settle=5.0)
+        dump_vga(s)
+        check("VitaminOS test site" in screen(), "page loaded for the key test")
+        sendkey(s, "q")
+        time.sleep(1.5)
+        dump_vga(s)
+        check("VitaminOS test site" in screen(),
+              "q no longer quits when key_quit = x")
+        sendkey(s, "x")
+        time.sleep(1.5)
+        type_line(s, "echo cfg5-done", settle=1.0)
+        dump_vga(s)
+        check("cfg5-done" in screen(), "x quits when key_quit = x")
+
+        # ─── 17. color = off: весь экран одним атрибутом ──────────────────
+        print("\n== config: color = off ==")
+        type_line(s, "echo start_url = http://10.0.2.2:8080/ > /tmp/w6.conf",
+                  settle=1.2)
+        type_line(s, "echo color = off >> /tmp/w6.conf", settle=1.2)
+        type_line(s, "web -c /tmp/w6.conf", settle=5.0)
+        dump_vga(s)
+        t = screen()
+        check("VitaminOS test site" in t, "index page loaded for the color test")
+        attrs = doc_attrs()
+        check(attrs <= {0x07},
+              f"color = off paints the document grey (attrs {sorted(attrs)})")
+        sendkey(s, "q")
+        time.sleep(1.5)
+
+        # ─── 18. Неизвестный ключ не ломает запуск ────────────────────────
+        print("\n== unknown config key is ignored ==")
+        type_line(s, "echo start_url = http://10.0.2.2:8080/ > /tmp/w7.conf",
+                  settle=1.2)
+        type_line(s, "echo width = banana >> /tmp/w7.conf", settle=1.2)
+        type_line(s, "echo no_such_key = 1 >> /tmp/w7.conf", settle=1.2)
+        type_line(s, "web -c /tmp/w7.conf", settle=5.0)
+        dump_vga(s)
+        check("VitaminOS test site" in screen(),
+              "garbage value and unknown key do not break web")
+        sendkey(s, "q")
+        time.sleep(1.5)
+
+        # ─── 19. Отсутствующий конфиг: заводские значения ─────────────────
+        print("\n== missing config file falls back to defaults ==")
+        type_line(s, "web -c /tmp/no-such-file.conf 10.0.2.2 8080 /", settle=5.0)
+        dump_vga(s)
+        check("VitaminOS test site" in screen(),
+              "missing config does not stop web from loading a page")
+        sendkey(s, "q")
+        time.sleep(1.5)
+        type_line(s, "echo all-config-tests-done", settle=1.2)
+        dump_vga(s)
+        check("all-config-tests-done" in screen(),
+              "shell alive after the whole config suite")
         s.close()
     except Exception as e:
         import traceback

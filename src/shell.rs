@@ -3,7 +3,9 @@ use crate::fs;
 use crate::keyboard;
 use crate::sysinfo;
 use crate::vfs::Vfs;
-use crate::vga::{COLOR_DARK_GREY, COLOR_LIGHT_CYAN, COLOR_LIGHT_GREEN, COLOR_WHITE, Writer};
+use crate::vga::{
+    COLOR_DARK_GREY, COLOR_LIGHT_CYAN, COLOR_LIGHT_GREEN, COLOR_LIGHT_RED, COLOR_WHITE, Writer,
+};
 use alloc::vec::Vec;
 /// Восьмеричное число из строки ("755" -> 0o755). None, если в строке есть
 /// что-то кроме цифр 0..7.
@@ -56,10 +58,6 @@ pub fn run_shell(
         writer.write_string(alloc::format!("{}", desk_index + 1).as_str());
         writer.set_color(COLOR_DARK_GREY);
         writer.write_string("] ");
-        writer.set_color(COLOR_LIGHT_CYAN);
-        writer.write_string("vitamin_os26");
-        writer.set_color(COLOR_WHITE);
-        writer.write_string(":");
         // Кто вошёл: иначе в приглашении не видно, под кем идёт работа.
         writer.set_color(COLOR_LIGHT_GREEN);
         writer.write_string(crate::user::current_name().as_str());
@@ -69,7 +67,18 @@ pub fn run_shell(
         writer.write_string(vfs.pwd().as_str());
         writer.set_color(COLOR_WHITE);
         writer.write_string("$ ");
-        writer.set_color(COLOR_WHITE);
+        // Активная раскладка. Метку печатаем только в русской: иначе
+        // приглашение в обычном случае длиннее на четыре символа ради
+        // информации, которой и так нет.
+        if keyboard::layout_russian() {
+            writer.set_color(COLOR_LIGHT_RED);
+            writer.write_string("[RU] ");
+            writer.set_color(COLOR_WHITE);
+        }
+        // Один кадр на всю команду: и весь её вывод, и новое приглашение
+        // появляются вместе. Отрисовка на каждой строке означала бы, что
+        // текст «печатается» на глазах — ровно то, чего здесь быть не должно.
+        writer.sync();
 
         let input = keyboard::read_line(writer, &mut history);
         if input.is_empty() {
@@ -92,7 +101,17 @@ pub fn run_shell(
                 append_history(vfs, input.as_str());
             }
         }
+        // Сейчас начинается вывод команды. Занимаем экран: пока шелл печатает,
+        // композитор не вмешивается, иначе он поймает экран на середине
+        // вывода — а дисковый ввод-вывод внутри команды отдаёт планировщик
+        // — и текст поедет по строкам. Свой кадр шелт показывает один раз,
+        // в конце команды.
+        crate::fb::set_quiet(true);
         handle_command(input.as_str(), writer, mem, vfs);
+        // Вывод закончен: экран снова свободен. Пока он был занят, его
+        // освобождали `exec::run_program` и `bg` — там, где экран переходит
+        // к ring3-программе, которая рисует себя сама.
+        crate::fb::set_quiet(false);
     }
 }
 
@@ -218,6 +237,9 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
         bg_task(writer, name, args);
         let _g = crate::scheduler::vfs_lock();
         crate::vitafs::sync_all();
+        // Фоновая задача рисует себя сама (пишет в 0xB8000 напрямую, её
+        // кадры рисует композитор), поэтому на её время экран свободен.
+        crate::fb::set_quiet(false);
         return true;
     }
 
@@ -426,17 +448,27 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
             }
         }
         ["history"] => {
-            if let Some(data) = vfs.cat("/var/log/history.log") {
-                let mut n = 1;
-                let mut start = 0;
-                for (i, b) in data.iter().enumerate() {
-                    if *b == b'\n' {
-                        writer.write_string(&alloc::format!("{:>3}  ", n));
-                        writer.write_string(core::str::from_utf8(&data[start..i]).unwrap_or(""));
-                        writer.write_string("\n");
-                        n += 1;
-                        start = i + 1;
-                    }
+            // Показываем не только то, что уже лежит на диске, но и накопленное
+            // в памяти: иначе команда, отданная несколько шагов назад, была бы
+            // не видна до следующей пачки (HISTORY_BATCH) или до выключения.
+            let mut data = vfs
+                .cat("/var/log/history.log")
+                .map(|d| d.to_vec())
+                .unwrap_or_default();
+            unsafe {
+                if let Some(p) = PENDING.as_ref() {
+                    data.extend_from_slice(p.as_bytes());
+                }
+            }
+            let mut n = 1;
+            let mut start = 0;
+            for (i, b) in data.iter().enumerate() {
+                if *b == b'\n' {
+                    writer.write_string(&alloc::format!("{:>3}  ", n));
+                    writer.write_string(core::str::from_utf8(&data[start..i]).unwrap_or(""));
+                    writer.write_string("\n");
+                    n += 1;
+                    start = i + 1;
                 }
             }
         }
@@ -508,8 +540,8 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
                 let _ = row;
                 writer.write_string(&alloc::format!(
                     "screen: {}x{}\n",
-                    crate::vga::SCREEN_WIDTH,
-                    crate::vga::SCREEN_HEIGHT
+                    crate::vga::screen_cols(),
+                    crate::vga::screen_rows()
                 ));
             }
             "echo" => match rest.first() {
@@ -538,11 +570,13 @@ fn run_one(raw: &[&str], writer: &mut Writer, mem: sysinfo::MemInfo, vfs: &mut V
         // уже взят), а потом передаём управление в power: обе функции не
         // возвращаются, и после sync_all() писать в ФС уже нельзя.
         ["shutdown"] | ["poweroff"] => {
+            flush_history(vfs);
             crate::vitafs::sync_all();
             drop(_vfs_guard);
             crate::power::shutdown(writer);
         }
         ["reboot"] => {
+            flush_history(vfs);
             crate::vitafs::sync_all();
             drop(_vfs_guard);
             crate::power::reboot(writer);
@@ -603,21 +637,59 @@ fn tokenize(command: &str) -> Vec<&str> {
     command.split_whitespace().collect()
 }
 
-/// Дописывает команду в /var/log/history.log (с ограничением размера).
+/// Кэш журнала истории в ОЗУ.
+///
+/// Раньше история писалась на диск перед КАЖДОЙ командой: файл целиком
+/// перечитывался, перезаписывался и синхронно фиксировался через WAL. Это
+/// десятки миллисекунд на команду на реальном диске, и всё это время тик
+/// таймера стоит (дисковый PIO идёт с IF=0, плюс `commit_portion` замораживает
+/// планирование) - экран не обновляется, и вывод команды выглядит построчным.
+/// Теперь строки копятся в памяти и уходят на диск пачками по HISTORY_BATCH.
+const HISTORY_BATCH: usize = 32;
+
+/// Незаписанные строки журнала. Доступ только под VFS_LOCK (см. вызовы).
+static mut PENDING: Option<alloc::string::String> = None;
+static mut PENDING_LINES: usize = 0;
+
+/// Сбрасывает накопленный журнал на диск. Вызывается при выключении и
+/// перезагрузке, а также автоматически каждые HISTORY_BATCH команд.
+fn flush_history(vfs: &mut Vfs) {
+    unsafe {
+        let pending = match PENDING.as_mut() {
+            Some(p) if !p.is_empty() => core::mem::take(p),
+            _ => {
+                PENDING_LINES = 0;
+                return;
+            }
+        };
+        PENDING_LINES = 0;
+        let mut out = vfs
+            .cat("/var/log/history.log")
+            .map(|d| d.to_vec())
+            .unwrap_or_default();
+        // Журнал ограничен по размеру: обрезаем начало, а не конец.
+        if out.len() + pending.len() > 8192 {
+            out = out[out.len().saturating_sub(4096)..].to_vec();
+        }
+        out.extend_from_slice(pending.as_bytes());
+        let _ = vfs.write_file("/var/log/history.log", &out);
+    }
+}
+
+/// Дописывает команду в /var/log/history.log (в RAM; на диск - пачками).
 fn append_history(vfs: &mut Vfs, line: &str) {
     if line.trim().is_empty() {
         return;
     }
-    let mut out = vfs
-        .cat("/var/log/history.log")
-        .map(|d| d.to_vec())
-        .unwrap_or_default();
-    if out.len() + line.len() + 1 > 8192 {
-        out = out[out.len().saturating_sub(4096)..].to_vec();
+    unsafe {
+        let p = PENDING.get_or_insert_with(alloc::string::String::new);
+        p.push_str(line);
+        p.push('\n');
+        PENDING_LINES += 1;
+        if PENDING_LINES >= HISTORY_BATCH {
+            flush_history(vfs);
+        }
     }
-    out.extend_from_slice(line.as_bytes());
-    out.push(b'\n');
-    let _ = vfs.write_file("/var/log/history.log", &out);
 }
 
 fn bg_task(writer: &mut Writer, name: &str, args: &[&str]) {
@@ -633,7 +705,6 @@ fn bg_task(writer: &mut Writer, name: &str, args: &[&str]) {
     let binpath = alloc::format!("/bin/{}", name);
     let code = crate::scheduler::with_vfs(|vfs| vfs.cat(&binpath).map(|d| d.to_vec()));
     if let Some(code) = code {
-        crate::net::tcp_reset();
         crate::progabi::install();
         let argv = [binpath.as_str()];
         let uid = crate::user::current_uid();

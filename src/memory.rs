@@ -44,6 +44,19 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 
 const FREE_LIST_CAP: usize = 4096;
 
+/// Нижняя граница: всё ниже 4 МиБ не выдаётся. Диапазон 0..2 МиБ виден
+/// user-задачам через identity-map (VGA/ABI), а 2..4 МиБ - физическая память
+/// ядра. Фрейм из этой зоны в руках ring 3 - прямой путь к порче.
+const LOW_MEMORY_END: u64 = 0x40_0000;
+/// Столько физической памяти отображено в верхнем окне PHYS_MEM_OFFSET
+/// (boot.asm, .fill_high: 512 huge pages по 2 МиБ). Всё, что выше, недостижимо
+/// через это окно: и `table_of`, и `zero_frame`, и запись образа программы идут
+/// именно через него. Кадр выше границы вернулся бы как 4 КиБ запись по
+/// неотображённому адресу - #PF в ring 0, а обработчик исключений на такой
+/// ошибке останавливает систему. На машинах с >1 ГиБ ОЗУ аллокатор рано или
+/// поздно дошёл бы до такого кадра, поэтому проход ограничен.
+const PHYS_WINDOW_END: u64 = 0x4000_0000;
+
 static mut REGIONS: &'static [MemRegion] = &[];
 static mut FREE_FRAMES: [u64; FREE_LIST_CAP] = [0; FREE_LIST_CAP];
 static mut FREE_COUNT: usize = 0;
@@ -112,10 +125,6 @@ impl FrameAlloc {
     /// Следующий свободный кадр из линейного прохода по регионам, начиная с
     /// позиции курсора. O(1) амортизированно: курсор двигается только вперёд.
     unsafe fn sweep_next(&mut self) -> Option<PhysFrame> {
-        // Пропускаем всё ниже 4 МиБ: диапазон 0..2 МиБ виден user-задачам
-        // через identity-map (VGA/ABI), а 2..4 МиБ - это физическая память
-        // ядра. Фреймы из этой зоны в руках ring 3 - прямой путь к порче.
-        const LOW_MEMORY_END: u64 = 0x40_0000;
         let reserved = kernel_reserved_ranges();
         while self.region_idx < REGIONS.len() {
             let r = &REGIONS[self.region_idx];
@@ -132,6 +141,11 @@ impl FrameAlloc {
             }
             let addr = first_addr;
             self.frame_offset += 1;
+            if addr >= PHYS_WINDOW_END {
+                // Дальше идти незачем: всё выше не отображено в окно.
+                self.region_idx = REGIONS.len();
+                return None;
+            }
             if addr >= LOW_MEMORY_END && !frame_is_reserved(addr, &reserved) {
                 return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
             }
@@ -150,7 +164,14 @@ unsafe impl FrameAllocator<Size4KiB> for FrameAlloc {
                 FREE_COUNT -= 1;
                 let addr = FREE_FRAMES[FREE_COUNT];
                 // Валидация записи free-list: мусор здесь = чья-то порча.
-                if addr >= 0x40_0000 && addr < 0x80_0000 && addr % 4096 == 0 {
+                // Границы - ровно те же, что и у sweep_next: странично-
+                // выровненный кадр выше 4 МиБ и ниже PHYS_WINDOW_END.
+                // Раньше здесь стояло жёсткое окно 4..8 МиБ, из-за чего
+                // любой освобождённый фрейм выше 8 МиБ (а это весь хвост
+                // ОЗУ на машине с >8 МиБ) отбрасывался как "BAD entry":
+                // кадр терялся навсегда, ALLOCATED_FRAMES не уменьшался,
+                // а мусор продолжал жрать free-list по одной записи.
+                if addr % 4096 == 0 && addr >= LOW_MEMORY_END && addr < PHYS_WINDOW_END {
                     ALLOCATED_FRAMES.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
                     return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
                 }
@@ -183,6 +204,17 @@ impl FrameDeallocator<Size4KiB> for FrameAlloc {
                     crate::vga::serial_write_atomic("\n");
                     return;
                 }
+            }
+            if addr % 4096 != 0 || addr < LOW_MEMORY_END || addr >= PHYS_WINDOW_END {
+                // Такой кадр всё равно нельзя выдать (не выровнен / ниже
+                // 4 МиБ / не отображён в PHYS_MEM_OFFSET). Не занимаем им
+                // место в free-list - иначе каждая выдача тратила бы запись
+                // на заведомо отбракованный адрес.
+                crate::vga::serial_write_atomic("[frames] refusing free of unusable addr=");
+                crate::vga::serial_u64(addr);
+                crate::vga::serial_write_atomic("\n");
+                ALLOCATED_FRAMES.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+                return;
             }
             if FREE_COUNT < FREE_LIST_CAP {
                 FREE_FRAMES[FREE_COUNT] = addr;
@@ -290,6 +322,12 @@ unsafe fn parse_multiboot2_into_buf(mb_info_ptr: u64) -> &'static [MemRegion] {
             }
         }
 
+        // Тег нулевой длины не продвигает курсор: без этой проверки цикл
+        // while offset + 8 <= total_size крутился бы вечно на битой таблице
+        // от GRUB (или от кривой прошивки) - зависание до первого сообщения.
+        if tag_size == 0 {
+            break;
+        }
         offset += tag_size;
         offset = (offset + 7) & !7;
     }

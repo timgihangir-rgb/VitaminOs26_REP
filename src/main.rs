@@ -31,6 +31,9 @@ mod part;
 mod pci;
 mod power;
 mod progabi;
+mod hmac;
+mod pbkdf2;
+mod rand;
 mod ralloc;
 mod rtc;
 mod scheduler;
@@ -83,6 +86,7 @@ pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
         },
         Err(_) => {
             writer.write_string("KERNEL PANIC: heap initialization failed\n");
+            writer.sync();
             halt_loop();
         }
     }
@@ -127,6 +131,8 @@ pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
     scheduler::init();
     scheduler::set_vfs(&mut vfs);
     interrupts::init();
+    rand::init();
+    splash::step(&mut writer, "entropy pool seeded");
     // USB-клавиатура поднимается отдельной задачей: сброс порта по USB-специ
     // требует паузы в десятки миллисекунд, а загрузку тормозить нельзя.
     let _ = scheduler::spawn("usbkbd", alloc::boxed::Box::new(|| usb::run()));
@@ -191,6 +197,7 @@ pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
             // Пароль не введён - система остаётся закрытой. Шелл не запускаем:
             // иначе несколько нажатий Enter дали бы полный доступ.
             writer.write_string("\nSystem halted: no login.\n");
+            writer.sync();
             halt_loop();
         }
     }
@@ -282,6 +289,34 @@ fn stage0_diag() {
     msg.push_str(&alloc::format!("{}", usb::reports()));
     msg.push_str(" kbd_irq=");
     msg.push_str(&alloc::format!("{}", keyboard::kbd_irq_count()));
+    // RNG: два подряд вызова разные, распределение битов в пределах шума.
+    let (ok_repeat, ones) = rand::selftest();
+    msg.push_str(if ok_repeat { " | rand: OK" } else { " | rand: FAIL(repeat)" });
+    if !(900..=1150).contains(&ones) {
+        msg.push_str(&alloc::format!(" suspicious-ones={}", ones));
+    }
+    // PBKDF2-HMAC-SHA256: векторы RFC 6070. Если они не сходятся, схема
+    // паролей в /etc/shadow читалась бы, но пароль не подходил бы.
+    let vectors: [(&str, &str, u32, &str); 3] = [
+        ("password", "salt", 1,
+         "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"),
+        ("password", "salt", 2,
+         "ae4d0c95af6b46d32d0adff928f06dd02a303f8ef3c251dfd6e2d85a95474c43"),
+        ("password", "salt", 4096,
+         "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"),
+    ];
+    let mut ok = true;
+    for (p, s, it, want) in vectors.iter() {
+        let got = crate::sha256::hex(&crate::pbkdf2::pbkdf2_sha256(
+            p.as_bytes(),
+            s.as_bytes(),
+            *it,
+        ));
+        if got != *want {
+            ok = false;
+        }
+    }
+    msg.push_str(if ok { " | pbkdf2: OK" } else { " | pbkdf2: FAIL" });
     bcache::stats_line(&mut msg);
     for b in msg.bytes() {
         vga::serial_putchar(b);
@@ -302,6 +337,9 @@ fn panic(info: &PanicInfo) -> ! {
         writer.write_string("Kernel panic occurred");
     }
     writer.write_string("\n");
+    // Паника - последнее, что увидит человек: выводим на экран до записи
+    // в COM1, дальше система встаёт и перерисовывать будет уже некому.
+    writer.sync();
 
     // Дублируем на COM1: в headless-прогоне (-display none) VGA не виден.
     let mut msg = alloc::string::String::from("KERNEL PANIC\n");

@@ -17,7 +17,7 @@
 use crate::keyboard;
 use crate::ralloc;
 use crate::scheduler::{self, ProcInfo};
-use crate::vga::{Writer, SCREEN_HEIGHT, SCREEN_WIDTH};
+use crate::vga::{screen_cols, screen_rows, Writer};
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -32,10 +32,20 @@ const ROW_TOP: usize = 0; // top - up ...
 const ROW_LOAD: usize = 1; // load average: ...
 const ROW_HEAD: usize = 2; //   PID  STATE       TIME    %CPU  COMMAND
 const ROW_FIRST: usize = 3; // первая строка таблицы
-const ROW_HELP: usize = SCREEN_HEIGHT - 2; // подсказка по клавишам
-const ROW_MSG: usize = SCREEN_HEIGHT - 1; // строка сообщений
+
+// Нижние две строки экрана — подсказка и строка сообщений. Раньше это были
+// константы (экран был всегда 80x30), теперь сетка считается под разрешение
+// монитора, и строки снизу надо брать у `vga`.
+fn row_help() -> usize {
+    screen_rows() - 2
+}
+fn row_msg() -> usize {
+    screen_rows() - 1
+}
 /// Сколько строк отдаём под таблицу.
-const TABLE_ROWS: usize = ROW_HELP - ROW_FIRST;
+fn table_rows() -> usize {
+    row_help() - ROW_FIRST
+}
 
 // Начала колонок обязаны совпадать с форматной строкой в draw() и draw_field()
 // ниже: строка задач начинается с маркера '>' (1 символ), поэтому PID сдвинут
@@ -116,7 +126,7 @@ fn draw_field(writer: &mut Writer, row: usize, col: usize, width: usize, s: &str
 fn draw_text(writer: &mut Writer, row: usize, col: usize, s: &str, color: u8) {
     writer.set_color(color);
     for (i, &ch) in s.as_bytes().iter().enumerate() {
-        if col + i >= SCREEN_WIDTH {
+        if col + i >= screen_cols() {
             break;
         }
         writer.put(row, col + i, ch);
@@ -349,16 +359,19 @@ pub fn run(writer: &mut Writer) {
         }
 
         draw(writer, &rows, &t);
+        // Кадр `top` показываем целиком: пока он нарисован по кускам, таблица
+        // выглядит пересчитывающейся, а не мгновенно обновлённой.
+        writer.sync();
     }
 
     crate::desk::clear_fg();
 
     // Убираем подсказку и возвращаем курсор вниз экрана под приглашение.
-    for r in ROW_HELP..SCREEN_HEIGHT {
-        draw_field(writer, r, 0, SCREEN_WIDTH, "", C_HELP);
+    for r in row_help()..screen_rows() {
+        draw_field(writer, r, 0, screen_cols(), "", C_HELP);
     }
     writer.set_color(crate::vga::COLOR_WHITE);
-    writer.set_cursor(ROW_MSG, 0);
+    writer.set_cursor(row_msg(), 0);
 }
 
 /// Один кадр целиком.
@@ -369,7 +382,7 @@ fn draw(writer: &mut Writer, rows: &[Row], t: &Top) {
         writer,
         ROW_TOP,
         0,
-        SCREEN_WIDTH,
+        screen_cols(),
         &format!(
             "top - up {},  {} tasks,  {} running,  {}% CPU,  {}/{} mem",
             uptime_str(scheduler::ticks()),
@@ -388,7 +401,7 @@ fn draw(writer: &mut Writer, rows: &[Row], t: &Top) {
         writer,
         ROW_LOAD,
         0,
-        SCREEN_WIDTH,
+        screen_cols(),
         &format!(
             "load average: {:.2}, {:.2}, {:.2}    heap peak {}",
             l1,
@@ -404,7 +417,7 @@ fn draw(writer: &mut Writer, rows: &[Row], t: &Top) {
         writer,
         ROW_HEAD,
         0,
-        SCREEN_WIDTH,
+        screen_cols(),
         &format!(
             "  {:>4}  {:<11}{:>8}  {:>5}  {}",
             "PID", "STATE", "TIME", "%CPU", "COMMAND"
@@ -423,12 +436,12 @@ fn draw(writer: &mut Writer, rows: &[Row], t: &Top) {
 
     // ─── Строки задач ────────────────────────────────────────────────────
     // Если выбранная строка уехала за нижний край — прокручиваем таблицу.
-    let start = if t.sel >= TABLE_ROWS { t.sel + 1 - TABLE_ROWS } else { 0 };
-    for slot in 0..TABLE_ROWS {
+    let start = if t.sel >= table_rows() { t.sel + 1 - table_rows() } else { 0 };
+    for slot in 0..table_rows() {
         let r = ROW_FIRST + slot;
         let idx = start + slot;
         let Some(row) = rows.get(idx) else {
-            draw_field(writer, r, 0, SCREEN_WIDTH, "", C_ROW);
+            draw_field(writer, r, 0, screen_cols(), "", C_ROW);
             continue;
         };
         let base = if row.running { C_RUN } else { C_ROW };
@@ -438,7 +451,7 @@ fn draw(writer: &mut Writer, rows: &[Row], t: &Top) {
             writer,
             r,
             0,
-            SCREEN_WIDTH,
+            screen_cols(),
             &format!(
                 "{} {:>4}  {:<11}{:>8}  {:>5}  {}",
                 marker,
@@ -472,17 +485,17 @@ fn draw(writer: &mut Writer, rows: &[Row], t: &Top) {
     // ─── Подсказка и сообщение ───────────────────────────────────────────
     draw_field(
         writer,
-        ROW_HELP,
+        row_help(),
         0,
-        SCREEN_WIDTH,
+        screen_cols(),
         &format!(
             "sort: {}   <-/->: field   up/down: select   k: kill   q: quit",
             t.sort.title()
         ),
         C_HELP,
     );
-    draw_field(writer, ROW_MSG, 0, SCREEN_WIDTH, &t.msg, C_MSG);
+    draw_field(writer, row_msg(), 0, screen_cols(), &t.msg, C_MSG);
 
     // Курсор — на строке сообщений, чтобы не мигал поверх таблицы.
-    writer.set_cursor(ROW_MSG, 0);
+    writer.set_cursor(row_msg(), 0);
 }

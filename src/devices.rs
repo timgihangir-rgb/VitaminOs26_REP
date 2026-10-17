@@ -39,7 +39,11 @@ pub fn dev_write(name: &str, data: &[u8]) -> bool {
             // недоступен отсюда, а CRTC всегда отражает реальное место вывода.
             let mut w = crate::vga::Writer::at_hw_cursor();
             for &b in data {
-                if b == b'\n' || (0x20..0x7F).contains(&b) {
+                // Управляющие пропускаем, а 0x80..0xFF пропускаем только
+                // если это не буква кодовой страницы: кириллица в CP1251 -
+                // это 0xC0..0xFF плюс Ё/ё, и `cat файла > /dev/tty` должен
+                // печатать по-русски.
+                if b == b'\n' || (0x20..0x7F).contains(&b) || crate::vga::code_page(b as char) != b'?' {
                     w.write_byte(b);
                 }
             }

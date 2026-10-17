@@ -3,13 +3,15 @@
  * Вывод идёт в VGA с позиции vga_offset; в конце выставляет EXIT_ROW/COL,
  * чтобы промпт шелла не перерисовался поверх вывода. */
 
+#include "../common/vgasize.h"
+
 #define EXIT_ROW_P 0x708C
 #define EXIT_COL_P 0x7090
 
 static void put_char(unsigned int *offset, char ch, char attr) {
     volatile char *vga = (volatile char *)0xB8000;
     if (ch == '\n') {
-        *offset = (*offset / 160 + 1) * 160;
+        *offset = (*offset / (g_screen_w * 2) + 1) * (g_screen_w * 2);
         return;
     }
     vga[*offset] = ch;
@@ -36,6 +38,8 @@ static void put_u64(unsigned int *offset, unsigned long v, char attr) {
 }
 
 void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
+    vga_read_grid();
+
     unsigned int off = vga_offset;
 
     put_str(&off, "argc=", 0x0B);
@@ -53,6 +57,6 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
     }
 
     /* Курсор за концом вывода: промпт рисуется ниже, не затирая строки. */
-    *(volatile int *)EXIT_ROW_P = (int)(off / 160);
-    *(volatile int *)EXIT_COL_P = (int)((off % 160) / 2);
+    *(volatile int *)EXIT_ROW_P = (int)(off / (g_screen_w * 2));
+    *(volatile int *)EXIT_COL_P = (int)((off % (g_screen_w * 2)) / 2);
 }

@@ -7,6 +7,8 @@
  * экраном (от строки vga_offset вниз); при нехватке места — "..." в конце.
  */
 
+#include "../common/vgasize.h"
+
 #define VFS_READ_P  0x7818
 #define EXIT_ROW_P  0x708C
 #define EXIT_COL_P  0x7090
@@ -22,7 +24,7 @@ static const char hexd[] = "0123456789abcdef";
  * Возвращает колонку конца (для EXIT_COL). */
 static int draw_line(int row, int off, int n) {
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
-    int base = row * 160;
+    int base = row * (int)(g_screen_w * 2);
     int col = 0;
 
     /* offset: 8 hex-цифр (cyan) */
@@ -84,6 +86,8 @@ static int draw_line(int row, int off, int n) {
 }
 
 void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
+    vga_read_grid();
+
     const char *path = (argc >= 2) ? argv[1] : 0;
     if (!path) {
         path = "usage: hexdump <path>";
@@ -91,17 +95,17 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
     int len = abi_read(path, buf, sizeof(buf));
     if (len < 0) {
         volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
-        int row = (int)(vga_offset / 160);
+        int row = (int)(vga_offset / (g_screen_w * 2));
         int col = 0;
         const char *m = "hexdump: cannot read: ";
-        while (*m && col < 79) {
-            vga[row * 160 + col * 2] = (unsigned char)*m++;
-            vga[row * 160 + col * 2 + 1] = 0x0F;
+        while (*m && col < (int)g_screen_w - 1) {
+            vga[row * (int)(g_screen_w * 2) + col * 2] = (unsigned char)*m++;
+            vga[row * (int)(g_screen_w * 2) + col * 2 + 1] = 0x0F;
             col++;
         }
-        while (*path && col < 79) {
-            vga[row * 160 + col * 2] = (unsigned char)*path++;
-            vga[row * 160 + col * 2 + 1] = 0x0F;
+        while (*path && col < (int)g_screen_w - 1) {
+            vga[row * (int)(g_screen_w * 2) + col * 2] = (unsigned char)*path++;
+            vga[row * (int)(g_screen_w * 2) + col * 2 + 1] = 0x0F;
             col++;
         }
         *(volatile int *)EXIT_ROW_P = row;
@@ -109,8 +113,8 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
         return;
     }
 
-    int start_row = (int)(vga_offset / 160);
-    int rows = 30 - start_row;
+    int start_row = (int)(vga_offset / (g_screen_w * 2));
+    int rows = (int)g_screen_h - start_row;
     int needed = (len + 15) / 16;
     int show = needed;
     int truncated = 0;
@@ -133,9 +137,9 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
         int row = start_row + show;
         int col = 0;
         const char *m = "... (";
-        while (*m && col < 79) {
-            vga[row * 160 + col * 2] = (unsigned char)*m++;
-            vga[row * 160 + col * 2 + 1] = 0x0B;
+        while (*m && col < (int)g_screen_w - 1) {
+            vga[row * (int)(g_screen_w * 2) + col * 2] = (unsigned char)*m++;
+            vga[row * (int)(g_screen_w * 2) + col * 2 + 1] = 0x0B;
             col++;
         }
         char num[16];
@@ -148,31 +152,31 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
             left /= 10;
         }
         for (int k = n2 - 1; k >= 0; k--) {
-            if (col >= 79) break;
-            vga[row * 160 + col * 2] = (unsigned char)num[k];
-            vga[row * 160 + col * 2 + 1] = 0x0B;
+            if (col >= (int)g_screen_w - 1) break;
+            vga[row * (int)(g_screen_w * 2) + col * 2] = (unsigned char)num[k];
+            vga[row * (int)(g_screen_w * 2) + col * 2 + 1] = 0x0B;
             col++;
         }
-        vga[row * 160 + col * 2] = ' ';
-        vga[row * 160 + col * 2 + 1] = 0x0B;
+        vga[row * (int)(g_screen_w * 2) + col * 2] = ' ';
+        vga[row * (int)(g_screen_w * 2) + col * 2 + 1] = 0x0B;
         col++;
-        vga[row * 160 + col * 2] = 'b';
-        vga[row * 160 + col * 2 + 1] = 0x0B;
+        vga[row * (int)(g_screen_w * 2) + col * 2] = 'b';
+        vga[row * (int)(g_screen_w * 2) + col * 2 + 1] = 0x0B;
         col++;
-        vga[row * 160 + col * 2] = 'y';
-        vga[row * 160 + col * 2 + 1] = 0x0B;
+        vga[row * (int)(g_screen_w * 2) + col * 2] = 'y';
+        vga[row * (int)(g_screen_w * 2) + col * 2 + 1] = 0x0B;
         col++;
-        vga[row * 160 + col * 2] = 't';
-        vga[row * 160 + col * 2 + 1] = 0x0B;
+        vga[row * (int)(g_screen_w * 2) + col * 2] = 't';
+        vga[row * (int)(g_screen_w * 2) + col * 2 + 1] = 0x0B;
         col++;
-        vga[row * 160 + col * 2] = 'e';
-        vga[row * 160 + col * 2 + 1] = 0x0B;
+        vga[row * (int)(g_screen_w * 2) + col * 2] = 'e';
+        vga[row * (int)(g_screen_w * 2) + col * 2 + 1] = 0x0B;
         col++;
-        vga[row * 160 + col * 2] = 's';
-        vga[row * 160 + col * 2 + 1] = 0x0B;
+        vga[row * (int)(g_screen_w * 2) + col * 2] = 's';
+        vga[row * (int)(g_screen_w * 2) + col * 2 + 1] = 0x0B;
         col++;
-        vga[row * 160 + col * 2] = ')';
-        vga[row * 160 + col * 2 + 1] = 0x0B;
+        vga[row * (int)(g_screen_w * 2) + col * 2] = ')';
+        vga[row * (int)(g_screen_w * 2) + col * 2 + 1] = 0x0B;
         col++;
         last_row = row;
         last_col = col;

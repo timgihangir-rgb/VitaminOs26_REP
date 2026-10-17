@@ -158,6 +158,9 @@ pub fn boot(writer: &mut Writer) {
             writer.set_color(crate::vga::COLOR_WHITE);
             writer.write_string(&alloc::format!("service: {}", svc));
             writer.write_string("\n");
+            // Старт сервиса занимает заметное время; без кадра пользователь
+            // смотрит на застывший экран и не понимает, что идёт загрузка.
+            writer.sync();
         }
         crate::vga::serial_write_atomic("[B] logged ");
         crate::vga::serial_write_atomic(&svc);

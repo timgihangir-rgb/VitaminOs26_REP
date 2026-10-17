@@ -1753,27 +1753,166 @@ pub fn mount_or_format() -> bool {
     format_image()
 }
 
+/// Номер блока файла по логическому индексу. Отдельная функция, чтобы не
+/// строить Vec для block_list на каждый вызов диапазонного доступа.
+/// Без косвенного блока многодилка: idx < DIRECT_BLOCKS - прямо в direct,
+/// иначе читаем косвенный блок и берём оттуда.
+fn block_number(_sb: &Superblock, node: &DiskInode, idx: u32) -> Option<u32> {
+    if (idx as usize) < DIRECT_BLOCKS {
+        let b = node.direct[idx as usize];
+        return if b == 0 { None } else { Some(b) };
+    }
+    let iidx = idx as usize - DIRECT_BLOCKS;
+    if iidx >= PTRS_PER_BLOCK {
+        return None;
+    }
+    if node.indirect1 == 0 {
+        return None;
+    }
+    let mut ind = [0u8; BLOCK_SIZE];
+    if !fs_read_block(node.indirect1 as u64, &mut ind) {
+        return None;
+    }
+    let o = iidx * 4;
+    let b = u32::from_le_bytes(ind[o..o + 4].try_into().ok()?);
+    if b == 0 {
+        None
+    } else {
+        Some(b)
+    }
+}
+
+/// Читает до buf.len() байт начиная с offset. Возвращает число
+/// прочитанных байт (0 — конец файла). Читает только нужные блоки,
+/// т.е. работает с любым размером файла и не строит Vec.
+pub fn file_read_range(
+    sb: &Superblock,
+    ino: u32,
+    offset: u64,
+    buf: &mut [u8],
+) -> Option<usize> {
+    let node = iget(sb, ino)?;
+    if node.itype != TYPE_FILE && node.itype != TYPE_DIR {
+        return None;
+    }
+    let file_size = node.size as u64;
+    if offset >= file_size {
+        return Some(0); // конец файла
+    }
+    let to_read = core::cmp::min(buf.len() as u64, file_size - offset) as usize;
+    if to_read == 0 {
+        return Some(0);
+    }
+
+    let first_block = (offset / BLOCK_SIZE as u64) as u32;
+    let last_block = ((offset + to_read as u64 - 1) / BLOCK_SIZE as u64) as u32;
+    let mut done = 0usize;
+    let mut blk_buf = [0u8; BLOCK_SIZE];
+
+    for bi in first_block..=last_block {
+        let bno = block_number(sb, &node, bi)?;
+        if !fs_read_block(bno as u64, &mut blk_buf) {
+            return None;
+        }
+        let block_start = bi as u64 * BLOCK_SIZE as u64;
+        let copy_from = offset.saturating_sub(block_start) as usize;
+        let copy_to = core::cmp::min(
+            BLOCK_SIZE,
+            (offset + to_read as u64 - block_start) as usize,
+        );
+        let n = copy_to - copy_from;
+        buf[done..done + n].copy_from_slice(&blk_buf[copy_from..copy_to]);
+        done += n;
+        if done >= to_read {
+            break;
+        }
+    }
+    Some(done)
+}
+
+/// Пишет data начиная с offset, расширяя файл при необходимости.
+/// offset обязан быть <= size (sparse не поддержан).
+pub fn file_write_range(
+    sb: &Superblock,
+    ino: u32,
+    offset: u64,
+    data: &[u8],
+) -> Option<usize> {
+    let mut node = iget(sb, ino)?;
+    if node.itype != TYPE_FILE {
+        return None;
+    }
+    if offset > node.size as u64 {
+        return None; // sparse не поддержан
+    }
+    if data.is_empty() {
+        node.mtime = crate::rtc::now_unix() as u32;
+        if iput(sb, ino, &node) {
+            return Some(0);
+        }
+        return None;
+    }
+
+    let first_block = (offset / BLOCK_SIZE as u64) as u32;
+    let end = offset + data.len() as u64;
+    let last_block = ((end - 1) / BLOCK_SIZE as u64) as u32;
+    let mut done = 0usize;
+
+    for bi in first_block..=last_block {
+        let block_start = bi as u64 * BLOCK_SIZE as u64;
+
+        // Начало диапазона в этом блоке.
+        let from = (offset.max(block_start) - block_start) as usize;
+        let to = (core::cmp::min(end, block_start + BLOCK_SIZE as u64) - block_start) as usize;
+
+        let mut blk_buf = [0u8; BLOCK_SIZE];
+        // Если пишем не в весь блок — читаем его, чтобы сохранить байты
+        // за пределами диапазона. Если пишем весь — читать не нужно;
+        // для нового блока (bi >= n_data_blocks) чтения не существует.
+        if from > 0 || to < BLOCK_SIZE {
+            if bi < node.n_data_blocks() {
+                if file_read_block(sb, ino, bi, &mut blk_buf).is_none() {
+                    return None;
+                }
+            }
+        }
+
+        let src_from = done;
+        let src_to = done + (to - from);
+        blk_buf[from..to].copy_from_slice(&data[src_from..src_to]);
+
+        if file_write_block(sb, &mut node, bi, &blk_buf).is_none() {
+            return None;
+        }
+        done += to - from;
+        if done >= data.len() {
+            break;
+        }
+    }
+
+    if end > node.size as u64 {
+        node.size = end as u32;
+    }
+    node.mtime = crate::rtc::now_unix() as u32;
+    if !iput(sb, ino, &node) {
+        return None;
+    }
+    Some(done)
+}
+
 /// Читает содержимое файла целиком (обрезается по inode.size).
+/// Теперь построен на file_read_range: никаких отдельных путей, предел
+/// MAX_FILE_IO больше не в этой функции.
 pub fn file_read_all(sb: &Superblock, ino: u32) -> Option<alloc::vec::Vec<u8>> {
     let node = iget(sb, ino)?;
     if node.itype != TYPE_FILE && node.itype != TYPE_DIR {
         return None;
     }
     let len = node.size as usize;
-    if len > MAX_FILE_IO {
-        return None;
-    }
-    let mut out = alloc::vec::Vec::with_capacity(len);
-    let nblocks = node.n_data_blocks();
-    let mut buf = [0u8; BLOCK_SIZE];
-    for bi in 0..nblocks {
-        file_read_block(sb, ino, bi, &mut buf)?;
-        let start = bi as usize * BLOCK_SIZE;
-        let take = core::cmp::min(BLOCK_SIZE, len - start);
-        out.extend_from_slice(&buf[..take]);
-        if out.len() >= len {
-            break;
-        }
+    let mut out = alloc::vec![0u8; len];
+    let n = file_read_range(sb, ino, 0, &mut out)?;
+    if n != len {
+        return None; // диск отдал меньше, чем обещал inode
     }
     Some(out)
 }
@@ -2238,5 +2377,101 @@ pub fn fsck_lite(sb: &Superblock) -> bool {
         crate::vga::serial_u64(bad_ptrs as u64);
     }
     crate::vga::serial_write_atomic("\n");
+    true
+}
+
+/// Самотест диапазонного доступа (не вызывается при загрузке, запускается
+/// вручную из dev-скриптов, как прочие *_selftest_disk).
+#[allow(dead_code)]
+pub fn range_selftest_disk() -> bool {
+    const TEST_ROOT: u32 = 1001;
+    idrop_all();
+    crate::bcache::drop_all();
+    let sb = current_sb();
+    let now = crate::rtc::now_unix() as u32;
+    let root = DiskInode {
+        itype: TYPE_DIR,
+        perms: 0o755,
+        size: 0,
+        links: 1,
+        atime: now,
+        mtime: now,
+        device_id: 0,
+        uid: 0,
+        direct: [0; DIRECT_BLOCKS],
+        indirect1: 0,
+        indirect2: 0,
+        indirect3: 0,
+        target: [0; SYMLINK_MAX],
+    };
+    if !iput(&sb, TEST_ROOT, &root) {
+        return false;
+    }
+    let f = match create_node(&sb, TEST_ROOT, "range.bin", TYPE_FILE) {
+        Some(f) => f,
+        None => return false,
+    };
+
+    // Пишем 200 КиБ через диапазоны по 1000 байт.
+    let mut payload = alloc::vec![0u8; 200 * 1024];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let mut off = 0;
+    while off < payload.len() {
+        let end = (off + 1000).min(payload.len());
+        let chunk = &payload[off..end];
+        match file_write_range(&sb, f, off as u64, chunk) {
+            Some(n) if n == chunk.len() => {
+                off += n;
+            }
+            _ => return false,
+        }
+    }
+
+    // Читаем обратно диапазонами по 777 байт.
+    let mut got = alloc::vec![0u8; payload.len()];
+    let mut off = 0;
+    while off < got.len() {
+        let want = (off + 777).min(got.len()) - off;
+        match file_read_range(&sb, f, off as u64, &mut got[off..off + want]) {
+            Some(n) if n == want => {
+                off += n;
+            }
+            _ => return false,
+        }
+    }
+    if got != payload {
+        return false;
+    }
+
+    // Чтение за концом файла возвращает 0.
+    let mut tiny = [0u8; 16];
+    match file_read_range(&sb, f, payload.len() as u64, &mut tiny) {
+        Some(0) => {}
+        _ => return false,
+    }
+
+    // Частичная запись в середину не затирает соседей.
+    let overlay = [0xAAu8; 500];
+    let mid = payload.len() / 2;
+    if file_write_range(&sb, f, mid as u64, &overlay) != Some(500) {
+        return false;
+    }
+    let mut probe = [0u8; 1];
+    if file_read_range(&sb, f, (mid - 1) as u64, &mut probe) != Some(1)
+        || probe[0] != payload[mid - 1]
+    {
+        return false;
+    }
+    if file_read_range(&sb, f, (mid + 500) as u64, &mut probe) != Some(1)
+        || probe[0] != payload[mid + 500]
+    {
+        return false;
+    }
+    let mut part = [0u8; 500];
+    if file_read_range(&sb, f, mid as u64, &mut part) != Some(500) || part != overlay {
+        return false;
+    }
     true
 }

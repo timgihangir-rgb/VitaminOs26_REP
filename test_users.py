@@ -128,18 +128,38 @@ def vga_addr():
     return m.group(1) if m else "0xb8000"
 
 
+def grid():
+    """Размер текстовой сетки в ячейках.
+
+    Сетку больше не 80x30 на все случаи: композитор выбирает её под
+    разрешение монитора (см. `fit_grid` в src/fb.rs), и на 1280x800 это
+    80x25 в масштабе 2x - буквы вдвое крупнее и занимают весь кадр. Ядро
+    печатает итог в serial строкой "[N] fb WxH scale=N grid=CxR", по ней и
+    читаем, сколько колонок и строк разбирать из дампа экрана. Нет такой
+    строки - композитор не включился, система в текстовом режиме, и сетка
+    историческая.
+    """
+    try:
+        log = open(SERIAL_LOG, errors="replace").read()
+    except OSError:
+        return 80, 30
+    m = re.search(r"grid=(\d+)x(\d+)", log)
+    return (int(m.group(1)), int(m.group(2))) if m else (80, 30)
+
+
 def screen(s):
-    hmp(s, f'pmemsave {vga_addr()} 9600 "{VGA_DUMP}"')
+    hmp(s, f'pmemsave {vga_addr()} 65536 "{VGA_DUMP}"')
     time.sleep(0.45)
     try:
         data = open(VGA_DUMP, "rb").read()
     except FileNotFoundError:
         return ""
     lines = []
-    for row in range(30):
+    cols, rows_ = grid()
+    for row in range(rows_):
         chars = []
-        for col in range(80):
-            b = data[row * 160 + col * 2]
+        for col in range(cols):
+            b = data[row * cols * 2 + col * 2]
             chars.append(chr(b) if 32 <= b < 127 else " ")
         lines.append("".join(chars).rstrip())
     return "\n".join(lines)

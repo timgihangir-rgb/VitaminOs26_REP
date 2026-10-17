@@ -18,6 +18,8 @@
  * бинарник с его самого первого байта (как и во всех остальных /bin-программах).
  */
 
+#include "../common/vgasize.h"
+
 #define TICKS_PTR   0x7800
 #define HLT_PTR     0x7808
 #define VFS_WRITE_P 0x7810
@@ -71,6 +73,8 @@ static int read_state(long *prev, long *delta);
 static void save_state(long prev, long delta);
 
 void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
+    vga_read_grid();
+
     (void)argc;
     (void)argv;
     if (vga_offset == 0)
@@ -411,16 +415,17 @@ static void command_mode(unsigned int vga_offset) {
 
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
     int off = (int)vga_offset;
-    for (int i = 0; i < n && off + 2 * i < 9600; i++) {
+    int screen_end = (int)(g_screen_w * g_screen_h) * 2;
+    for (int i = 0; i < n && off + 2 * i < screen_end; i++) {
         vga[off + 2 * i] = (unsigned char)line[i];
         vga[off + 2 * i + 1] = 0x0F;
     }
 
-    int start_row = (int)(vga_offset / 160);
-    int start_col = (int)((vga_offset % 160) / 2);
+    int start_row = (int)(vga_offset / (g_screen_w * 2));
+    int start_col = (int)((vga_offset % (g_screen_w * 2)) / 2);
     int end_col = start_col + n;
-    if (end_col > 79)
-        end_col = 79;
+    if (end_col > (int)g_screen_w - 1)
+        end_col = (int)g_screen_w - 1;
     *(volatile int *)EXIT_ROW_P = start_row;
     *(volatile int *)EXIT_COL_P = end_col;
 }

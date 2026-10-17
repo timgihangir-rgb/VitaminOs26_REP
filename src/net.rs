@@ -173,25 +173,109 @@ pub const NET_ERR: i32 = -3; // фатальная ошибка (нет карт
 /// Буфер принятых данных. Реальные страницы (example.com ~1 КБ, iana.org —
 /// десятки КБ) не влезали в прежние 16 КиБ: переполнение молча обрезало хвост
 /// документа. 96 КиБ — с запасом на типичную HTML-страницу целиком.
-const TCP_RX_CAP: usize = 98304;
 const TCP_HS_TIMEOUT: u64 = 400; // 4 c на ARP+SYN-фазу рукопожатия
 
-/// Фазы соединения: 0 — ARP, 1 — SYN послан, 2 — ESTABLISHED, 4 — RST/ошибка.
-static mut TCP_ACTIVE: bool = false;
-static mut TCP_PHASE: u8 = 0;
-static mut TCP_START_TICK: u64 = 0;
-static mut TCP_ISN: u32 = 0; // seq нашего SYN
-static mut TCP_SEND_SEQ: u32 = 0; // seq следующего отправляемого сегмента
-static mut TCP_RECV_NEXT: u32 = 0; // следующий ожидаемый от пира seq (= наш ack)
-static mut TCP_DST_IP: [u8; 4] = [0; 4];
-static mut TCP_DST_MAC: [u8; 6] = [0; 6];
-static mut TCP_DST_PORT: u16 = 0;
-static mut TCP_SRC_PORT: u16 = 0;
-static mut TCP_RST: bool = false;
-static mut TCP_GOT_FIN: bool = false;
-static mut TCP_RX: [u8; TCP_RX_CAP] = [0; TCP_RX_CAP];
-static mut TCP_RX_LEN: usize = 0; // всего накоплено
-static mut TCP_RX_READ: usize = 0; // прочитано приложением
+pub const MAX_SOCKETS: usize = 16;
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SocketState {
+    Free,
+    ArpPending,
+    SynSent,
+    Established,
+    Closing,
+    Closed,
+    Error,
+}
+
+const RX_CAP_PER_SOCKET: usize = 98304; // как у TCP_RX_CAP, но на сокет
+
+struct Socket {
+    state: SocketState,
+    dst_ip: [u8; 4],
+    dst_mac: [u8; 6],
+    dst_port: u16,
+    src_port: u16,
+    seq_send: u32,
+    seq_recv: u32,
+    isn: u32,
+    start_tick: u64,
+    rx: alloc::vec::Vec<u8>,
+    rx_len: usize,
+    rx_read: usize,
+    fin_received: bool,
+    rst_received: bool,
+    owner_pid: usize,
+}
+
+impl Socket {
+    fn new() -> Socket {
+        Socket {
+            state: SocketState::Free,
+            dst_ip: [0; 4],
+            dst_mac: [0; 6],
+            dst_port: 0,
+            src_port: 0,
+            seq_send: 0,
+            seq_recv: 0,
+            isn: 0,
+            start_tick: 0,
+            rx: alloc::vec![0u8; RX_CAP_PER_SOCKET],
+            rx_len: 0,
+            rx_read: 0,
+            fin_received: false,
+            rst_received: false,
+            owner_pid: crate::scheduler::current_pid(),
+        }
+    }
+}
+
+static mut SOCKETS: [Option<Socket>; MAX_SOCKETS] = [
+    None, None, None, None,
+    None, None, None, None,
+    None, None, None, None,
+    None, None, None, None,
+];
+
+pub type SocketId = usize;
+
+fn with_socket<R>(id: SocketId, f: impl FnOnce(&Socket) -> R) -> Option<R> {
+    if id >= MAX_SOCKETS {
+        return None;
+    }
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        SOCKETS[id].as_ref().map(f)
+    })
+}
+
+fn with_socket_mut<R>(id: SocketId, f: impl FnOnce(&mut Socket) -> R) -> Option<R> {
+    if id >= MAX_SOCKETS {
+        return None;
+    }
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        SOCKETS[id].as_mut().map(f)
+    })
+}
+
+fn alloc_socket() -> Option<SocketId> {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        for i in 0..MAX_SOCKETS {
+            if SOCKETS[i].is_none() {
+                SOCKETS[i] = Some(Socket::new());
+                return Some(i);
+            }
+        }
+        None
+    })
+}
+
+fn free_socket(id: SocketId) {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        if id < MAX_SOCKETS {
+            SOCKETS[id] = None;
+        }
+    });
+}
 
 // ─── Доступ к портам чипа ───────────────────────────────────────────────────
 unsafe fn inb(reg: u16) -> u8 {
@@ -274,6 +358,24 @@ pub fn init() -> bool {
     }
 }
 
+/// MAC-адрес карты (6 байт) или `None`, если rtl8139 не найдена.
+/// Для sysinfo/fetch: без этого программа ring 3 не может узнать даже то,
+/// что сетевой драйвер вообще поднялся.
+pub fn mac() -> Option<[u8; 6]> {
+    unsafe {
+        if INITIALIZED && IO_BASE != 0 {
+            Some(MAC)
+        } else {
+            None
+        }
+    }
+}
+
+/// Драйвер поднялся и карта на конфигурации rtl8139.
+pub fn ready() -> bool {
+    unsafe { INITIALIZED && IO_BASE != 0 }
+}
+
 /// Последовательность конфигурации чипа (выверена по hw/net/rtl8139.c).
 unsafe fn rtl_hw_init() {
     // 1) Аппаратный сброс.
@@ -325,6 +427,21 @@ unsafe fn build_eth(dst: &[u8; 6], ethertype: u16, payload: &[u8]) -> usize {
 /// следующему дескриптору — поэтому драйвер ведёт свой счётчик и пишет в свой
 /// TSAD. Ждём TxHostOwns именно на своём дескрипторе.
 unsafe fn tx_send(len: usize) -> bool {
+    let mut len = len;
+    // Ethernet требует кадр длиной НЕ МЕНЕЕ 60 байт (без FCS); короткие
+    // добиваются нулями. Без этого первая половина TLS-записи (5 байт:
+    // заголовок 16 03 03 00 c4) даёт кадр 14+20+20+5 = 59 байт, и QEMU/slirp
+    // такой кадр доставляет не целиком: у сервера пропадал первый байт
+    // ClientHello, и он отвечал alert вместо ServerHello.
+    if len < 60 {
+        let n = core::cmp::min(60, TX_BUF.len());
+        let mut i = len;
+        while i < n {
+            TX_BUF[i] = 0;
+            i += 1;
+        }
+        len = n;
+    }
     // Публикуем данные в гостевой памяти перед «DMA-чтением» эмулятора.
     let buf = TX_BUF.as_ptr();
     clflush_range(buf as usize, len);
@@ -575,15 +692,15 @@ fn handle_udp(pkt: &[u8], ihl: usize) {
 /// кладётся сразу после TCP-заголовка: для SYN это опции, для данных —
 /// payload). `data_off` — длина TCP-заголовка в 4-байтовых словах
 /// (SYN c MSS = 6, обычные сегменты = 5).
-unsafe fn tcp_seg(flags: u8, data_off: u8, seq: u32, ack: u32, body: &[u8]) -> bool {
+unsafe fn tcp_seg_for(s: &Socket, flags: u8, data_off: u8, seq: u32, ack: u32, body: &[u8]) -> bool {
     let hdr = (data_off as usize) * 4;
     let tcp_len = hdr + body.len();
     if tcp_len > 1400 {
         return false;
     }
     let mut seg = [0u8; 1400];
-    seg[0..2].copy_from_slice(&TCP_SRC_PORT.to_be_bytes());
-    seg[2..4].copy_from_slice(&TCP_DST_PORT.to_be_bytes());
+    seg[0..2].copy_from_slice(&s.src_port.to_be_bytes());
+    seg[2..4].copy_from_slice(&s.dst_port.to_be_bytes());
     seg[4..8].copy_from_slice(&seq.to_be_bytes());
     seg[8..12].copy_from_slice(&ack.to_be_bytes());
     seg[12] = data_off << 4;
@@ -600,7 +717,7 @@ unsafe fn tcp_seg(flags: u8, data_off: u8, seq: u32, ack: u32, body: &[u8]) -> b
     // TCP checksum: псевдозаголовок (src, dst, 0, 6, tcp_len) + сегмент.
     let mut c = [0u8; 12 + 1400];
     c[0..4].copy_from_slice(&OWN_IP);
-    c[4..8].copy_from_slice(&TCP_DST_IP);
+    c[4..8].copy_from_slice(&s.dst_ip);
     c[8] = 0;
     c[9] = 6;
     c[10..12].copy_from_slice(&(tcp_len as u16).to_be_bytes());
@@ -616,38 +733,81 @@ unsafe fn tcp_seg(flags: u8, data_off: u8, seq: u32, ack: u32, body: &[u8]) -> b
     ip[8] = 64; // TTL
     ip[9] = 6; // TCP
     ip[12..16].copy_from_slice(&OWN_IP);
-    ip[16..20].copy_from_slice(&TCP_DST_IP);
+    ip[16..20].copy_from_slice(&s.dst_ip);
     let ip_sum = checksum(&ip);
     ip[10..12].copy_from_slice(&ip_sum.to_be_bytes());
 
     let mut frame = [0u8; 1420];
     frame[..20].copy_from_slice(&ip);
     frame[20..20 + tcp_len].copy_from_slice(&seg[..tcp_len]);
-    let len = build_eth(&TCP_DST_MAC, 0x0800, &frame[..20 + tcp_len]);
+    let len = build_eth(&s.dst_mac, 0x0800, &frame[..20 + tcp_len]);
     let ok = tx_send(len);
 
     ok
 }
 
-/// Шлёт SYN с опцией MSS 1460 внутри TCP-заголовка (seq = TCP_ISN).
-unsafe fn tcp_send_syn() {
-    let _ = tcp_seg(0x02, 6, TCP_ISN, 0, &[]);
+/// Шлёт SYN с опцией MSS 1460 внутри TCP-заголовка (seq = socket.isn).
+unsafe fn send_syn_for(sid: SocketId) {
+    with_socket_mut(sid, |s| {
+        let _ = tcp_seg_for(&*s, 0x02, 6, s.isn, 0, &[]);
+        // SYN занимает один номер последовательности: следующий сегмент
+        // обязан идти с isn+1. Без этого пир считал первый байт данных
+        // повтором байта SYN и отбрасывал РОВНО ЕГО — TLS-клиент терял
+        // первый байт ClientHello (тип записи 0x16), и сервер отвечал
+        // alert вместо ServerHello.
+        s.seq_send = s.isn.wrapping_add(1);
+    });
 }
 
-/// Разбор входящего TCP-сегмента единственного активного соединения.
-/// Принимаем строго in-order данные (выброс дубликатов/пропусков заставляет
-/// пира ретрамитить), ACKим всё принятое; FIN закрывает поток (EOF для
-/// приложения).
+/// Разбор входящего TCP-сегмента: по четвёрке (src_ip,src_port,dst_port)
+/// находим сокет-владельца и обрабатываем сегмент в его контексте.
 fn handle_tcp(pkt: &[u8], ihl: usize) {
     unsafe {
-        if !TCP_ACTIVE || TCP_PHASE == 4 || pkt.len() < ihl + 20 {
+        if pkt.len() < ihl + 20 {
             return;
         }
         let seg = &pkt[ihl..];
+        if seg.len() < 20 {
+            return;
+        }
         let src_port = u16::from_be_bytes([seg[0], seg[1]]);
         let dst_port = u16::from_be_bytes([seg[2], seg[3]]);
-        if src_port != TCP_DST_PORT || dst_port != TCP_SRC_PORT {
+        let src_ip: [u8; 4] = match pkt.get(12..16).and_then(|b| b.try_into().ok()) {
+            Some(v) => v,
+            None => return,
+        };
+
+        // Точный поиск: сегмент должен ссылаться на один из живых сокетов.
+        let mut target: Option<SocketId> = None;
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            for i in 0..MAX_SOCKETS {
+                if let Some(s) = SOCKETS[i].as_ref() {
+                    if s.dst_ip == src_ip && s.dst_port == src_port && s.src_port == dst_port
+                        && s.state != SocketState::Free && s.state != SocketState::Error
+                    {
+                        target = Some(i);
+                        return;
+                    }
+                }
+            }
+        });
+        let Some(sid) = target else {
             return; // не наш поток
+        };
+        process_tcp_segment(sid, seg);
+    }
+}
+
+/// Обработка входящего сегмента для конкретного сокета. Принимаем строго
+/// in-order данные (выброс дубликатов/пропусков заставляет пира ретрамитить),
+/// ACKим всё принятое; FIN закрывает поток (EOF для приложения).
+fn process_tcp_segment(sid: SocketId, seg: &[u8]) {
+    with_socket_mut(sid, |s| {
+        if s.state == SocketState::Free || s.state == SocketState::Error {
+            return;
+        }
+        if seg.len() < 20 {
+            return;
         }
         let seq = u32::from_be_bytes([seg[4], seg[5], seg[6], seg[7]]);
         let ack = u32::from_be_bytes([seg[8], seg[9], seg[10], seg[11]]);
@@ -663,161 +823,231 @@ fn handle_tcp(pkt: &[u8], ihl: usize) {
         let payload = &seg[off..];
 
         if rst {
-            TCP_PHASE = 4; // соединение разорвано пиром (порт закрыт и т.п.)
+            s.state = SocketState::Error;
+            s.rst_received = true;
             return;
         }
         // SYN+ACK на наш SYN: их ack обязан быть ISN+1.
-        if syn && TCP_PHASE == 1 {
-            if ackf && ack == TCP_ISN.wrapping_add(1) {
-                TCP_RECV_NEXT = seq.wrapping_add(1);
-                TCP_PHASE = 2;
-                let _ = tcp_seg(0x10, 5, TCP_SEND_SEQ, TCP_RECV_NEXT, &[]); // ACK
+        if syn && s.state == SocketState::SynSent {
+            if ackf && ack == s.isn.wrapping_add(1) {
+                s.seq_recv = seq.wrapping_add(1);
+                s.state = SocketState::Established;
+                unsafe { let _ = tcp_seg_for(&*s, 0x10, 5, s.seq_send, s.seq_recv, &[]); } // ACK
             }
             return; // SYN-сегменты данных не несут
         }
-        if TCP_PHASE != 2 {
+        if s.state != SocketState::Established {
             return;
         }
 
         // Данные строго по порядку. Переполнение приёмного буфера отбрасываем
         // (ACKим пропущенное — пир не будет ретрамитить зря).
-        if !payload.is_empty() && seq == TCP_RECV_NEXT {
-            let space = TCP_RX_CAP - TCP_RX_LEN;
+        if !payload.is_empty() && seq == s.seq_recv {
+            let space = RX_CAP_PER_SOCKET.saturating_sub(s.rx_len);
             let n = payload.len().min(space);
-            TCP_RX[TCP_RX_LEN..TCP_RX_LEN + n].copy_from_slice(&payload[..n]);
-            TCP_RX_LEN += n;
-            TCP_RECV_NEXT = seq.wrapping_add(payload.len() as u32);
-            let _ = tcp_seg(0x10, 5, TCP_SEND_SEQ, TCP_RECV_NEXT, &[]); // ACK
+            s.rx[s.rx_len..s.rx_len + n].copy_from_slice(&payload[..n]);
+            s.rx_len += n;
+            s.seq_recv = seq.wrapping_add(payload.len() as u32);
+            unsafe { let _ = tcp_seg_for(&*s, 0x10, 5, s.seq_send, s.seq_recv, &[]); } // ACK
         }
         // FIN занимает собственный номер seq (после данных того же сегмента).
-        if fin && seq.wrapping_add(payload.len() as u32) == TCP_RECV_NEXT {
-            TCP_RECV_NEXT = TCP_RECV_NEXT.wrapping_add(1);
-            TCP_GOT_FIN = true;
-            let _ = tcp_seg(0x10, 5, TCP_SEND_SEQ, TCP_RECV_NEXT, &[]); // ACK FIN
+        if fin && seq.wrapping_add(payload.len() as u32) == s.seq_recv {
+            s.seq_recv = s.seq_recv.wrapping_add(1);
+            s.fin_received = true;
+            s.state = SocketState::Closed;
+            unsafe { let _ = tcp_seg_for(&*s, 0x10, 5, s.seq_send, s.seq_recv, &[]); } // ACK FIN
         }
-    }
+    });
 }
 
 // ─── TCP: ABI-функции (вызываются из syscall.rs, не блокируют CPU) ──────────
 
-/// Инициирует/продвигает соединение с `ip:port`. Возвращает 0 (ESTABLISHED),
-/// NET_EAGAIN (звать ещё раз), NET_ERR (таймаут/нет карты/ошибка).
-/// Первый вызов стартует сессию (ARP + SYN); повторные обрабатывают кольцо
-/// RX и продвигают фазы до SYN+ACK.
+/// Инициирует (или продвигает) соединение. Возвращает:
+///   >= 0 — SocketId, соединение в процессе или установлено;
+///   NET_ERR — фатальная ошибка, сокет не создан.
+/// Клиентские программы потом опрашивают `tcp_state(sid)`, чтобы понять,
+/// когда соединение станет Established.
 pub fn tcp_connect(ip: &[u8; 4], port: u16) -> i32 {
     unsafe {
         if !init() {
             return NET_ERR;
         }
+
+        // Ищем сокет в состоянии ArpPending/SynSent на тот же адрес/порт —
+        // это «продолжение» того же вызова.
+        let mut existing: Option<SocketId> = None;
+        let mut to_free: Option<SocketId> = None;
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            for i in 0..MAX_SOCKETS {
+                if let Some(s) = SOCKETS[i].as_ref() {
+                    if s.dst_ip != *ip || s.dst_port != port {
+                        continue;
+                    }
+                    if matches!(s.state, SocketState::ArpPending | SocketState::SynSent | SocketState::Established) {
+                        existing = Some(i);
+                        return;
+                    }
+                    if matches!(s.state, SocketState::Closed | SocketState::Error | SocketState::Closing) {
+                        if to_free.is_none() {
+                            to_free = Some(i);
+                        }
+                    }
+                }
+            }
+        });
+        if let Some(dead) = to_free {
+            free_socket(dead);
+        }
+
+        let sid = match existing {
+            Some(i) => i,
+            None => {
+                let Some(i) = alloc_socket() else { return NET_ERR; };
+                with_socket_mut(i, |s| {
+                    s.state = SocketState::ArpPending;
+                    s.dst_ip = *ip;
+                    s.dst_port = port;
+                    s.start_tick = crate::scheduler::ticks();
+                    s.src_port = 0xC000 + ((s.start_tick as u16) % 0x3FFF);
+                    s.isn = (s.start_tick as u32).wrapping_mul(0x9E37_79B9) | 0x0001_0000;
+                    s.seq_send = s.isn;
+                });
+                i
+            }
+        };
+
         let now = crate::scheduler::ticks();
-        if !TCP_ACTIVE || TCP_PHASE == 4 || TCP_GOT_FIN {
-            // Новая сессия (в т.ч. восстановление после RST и полного EOF).
-            TCP_ACTIVE = true;
-            TCP_START_TICK = now;
-            TCP_PHASE = 0;
-            TCP_RST = false;
-            TCP_GOT_FIN = false;
-            TCP_RX_LEN = 0;
-            TCP_RX_READ = 0;
-            TCP_DST_IP = *ip;
-            TCP_DST_PORT = port;
-            TCP_SRC_PORT = 0xC000 + (now % 0x3FFF) as u16; // эфемерный 49152+
-            TCP_ISN = (now as u32).wrapping_mul(0x9E37_79B9) | 0x0001_0000;
-            // Публичные адреса живут за шлюзом: ARP спрашиваем у него, а не
-            // у самого адреса (slirp на ARP для публичных IP не отвечает).
-            if arp_resolve(&arp_next_hop(ip), 200).is_none() {
-                TCP_ACTIVE = false;
+        let state = with_socket(sid, |s| s.state).unwrap();
+        match state {
+            SocketState::ArpPending => {
+                // Сначала продвигаем приём: возможно, ARP-ответ уже прилетел,
+                // и handle_arp обновил таблицу (arp_lookup - только кеш).
+                rx_poll();
+                let hop = arp_next_hop(ip);
+                let mac = arp_lookup(&hop);
+                if mac != [0; 6] {
+                    with_socket_mut(sid, |s| {
+                        s.dst_mac = mac;
+                        s.state = SocketState::SynSent;
+                    });
+                    send_syn_for(sid);
+                } else if now > with_socket(sid, |s| s.start_tick).unwrap() + 200 {
+                    free_socket(sid);
+                    return NET_ERR;
+                } else if !arp_request(&hop) {
+                    free_socket(sid);
+                    return NET_ERR;
+                }
+            }
+            SocketState::SynSent => {
+                rx_poll();
+                if now > with_socket(sid, |s| s.start_tick).unwrap() + TCP_HS_TIMEOUT {
+                    free_socket(sid);
+                    return NET_ERR;
+                }
+            }
+            SocketState::Established => {}
+            SocketState::Error | SocketState::Closed => {
+                free_socket(sid);
                 return NET_ERR;
             }
+            _ => {}
         }
-        rx_poll();
-        let dst_mac = arp_lookup(&arp_next_hop(ip));
-        if TCP_PHASE == 0 && dst_mac != [0; 6] {
-            TCP_DST_MAC = dst_mac;
-            TCP_PHASE = 1;
-            tcp_send_syn();
-            TCP_SEND_SEQ = TCP_ISN.wrapping_add(1);
-        }
-        if TCP_PHASE == 2 {
-            0
-        } else if TCP_PHASE == 4 || now > TCP_START_TICK + TCP_HS_TIMEOUT {
-            TCP_ACTIVE = false; // следующий connect начнёт заново
-            NET_ERR
-        } else {
-            NET_EAGAIN
-        }
+        sid as i32
     }
 }
 
-/// Отправляет данные по установленному соединению (PSH+ACK). Возвращает
-/// число отправленных байт (равно `data.len()`) или NET_ERR.
-pub fn tcp_send(data: &[u8]) -> i32 {
-    unsafe {
-        if !TCP_ACTIVE || TCP_PHASE != 2 || data.len() > 1400 {
-            return NET_ERR;
+/// Возвращает текущее состояние сокета (None — не найден).
+pub fn tcp_state(id: SocketId) -> Result<SocketState, ()> {
+    with_socket(id, |s| s.state).ok_or(())
+}
+
+pub fn tcp_send(id: SocketId, data: &[u8]) -> i32 {
+    let Some(state) = with_socket(id, |s| s.state) else {
+        return NET_ERR;
+    };
+    if state != SocketState::Established {
+        return NET_ERR;
+    }
+    if data.len() > 1400 {
+        return NET_ERR;
+    }
+    let ok = with_socket_mut(id, |s| {
+        let ok = unsafe { tcp_seg_for(&*s, 0x18, 5, s.seq_send, s.seq_recv, data) };
+        if ok {
+            s.seq_send = s.seq_send.wrapping_add(data.len() as u32);
         }
-        if !tcp_seg(0x18, 5, TCP_SEND_SEQ, TCP_RECV_NEXT, data) {
-            return NET_ERR;
-        }
-        TCP_SEND_SEQ = TCP_SEND_SEQ.wrapping_add(data.len() as u32);
+        ok
+    })
+    .unwrap_or(false);
+    if ok {
         data.len() as i32
+    } else {
+        NET_ERR
     }
 }
 
-/// Читает принятые данные из буфера. >0 — скопировано байт; NET_EAGAIN —
-/// данных пока нет (или соединение ещё не установлено); NET_EOF — конец
-/// потока (FIN получен, всё прочитано); NET_ERR — RST/не активен.
-pub fn tcp_recv(buf: &mut [u8]) -> i32 {
-    unsafe {
-        if !TCP_ACTIVE {
-            return NET_ERR;
-        }
-        rx_poll();
-        if TCP_PHASE == 4 || TCP_RST {
-            return NET_ERR;
-        }
-        if TCP_PHASE != 2 {
-            return NET_EAGAIN;
-        }
-        let avail = TCP_RX_LEN - TCP_RX_READ;
+pub fn tcp_recv(id: SocketId, buf: &mut [u8]) -> i32 {
+    rx_poll();
+    let Some(state) = with_socket(id, |s| s.state) else {
+        return NET_ERR;
+    };
+    match state {
+        SocketState::Established => {}
+        SocketState::Closed => {} // читаем что осталось
+        SocketState::Error => return NET_ERR,
+        _ => return NET_EAGAIN,
+    }
+
+    with_socket_mut(id, |s| {
+        let avail = s.rx_len.saturating_sub(s.rx_read);
         if avail > 0 {
             let n = avail.min(buf.len());
-            buf[..n].copy_from_slice(&TCP_RX[TCP_RX_READ..TCP_RX_READ + n]);
-            TCP_RX_READ += n;
+            buf[..n].copy_from_slice(&s.rx[s.rx_read..s.rx_read + n]);
+            s.rx_read += n;
             n as i32
-        } else if TCP_GOT_FIN {
+        } else if s.fin_received {
             NET_EOF
         } else {
             NET_EAGAIN
         }
-    }
+    })
+    .unwrap_or(NET_ERR)
 }
 
-/// Закрывает соединение и сбрасывает состояние (после EOF сервера FIN не
-/// шлём — пир уже закрыл поток; при живом соединении просто рвём локально).
-pub fn tcp_close() -> i32 {
-    unsafe {
-        TCP_ACTIVE = false;
-        TCP_PHASE = 0;
-        TCP_RST = false;
-        TCP_GOT_FIN = false;
-        TCP_RX_LEN = 0;
-        TCP_RX_READ = 0;
-        0
+pub fn tcp_close(id: SocketId) -> i32 {
+    let state = with_socket(id, |s| s.state);
+    if let Some(SocketState::Established) = state {
+        with_socket_mut(id, |s| {
+            let _ = unsafe { tcp_seg_for(&*s, 0x11, 5, s.seq_send, s.seq_recv, &[]) };
+            s.seq_send = s.seq_send.wrapping_add(1);
+        });
     }
+    free_socket(id);
+    0
 }
 
-/// Полный сброс TCP-состояния (ядро зовёт перед запуском очередной
-/// программы — сокет не должен «протекать» между запусками).
+/// Закрывает все сокеты, чьим владельцем является `pid`. Вызывается при
+/// reap'е задачи: сокет не должен «протекать» между сменой хозяина.
+pub fn close_sockets_of(pid: usize) {
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        for i in 0..MAX_SOCKETS {
+            if let Some(s) = SOCKETS[i].as_ref() {
+                if s.owner_pid == pid {
+                    SOCKETS[i] = None;
+                }
+            }
+        }
+    });
+}
+
+/// Полный сброс состояния сети: обрабатывает все сокеты как отключённые.
 pub fn tcp_reset() {
-    unsafe {
-        TCP_ACTIVE = false;
-        TCP_PHASE = 0;
-        TCP_RST = false;
-        TCP_GOT_FIN = false;
-        TCP_RX_LEN = 0;
-        TCP_RX_READ = 0;
-    }
+    x86_64::instructions::interrupts::without_interrupts(|| unsafe {
+        for i in 0..MAX_SOCKETS {
+            SOCKETS[i] = None;
+        }
+    });
 }
 
 /// «a.b.c.d» -> 4 байта.

@@ -26,18 +26,69 @@ pub const USER_DS: u16 = 0x23; // index 4 | RPL 3
 const TIMER_IRQ_VECTOR: u8 = 0x20;
 const KEYBOARD_IRQ_VECTOR: u8 = 0x21;
 
-static mut TSS: TaskStateSegment = TaskStateSegment::new();
+/// I/O permission bitmap: 65536 портов / 8 = 8192 байта.
+const IO_BITMAP_BYTES: usize = 8192;
+
+/// TSS + I/O bitmap в одном блоке. LDT/IDT/CPU читают bitmap по адресу
+/// `TSS_base + iomap_base`, поэтому он обязан лежать за структурой TSS.
+/// По умолчанию все биты = 1: любой доступ к портам из ring 3 → #GP.
+#[repr(C, align(16))]
+struct TssBlock {
+    tss: TaskStateSegment,
+    io_bitmap: [u8; IO_BITMAP_BYTES],
+}
+
+static mut TSS_BLOCK: TssBlock = TssBlock {
+    tss: TaskStateSegment::new(),
+    io_bitmap: [0xFF; IO_BITMAP_BYTES],
+};
+
 static mut DOUBLE_FAULT_STACK: [u8; 16384] = [0; 16384];
+
+/// Инкодирует 16-байтовый дескриптор TSS (Intel SDM Vol.3 §7.2.3):
+/// base, байтовый лимит (G=0), тип 0x9 (Available 64-bit TSS), P=1.
+unsafe fn write_tss_descriptor(base: u64, limit: u32) -> (u64, u64) {
+    let mut lo: u64 = 0;
+    let mut hi: u64 = 0;
+    lo |= (limit as u64) & 0xFFFF; // limit 15:0
+    lo |= (base & 0xFFFFFF) << 16; // base 23:0
+    lo |= 0x89u64 << 40; // access: type=0x9, S=0, DPL=0, P=1
+    lo |= (((limit >> 16) & 0x0F) as u64) << 48; // limit 19:16
+    lo |= 0u64 << 52; // granularity: G=0 (байтовый лимит! bitmap должен
+                      // укладываться ровно в лимит TSS_BLOCK)
+    lo |= ((base >> 24) & 0xFF) << 56; // base 31:24
+    hi |= (base >> 32) & 0xFFFFFFFF; // base 63:32
+    (lo, hi)
+}
 
 fn init_gdt() {
     unsafe {
-        TSS.interrupt_stack_table[0] = VirtAddr::new(DOUBLE_FAULT_STACK.as_ptr() as u64 + 16384);
-        let gdt = Box::leak(Box::new(GlobalDescriptorTable::new()));
-        let code = gdt.add_entry(Descriptor::kernel_code_segment());
-        let data = gdt.add_entry(Descriptor::kernel_data_segment());
-        let ucode = gdt.add_entry(Descriptor::user_code_segment());
-        let udata = gdt.add_entry(Descriptor::user_data_segment());
-        let tss = gdt.add_entry(Descriptor::tss_segment(&TSS));
+        TSS_BLOCK.tss.interrupt_stack_table[0] =
+            VirtAddr::new(DOUBLE_FAULT_STACK.as_ptr() as u64 + 16384);
+        TSS_BLOCK.tss.iomap_base = core::mem::size_of::<TaskStateSegment>() as u16;
+
+        // Первые четыре сегмента берём у crate, а TSS вписываем вручную,
+        // чтобы лимит покрывал ещё и I/O bitmap (дескриптор TSS из crate
+        // кладец лимит ровно в 104 байта и был бы бесполезен).
+        let mut pre = GlobalDescriptorTable::new();
+        let _ = pre.add_entry(Descriptor::kernel_code_segment());
+        let _ = pre.add_entry(Descriptor::kernel_data_segment());
+        let _ = pre.add_entry(Descriptor::user_code_segment());
+        let _ = pre.add_entry(Descriptor::user_data_segment());
+        let flat = pre.as_raw_slice();
+
+        let mut raw = [0u64; 8];
+        raw[0..flat.len()].copy_from_slice(flat);
+        let base = &TSS_BLOCK.tss as *const _ as u64;
+        let limit =
+            (core::mem::size_of::<TaskStateSegment>() + IO_BITMAP_BYTES - 1) as u32;
+        let (lo, hi) = write_tss_descriptor(base, limit);
+        raw[flat.len()] = lo;
+        raw[flat.len() + 1] = hi;
+
+        let gdt = Box::leak(Box::new(GlobalDescriptorTable::from_raw_slice(
+            &raw[..flat.len() + 2],
+        )));
         gdt.load();
         CS::set_reg(SegmentSelector::new(1, PrivilegeLevel::Ring0));
         let ds = SegmentSelector::new(2, PrivilegeLevel::Ring0);
@@ -46,8 +97,21 @@ fn init_gdt() {
         FS::set_reg(ds);
         GS::set_reg(ds);
         SS::set_reg(ds);
-        asm!("ltr {0:x}", in(reg) tss.0, options(nomem, nostack));
-        let _ = (code, data, ucode, udata);
+        // TSS лежит на OUM-индексе 5 (0..1 null, 1 kcode, 2 kdata, 3 ucode,
+        // 4 udata, 5 TSS lo|hi).
+        asm!("ltr {0:x}", in(reg) SegmentSelector::new(5, PrivilegeLevel::Ring0).0,
+             options(nomem, nostack));
+
+        // I/O bitmap по умолчанию запрещает всё. Текущая линейка
+        // программ на пользовательском I/O ровно на эти порты и висит:
+        //   snake — PIT (0x40, 0x43) для тиков,
+        //   clock — CMOS (0x70, 0x71) для RTC,
+        //   vita  — CRTC/VGA (0x3D4, 0x3D5) для позиции курсора.
+        // Без этого они упадут в #GP. Остальные порты — мимо системы.
+        io_bitmap_set(0x40, 0x44, true); // PIT data + command
+        io_bitmap_set(0x70, 0x72, true); // CMOS index + data
+        io_bitmap_set(0x3D4, 0x3D6, true); // VGA CRTC index + data
+
     }
 }
 
@@ -56,7 +120,21 @@ fn init_gdt() {
 /// задачи). Планировщик переключает его перед iretq в user-режим.
 pub fn set_tss_rsp0(addr: u64) {
     unsafe {
-        TSS.privilege_stack_table[0] = VirtAddr::new(addr);
+        TSS_BLOCK.tss.privilege_stack_table[0] = VirtAddr::new(addr);
+    }
+}
+
+/// Устанавливает/снимает биты в I/O bitmap. `end` — невключительно.
+/// Бит = 1 запрещает доступ, = 0 разрешает.
+pub unsafe fn io_bitmap_set(from_port: u32, to_port: u32, allow: bool) {
+    for p in from_port..to_port {
+        let byte = (p / 8) as usize;
+        let bit = (p % 8) as u8;
+        if allow {
+            TSS_BLOCK.io_bitmap[byte] &= !(1 << bit);
+        } else {
+            TSS_BLOCK.io_bitmap[byte] |= 1 << bit;
+        }
     }
 }
 

@@ -183,8 +183,6 @@ pub fn run_program(writer: &mut Writer, args: &[&str], mem: sysinfo::MemInfo) ->
         // Клавиатура: сбрасываем буфер сканкодов, чтобы foreground-программа не
         // получила остатки (break-коды Enter и т.п.) от командной строки шелла.
         crate::keyboard::flush();
-        // TCP-сокет не должен «протекать» между запусками программ.
-        crate::net::tcp_reset();
 
         crate::progabi::install();
 
@@ -207,7 +205,14 @@ pub fn run_program(writer: &mut Writer, args: &[&str], mem: sysinfo::MemInfo) ->
 
         dbg("exec: spawned, waiting");
         crate::desk::set_fg(pid);
+        // Экран отдаём программе: она пишет в 0xB8000 напрямую и показать
+        // себя может только композитор (`fb::tick`), а он молчит, пока экран
+        // занят выводом шелла.
+        crate::fb::set_quiet(false);
         let interrupted = scheduler::wait_for_polled(pid, foreground_poll);
+        // Шелл забирает экран обратно: то, что он напишет дальше, должно
+        // появиться одним кадром.
+        crate::fb::set_quiet(true);
         crate::desk::clear_fg();
         dbg("exec: wait done");
 

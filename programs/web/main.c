@@ -1,9 +1,16 @@
 /* Web: lynx-подобный мини-браузер — HTTP GET через TCP-сокет ядра, рендер
  * текста и ссылок прямо в VGA.
  *
- *   run web <host> [port] [path]
- *   run web example.com            — схема http, порт 80, путь /
+ *   run web                          — открыть start_url из /etc/web.conf
+ *   run web <host> [port] [path]     — схема http, порт 80, путь /
  *   run web 10.0.2.2 8080 /test.html
+ *   run web -c /tmp/my.conf <url>    — другой конфиг (см. /etc/web.conf)
+ *
+ * Настройки — в файле /etc/web.conf (`ключ = значение`, см. раздел «Конфиг»
+ * ниже): домашняя страница, ширина текста, User-Agent/Accept, таймауты,
+ * размер загрузки, глубина истории, нумерация ссылок, строка состояния,
+ * печать заголовков ответа, цвет и клавиши. Значения по умолчанию повторяют
+ * прежние константы, поэтому отсутствие файла ничего не меняет.
  *
  * Сеть — ABI-трамплины net_* (0x7840..0x7860): connect/send/recv/close и
  * resolve (DNS через UDP в ядре). Сисколы НЕ блокируют CPU: ядро продвигает
@@ -20,15 +27,18 @@
  * Клавиши: стрелки ↑↓ — скролл, PgUp/PgDn/Home/End — экран, ←/→ и TAB —
  * предыдущая/следующая ссылка, Enter или «номер.» — открыть ссылку,
  * g — «го» (ввод адреса), h — назад по истории, q — выход.
+ * Буквы настраиваются (key_quit/key_back/key_goto).
  *
  * Коды результатов net_*: 0 = ok, -1 = EOF (FIN получен, всё прочитано),
  * -2 = EAGAIN (ещё в процессе / данных нет), -3 = ошибка/RST.
  *
  * HTTPS: для схемы https (порт 443) поверх TCP поднимается TLS 1.3
- * (tls_client.c). Сертификат не проверяется — аналог curl -k.
+ * (tls_client.c). Сертификат не проверяется — аналог curl -k. Настройки для
+ * этого нет и быть не должно: опции «проверять» не существует.
  */
 
 #include "tls_client.h"
+#include "../common/vgasize.h"
 
 #define NET_CONNECT_P 0x7840
 #define NET_SEND_P    0x7848
@@ -47,12 +57,18 @@
 #define NET_ERR    (-3)
 #define NULL       ((void *)0)
 
+/* Чтение файла — тот же сискол, что у fetch: без него не прочитать конфиг. */
+#define VFS_READ_P 0x7818
+typedef int (*fn_vread)(const char *, void *, int);
+#define abi_vread(p, b, n) ((*(volatile fn_vread *)VFS_READ_P)(p, b, n))
+
 typedef unsigned long long (*fn_ticks)(void);
 typedef int (*fn_sleep)(unsigned long long);
 typedef int (*fn_connect)(const char *, unsigned int);
-typedef int (*fn_send)(const void *, unsigned int);
-typedef int (*fn_recv)(void *, unsigned int);
-typedef int (*fn_close)(void);
+typedef int (*fn_send)(int, const void *, unsigned int);
+typedef int (*fn_recv)(int, void *, unsigned int);
+typedef int (*fn_close)(int);
+typedef int (*fn_state)(int);
 typedef int (*fn_resolve)(const char *, unsigned char *, int);
 typedef int (*fn_kbhit)(void);
 typedef int (*fn_kbread)(void);
@@ -60,16 +76,22 @@ typedef int (*fn_kbread)(void);
 #define abi_ticks()        ((*(volatile fn_ticks *)TICKS_P)())
 #define abi_sleep(t)       ((*(volatile fn_sleep *)SLEEP_P)(t))
 #define abi_connect(h, p)  ((*(volatile fn_connect *)NET_CONNECT_P)(h, p))
-#define abi_send(b, l)     ((*(volatile fn_send *)NET_SEND_P)(b, l))
-#define abi_recv(b, m)     ((*(volatile fn_recv *)NET_RECV_P)(b, m))
-#define abi_close()        ((*(volatile fn_close *)NET_CLOSE_P)())
+#define abi_state(s)      ((*(volatile fn_state *)NET_STATE_P)(s))
+#define abi_send(b, l)     ((*(volatile fn_send *)NET_SEND_P)(cursock, b, l))
+#define abi_recv(b, m)     ((*(volatile fn_recv *)NET_RECV_P)(cursock, b, m))
+#define abi_close()        ((*(volatile fn_close *)NET_CLOSE_P)(cursock))
 #define abi_resolve(h, o, m) ((*(volatile fn_resolve *)NET_RESOLVE_P)(h, o, m))
+#define NET_STATE_P   0x78A8
+
+/* Текущий сокет — устанавливается в http_get при успешном connect. */
+static int cursock = -1;
 #define abi_kbhit()        ((*(volatile fn_kbhit *)KBHIT_P)())
 #define abi_kbread()       ((*(volatile fn_kbread *)KBREAD_P)())
 
-#define SCREEN_W 80
-#define SCREEN_H 30
-#define TEXT_W   74 /* ширина текста; справа остаётся место под « [NN]» */
+/* Сетку берём у ядра (programs/common/vgasize.h): на 1280x800 она 80x25,
+ * на 1920x1080 — 120x33. Раньше тут стояло жёстко 80x30, и браузер писал
+ * мимо экрана. */
+#define TEXT_W_MAX 194 /* максимум сетки (200 колонок) минус 6 на « [NN]» */
 #define RX_CAP   98304 /* совпадает с TCP_RX_CAP в ядре: страница целиком */
 #define MAX_LINES 800
 #define MAX_LINKS 96
@@ -84,7 +106,7 @@ typedef int (*fn_kbread)(void);
 static unsigned char rxbuf[RX_CAP];
 static int rx_total;
 
-static char lines[MAX_LINES][TEXT_W + 1];
+static char lines[MAX_LINES][TEXT_W_MAX + 1];
 static int nlines;
 
 struct Link {
@@ -107,15 +129,16 @@ static int nhist;
 
 static void put_ch(int row, int colc, char ch, unsigned char attr) {
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
-    if (row < 0 || row > SCREEN_H - 1 || colc < 0 || colc > SCREEN_W - 1)
+    if (row < 0 || (unsigned)row >= g_screen_h || colc < 0 ||
+        (unsigned)colc >= g_screen_w)
         return;
-    int off = row * 160 + colc * 2;
+    int off = row * (int)(g_screen_w * 2) + colc * 2;
     vga[off] = (unsigned char)ch;
     vga[off + 1] = attr;
 }
 
 static int put_str(int row, int colc, const char *s, unsigned char attr) {
-    while (*s && colc < SCREEN_W) {
+    while (*s && (unsigned)colc < g_screen_w) {
         put_ch(row, colc++, *s++, attr);
     }
     return colc;
@@ -142,7 +165,7 @@ static int put_num(int row, int colc, int v, unsigned char attr) {
 }
 
 static void fill_row(int row, unsigned char attr) {
-    for (int c = 0; c < SCREEN_W; c++)
+    for (unsigned c = 0; c < g_screen_w; c++)
         put_ch(row, c, ' ', attr);
 }
 
@@ -160,6 +183,269 @@ static void str_copy(char *dst, const char *src, int max) {
         i++;
     }
     dst[i] = 0;
+}
+
+/* ─── Конфиг ────────────────────────────────────────────────────────────────
+ *
+ * Файл /etc/web.conf, формат `ключ = значение`, `#` и `;` — комментарии:
+ *
+ *   start_url       = http://10.0.2.2:8080/  что открывать без аргументов
+ *   width           = 74                     ширина текста, 40..ширина сетки-6
+ *   user_agent      = VitaminOS-web/1.0      заголовок User-Agent
+ *   accept          = text/html              заголовок Accept
+ *   accept_encoding =                        пусто = заголовок не шлём
+ *   default_port    = 80                     порт без схемы в адресе
+ *   timeout_connect = 800                    тики PIT (100 Гц) = 8 с
+ *   timeout_send    = 800
+ *   timeout_recv    = 4000                   40 с
+ *   max_download    = 0                      байт; 0 = сколько влезет
+ *   max_redirects   = 5
+ *   history         = 12                     глубина «назад», 0..12
+ *   link_numbers    = on                     подписи [N] у ссылок
+ *   status_bar      = on                     строка состояния внизу
+ *   show_url        = on                     URL курсорной ссылки в строке
+ *   show_headers    = off                    печатать заголовки ответа
+ *   color           = on                     off = монохром
+ *   key_quit        = q                      клавиша выхода
+ *   key_back        = h
+ *   key_goto        = g
+ *
+ * Значения по умолчанию — ровно те, что раньше были константами, поэтому
+ * отсутствие файла ничего не меняет. `web -c PATH` читает другой файл.
+ *
+ * accept_encoding по умолчанию пуст не по недосмотру: браузер не умеет
+ * gzip/deflate, а объявить кодировку и не распаковать — получить битый текст.
+ */
+
+/* Ширина текста: TEXT_W_MAX — потолок буфера строк (место под « [NN]»
+ * справа), text_w — текущая, по конфигу и сетке.
+ *
+ * Ширина считается от сетки, а не от исторических 74: браузер, который
+ * знает только про 80x30, на 120x33 отдавал бы четверть экрана пустотой
+ * справа, а на 80x25 вылезал бы за правый край. */
+static int text_w = 74;
+
+static int default_text_w(void) {
+    int w = (int)g_screen_w - 6; /* « [NN]» справа */
+    if (w > TEXT_W_MAX)
+        w = TEXT_W_MAX;
+    if (w < 40)
+        w = 40;
+    return w;
+}
+
+struct WebCfg {
+    char start_url[URL_MAX];
+    char user_agent[96];
+    char accept[64];
+    char accept_encoding[48];
+    int width;
+    int default_port;
+    int timeout_connect;
+    int timeout_send;
+    int timeout_recv;
+    int max_download;
+    int max_redirects;
+    int history;
+    int link_numbers;
+    int status_bar;
+    int show_url;
+    int show_headers;
+    int color;
+    char key_quit;
+    char key_back;
+    char key_goto;
+};
+
+static struct WebCfg cfg;
+
+static void cfg_defaults(void) {
+    cfg.start_url[0] = 0;
+    str_copy(cfg.user_agent, "VitaminOS-web/1.0", sizeof(cfg.user_agent));
+    str_copy(cfg.accept, "text/html", sizeof(cfg.accept));
+    cfg.accept_encoding[0] = 0;
+    cfg.width = default_text_w();
+    cfg.default_port = 80;
+    cfg.timeout_connect = 800;
+    cfg.timeout_send = 800;
+    cfg.timeout_recv = 4000;
+    cfg.max_download = 0;
+    cfg.max_redirects = 5;
+    cfg.history = MAX_HIST;
+    cfg.link_numbers = 1;
+    cfg.status_bar = 1;
+    cfg.show_url = 1;
+    cfg.show_headers = 0;
+    cfg.color = 1;
+    cfg.key_quit = 'q';
+    cfg.key_back = 'h';
+    cfg.key_goto = 'g';
+}
+
+/* Сравнение без учёта регистра: имена ключей в конфиге пишут как удобнее. */
+static int str_ieq(const char *a, const char *b) {
+    int i = 0;
+    for (; a[i] && b[i]; i++) {
+        int x = a[i], y = b[i];
+        if (x >= 'A' && x <= 'Z')
+            x += 32;
+        if (y >= 'A' && y <= 'Z')
+            y += 32;
+        if (x != y)
+            return 0;
+    }
+    return a[i] == 0 && b[i] == 0;
+}
+
+static int is_space_c(int c) {
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static int is_digit(int c) { return c >= '0' && c <= '9'; }
+
+/* on/off/yes/no/1/0 — всё, что человек напишет в конфиге. */
+static int cfg_bool(const char *v, int dflt) {
+    if (!v[0])
+        return dflt;
+    if (str_ieq(v, "on") || str_ieq(v, "yes") || str_ieq(v, "1") ||
+        str_ieq(v, "true"))
+        return 1;
+    if (str_ieq(v, "off") || str_ieq(v, "no") || str_ieq(v, "0") ||
+        str_ieq(v, "false"))
+        return 0;
+    return dflt;
+}
+
+/* Число с необязательным знаком; мусор -> dflt (а не 0: молчаливый ноль в
+ * timeout_recv означал бы мгновенный отказ от страницы). */
+static int cfg_int(const char *v, int lo, int hi, int dflt) {
+    while (is_space_c(*v))
+        v++;
+    if (!is_digit(*v))
+        return dflt;
+    long n = 0;
+    while (is_digit(*v)) {
+        n = n * 10 + (*v - '0');
+        if (n > 1000000000L)
+            n = 1000000000L;
+        v++;
+    }
+    if (n < lo)
+        return lo;
+    if (n > hi)
+        return hi;
+    return (int)n;
+}
+
+/* Один символ значения: для key_quit/key_back/key_goto. */
+static char cfg_char(const char *v, char dflt) {
+    while (is_space_c(*v))
+        v++;
+    if (!v[0] || v[1])
+        return dflt; /* пусто или больше одного символа — оставляем как было */
+    return v[0];
+}
+
+/* Разбор одной строки `ключ = значение`. */
+static void cfg_apply(const char *key, const char *val) {
+    if (str_ieq(key, "start_url"))
+        str_copy(cfg.start_url, val, sizeof(cfg.start_url));
+    else if (str_ieq(key, "width"))
+        cfg.width = cfg_int(val, 40, TEXT_W_MAX, cfg.width);
+    else if (str_ieq(key, "user_agent"))
+        str_copy(cfg.user_agent, val, sizeof(cfg.user_agent));
+    else if (str_ieq(key, "accept"))
+        str_copy(cfg.accept, val, sizeof(cfg.accept));
+    else if (str_ieq(key, "accept_encoding"))
+        str_copy(cfg.accept_encoding, val, sizeof(cfg.accept_encoding));
+    else if (str_ieq(key, "default_port"))
+        cfg.default_port = cfg_int(val, 1, 65535, cfg.default_port);
+    else if (str_ieq(key, "timeout_connect"))
+        cfg.timeout_connect = cfg_int(val, 20, 60000, cfg.timeout_connect);
+    else if (str_ieq(key, "timeout_send"))
+        cfg.timeout_send = cfg_int(val, 20, 60000, cfg.timeout_send);
+    else if (str_ieq(key, "timeout_recv"))
+        cfg.timeout_recv = cfg_int(val, 20, 60000, cfg.timeout_recv);
+    else if (str_ieq(key, "max_download"))
+        cfg.max_download = cfg_int(val, 0, RX_CAP, cfg.max_download);
+    else if (str_ieq(key, "max_redirects"))
+        cfg.max_redirects = cfg_int(val, 1, 16, cfg.max_redirects);
+    else if (str_ieq(key, "history"))
+        cfg.history = cfg_int(val, 0, MAX_HIST, cfg.history);
+    else if (str_ieq(key, "link_numbers"))
+        cfg.link_numbers = cfg_bool(val, cfg.link_numbers);
+    else if (str_ieq(key, "status_bar"))
+        cfg.status_bar = cfg_bool(val, cfg.status_bar);
+    else if (str_ieq(key, "show_url"))
+        cfg.show_url = cfg_bool(val, cfg.show_url);
+    else if (str_ieq(key, "show_headers"))
+        cfg.show_headers = cfg_bool(val, cfg.show_headers);
+    else if (str_ieq(key, "color"))
+        cfg.color = cfg_bool(val, cfg.color);
+    else if (str_ieq(key, "key_quit"))
+        cfg.key_quit = cfg_char(val, cfg.key_quit);
+    else if (str_ieq(key, "key_back"))
+        cfg.key_back = cfg_char(val, cfg.key_back);
+    else if (str_ieq(key, "key_goto"))
+        cfg.key_goto = cfg_char(val, cfg.key_goto);
+    /* Неизвестный ключ молча пропускаем: конфиг переживает добавление
+     * параметров в новую версию web, лишняя строка не должна ломать запуск. */
+}
+
+/* Читает и разбирает конфиг. Отсутствие файла — не ошибка. */
+static void load_config(const char *path) {
+    static char buf[4096];
+    static char pbuf[64];
+    int pn = str_len(path);
+    if (pn <= 0 || pn >= (int)sizeof(pbuf))
+        return;
+    for (int i = 0; i <= pn; i++)
+        pbuf[i] = path[i];
+    int n = abi_vread(pbuf, buf, (int)sizeof(buf) - 1);
+    if (n <= 0)
+        return;
+    buf[n] = 0;
+
+    int i = 0;
+    while (i < n) {
+        int start = i;
+        while (i < n && buf[i] != '\n')
+            i++;
+        int end = i;
+        if (i < n)
+            i++;
+        /* Обрезаем \r и хвостовые пробелы, ведущие — пропускаем. */
+        while (end > start && is_space_c(buf[end - 1]))
+            end--;
+        int s = start;
+        while (s < end && is_space_c(buf[s]))
+            s++;
+        if (s >= end || buf[s] == '#' || buf[s] == ';')
+            continue;
+        /* Ищем '=' в строке целиком: в значении он тоже допустим. */
+        int eq = -1;
+        for (int k = s; k < end; k++)
+            if (buf[k] == '=') {
+                eq = k;
+                break;
+            }
+        if (eq < 0)
+            continue;
+        int ke = eq;
+        while (ke > s && is_space_c(buf[ke - 1]))
+            ke--;
+        int vs = eq + 1;
+        while (vs < end && is_space_c(buf[vs]))
+            vs++;
+        buf[ke] = 0;
+        buf[end] = 0;
+        cfg_apply(buf + s, buf + vs);
+    }
+}
+
+/* Цветовой атрибут с учётом color=off: весь интерфейс становится серым. */
+static unsigned char att(unsigned char a) {
+    return cfg.color ? a : 0x07;
 }
 
 /* Текущий URL — база для разрешения относительных href. */
@@ -235,8 +521,6 @@ static void wait_key_any(void) {
 
 /* ─── URL ────────────────────────────────────────────────────────────────── */
 
-static int is_digit(int c) { return c >= '0' && c <= '9'; }
-
 static int lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
 
 static int scheme_is(const char *s, int len, const char *want) {
@@ -255,10 +539,12 @@ static int scheme_is(const char *s, int len, const char *want) {
 static int parse_url(const char *in, char *host, int hostsz, char *path,
                      int pathsz, int *port_out) {
     int i = 0, pn = 0;
-    int def_port = 80;
+    /* Порт по умолчанию берём из конфига: если у сервера он не 80, не надо
+     * каждый раз дописывать «:8080» в адрес. Для https он всё равно 443. */
+    int def_port = cfg.default_port;
     host[0] = 0;
     path[0] = 0;
-    *port_out = 80;
+    *port_out = cfg.default_port;
     if (!in || !in[0])
         return -1;
 
@@ -311,21 +597,52 @@ static int parse_url(const char *in, char *host, int hostsz, char *path,
     return 0;
 }
 
+/* Схема URL, если она есть: «http» или «https». Иначе — «http».
+ *
+ * Схему нельзя терять при пересборке URL: «https://host:8443/» без неё
+ * превратился бы в «http://host:8443/», и браузер пошёл бы на 8443
+ * обычным HTTP вместо TLS. */
+static void url_scheme(const char *u, char *out, int outsz) {
+    int i = 0;
+    str_copy(out, "http", (int)sizeof("https"));
+    if (!u)
+        return;
+    for (; u[i] && u[i] != ':' && i < (int)sizeof("https") - 1; i++) {
+        if (u[i] == '/' || u[i] == ' ' || u[i] == '\t')
+            return; /* схемы нет */
+    }
+    if (u[i] != ':' || u[i + 1] != '/' || u[i + 2] != '/')
+        return;
+    /* Известны только два — никаких выдуманных протоколов. */
+    if ((i == 4 && lower(u[0]) == 'h' && lower(u[1]) == 't' && lower(u[2]) == 't' &&
+         lower(u[3]) == 'p') ||
+        (i == 5 && lower(u[0]) == 'h' && lower(u[1]) == 't' && lower(u[2]) == 't' &&
+         lower(u[3]) == 'p' && lower(u[4]) == 's')) {
+        for (int k = 0; k <= i && k < outsz - 1; k++)
+            out[k] = lower(u[k]);
+        out[i] = 0;
+    }
+}
+
 /* Разрешает href относительно текущего URL (cur_url) в абсолютный. */
 static void make_url(char *out, int outsz, const char *host, int port,
                      const char *path);
+static void make_url_sch(char *out, int outsz, const char *scheme,
+                        const char *host, int port, const char *path);
 
 static void resolve_href(const char *href, char *out, int outsz) {
     char base[HOST_MAX];
     char bpath[PATH_MAX];
+    char sch[8];
     int bport;
+    url_scheme(cur_url, sch, sizeof(sch));
     if (parse_url(cur_url, base, sizeof(base), bpath, sizeof(bpath), &bport) < 0) {
         str_copy(out, href, outsz);
         return;
     }
     /* Якорь. */
     if (href[0] == '#') {
-        make_url(out, outsz, base, bport, bpath);
+        make_url_sch(out, outsz, sch, base, bport, bpath);
         return;
     }
     /* Схема распознаётся по "://" — как в parse_url. */
@@ -337,9 +654,11 @@ static void resolve_href(const char *href, char *out, int outsz) {
     }
     /* //host/path -> протокол текущий. */
     if (href[0] == '/' && href[1] == '/') {
-        const char *p = "http://";
+        const char *p = "://";
         int n = 0;
-        while (*p && n < outsz - 1)
+        for (const char *q = sch; *q && n < outsz - 1; q++)
+            out[n++] = *q;
+        for (; *p && n < outsz - 1; )
             out[n++] = *p++;
         for (p = href + 2; *p && n < outsz - 1; )
             out[n++] = *p++;
@@ -348,7 +667,7 @@ static void resolve_href(const char *href, char *out, int outsz) {
     }
     /* Абсолютный путь — префиксуем хостом базового URL. */
     if (href[0] == '/') {
-        make_url(out, outsz, base, bport, href);
+        make_url_sch(out, outsz, sch, base, bport, href);
         return;
     }
     /* Относительный: каталог базового пути + href. */
@@ -395,18 +714,31 @@ static void resolve_href(const char *href, char *out, int outsz) {
     if (n > 0 && tmp[n - 1] == '/' && m < URL_MAX - 1)
         norm[m++] = '/'; /* каталог: сохраняем завершающий «/» */
     norm[m < URL_MAX ? m : URL_MAX - 1] = 0;
-    make_url(out, outsz, base, bport, norm);
+    make_url_sch(out, outsz, sch, base, bport, norm);
 }
 
 static void make_url(char *out, int outsz, const char *host, int port,
                      const char *path) {
+    make_url_sch(out, outsz, "http", host, port, path);
+}
+
+static void make_url_sch(char *out, int outsz, const char *scheme,
+                        const char *host, int port, const char *path) {
     int n = 0;
-    const char *p = "http://";
-    while (*p && n < outsz - 1)
+    int https = 0;
+    if (scheme && str_len(scheme) == 5 && lower(scheme[0]) == 'h' &&
+        lower(scheme[1]) == 't' && lower(scheme[2]) == 't' &&
+        lower(scheme[3]) == 'p' && lower(scheme[4]) == 's')
+        https = 1;
+    const char *p = scheme;
+    for (; *p && n < outsz - 1; )
+        out[n++] = *p++;
+    for (p = "://"; *p && n < outsz - 1; )
         out[n++] = *p++;
     for (p = host; *p && n < outsz - 1; )
         out[n++] = *p++;
-    if (port != 80) {
+    /* Порт по умолчанию для схемы не печатаем. */
+    if (port != 0 && port != (https ? 443 : 80)) {
         if (n < outsz - 1)
             out[n++] = ':';
         char pb[8];
@@ -506,7 +838,7 @@ static int find_header(int from, int len, const char *name, char *out,
 
 static int net_send_all(const void *buf, unsigned int len) {
     unsigned int off = 0;
-    unsigned long long deadline = abi_ticks() + 800;
+    unsigned long long deadline = abi_ticks() + cfg.timeout_send;
     while (off < len) {
         int n = abi_send((const char *)buf + off, len - off);
         if (n > 0) {
@@ -530,7 +862,7 @@ static int tls_tr_send(void *ctx, const uint8_t *buf, size_t len) {
 /* >0 — байт, 0 — EOF/таймаут (сервер закрыл или молчит), -1 — сбой. */
 static int tls_tr_recv(void *ctx, uint8_t *buf, size_t max) {
     (void)ctx;
-    unsigned long long deadline = abi_ticks() + 4000;
+    unsigned long long deadline = abi_ticks() + cfg.timeout_recv;
     for (;;) {
         int n = abi_recv(buf, (unsigned int)max);
         if (n > 0)
@@ -603,13 +935,17 @@ static int http_get(const char *host, int port, const char *path,
         str_copy(errmsg, "cannot resolve host", errsz);
         return 0;
     }
-    int st;
-    unsigned long long deadline = abi_ticks() + 800;
+    unsigned long long deadline = abi_ticks() + cfg.timeout_connect;
     while (1) {
-        st = abi_connect(ip, (unsigned int)port);
-        if (st == 0)
-            break;
-        if (st < NET_EAGAIN) {
+        int sid = abi_connect(ip, (unsigned int)port);
+        if (sid < 0) {
+            str_copy(errmsg, "connection refused/failed", errsz);
+            return 0;
+        }
+        cursock = sid;
+        int sc = abi_state(cursock);
+        if (sc == 3) /* Established */ break;
+        if (sc == 6 || sc < 0) {
             str_copy(errmsg, "connection refused/failed", errsz);
             return 0;
         }
@@ -634,7 +970,7 @@ static int http_get(const char *host, int port, const char *path,
         }
     }
 
-    char req[768];
+    char req[1024];
     int rr = 0;
     const char *m = "GET ";
     while (*m)
@@ -646,7 +982,10 @@ static int http_get(const char *host, int port, const char *path,
         req[rr++] = *m++;
     for (const char *hh = host; *hh; )
         req[rr++] = *hh++;
-    if (port != 80) {
+    /* Порт в Host пишем, когда он не дефолтный для СХЕМЫ (не для конфига):
+     * сервер отличает virtual host по «host:port», и молчаливый 8080 здесь
+     * приводит к 404 на половине сайтов. */
+    if (port != (tls_mode ? 443 : 80)) {
         req[rr++] = ':';
         char pb[8];
         int pn = 0, v = port;
@@ -659,10 +998,39 @@ static int http_get(const char *host, int port, const char *path,
         while (pn > 0)
             req[rr++] = pb[--pn];
     }
-    m = "\r\nUser-Agent: VitaminOS-web/1.0\r\nAccept: text/html\r\n"
-        "Connection: close\r\n\r\n";
+    /* Заголовки из конфига. accept_encoding пустой — не шлём вовсе: сам
+     * браузер gzip не распаковывает, объявить кодировку = отдать битый текст. */
+    m = "\r\nUser-Agent: ";
     while (*m)
         req[rr++] = *m++;
+    for (const char *u = cfg.user_agent; *u && rr < (int)sizeof(req) - 2; )
+        req[rr++] = *u++;
+    m = "\r\nAccept: ";
+    while (*m)
+        req[rr++] = *m++;
+    for (const char *u = cfg.accept; *u && rr < (int)sizeof(req) - 2; )
+        req[rr++] = *u++;
+    if (cfg.accept_encoding[0]) {
+        m = "\r\nAccept-Encoding: ";
+        while (*m)
+            req[rr++] = *m++;
+        for (const char *u = cfg.accept_encoding;
+             *u && rr < (int)sizeof(req) - 2; )
+            req[rr++] = *u++;
+    }
+    /* HTTP/1.0 + Connection: close: без закрытия сервер держит соединение,
+     * а ждать конца потока мы не умеем (таймаут recv - это отказ). */
+    m = "\r\nConnection: close\r\n\r\n";
+    while (*m && rr < (int)sizeof(req))
+        req[rr++] = *m++;
+    if (rr >= (int)sizeof(req)) {
+        str_copy(errmsg, "request too long", errsz);
+        abi_close();
+        return 0;
+    }
+
+    /* Сколько байт принимать: конфиг может ограничить (max_download). */
+    int cap = cfg.max_download > 0 ? cfg.max_download : RX_CAP;
 
     if (tls_mode) {
         if (tls_write(&tls, (const uint8_t *)req, (size_t)rr) < 0) {
@@ -677,9 +1045,9 @@ static int http_get(const char *host, int port, const char *path,
 
     rx_total = 0;
     if (tls_mode) {
-        while (rx_total < RX_CAP) {
+        while (rx_total < cap) {
             int n = tls_read(&tls, (uint8_t *)(rxbuf + rx_total),
-                             (size_t)(RX_CAP - rx_total));
+                             (size_t)(cap - rx_total));
             if (n > 0) {
                 rx_total += n;
                 continue;
@@ -691,12 +1059,12 @@ static int http_get(const char *host, int port, const char *path,
             return 0;
         }
     } else {
-        deadline = abi_ticks() + 4000;
+        deadline = abi_ticks() + cfg.timeout_recv;
         while (1) {
-            int n = abi_recv(rxbuf + rx_total, RX_CAP - rx_total);
+            int n = abi_recv(rxbuf + rx_total, (unsigned int)(cap - rx_total));
             if (n > 0) {
                 rx_total += n;
-                if (rx_total >= RX_CAP)
+                if (rx_total >= cap)
                     break;
                 continue;
             }
@@ -818,14 +1186,14 @@ static int indent_stack[16];
 static int indent_sp;
 
 static void clear_line(int k) {
-    for (int i = 0; i <= TEXT_W; i++)
+    for (int i = 0; i <= text_w; i++)
         lines[k][i] = 0;
     line_used[k] = 0;
 }
 
 /* Заполнить левое поле на текущей (пустой) строке. */
 static void apply_indent(void) {
-    for (int i = 0; i < indent && i < TEXT_W; i++)
+    for (int i = 0; i < indent && i < text_w; i++)
         lines[cur][i] = ' ';
     col = indent;
     lines[cur][col] = 0;
@@ -843,8 +1211,8 @@ static void new_line(void) {
 static void set_indent(int v) {
     if (v < 0)
         v = 0;
-    if (v > TEXT_W)
-        v = TEXT_W;
+    if (v > text_w)
+        v = text_w;
     indent = v;
     if (cur < MAX_LINES && !line_used[cur]) {
         clear_line(cur);
@@ -870,15 +1238,15 @@ static void flush_word(void) {
         wl = 0;
         return;
     }
-    if (line_used[cur] && col + 1 + wl > TEXT_W)
+    if (line_used[cur] && col + 1 + wl > text_w)
         new_line();
     else if (line_used[cur])
         lines[cur][col++] = ' ';
-    for (int i = 0; i < wl && col < TEXT_W; i++)
+    for (int i = 0; i < wl && col < text_w; i++)
         lines[cur][col++] = word[i];
     lines[cur][col] = 0; /* без терминатора строка читается до хвоста */
     line_used[cur] = 1;
-    if (col >= TEXT_W)
+    if (col >= text_w)
         new_line();
     wl = 0;
 }
@@ -887,11 +1255,11 @@ static void flush_word(void) {
 static void line_put(char c) {
     if (cur >= MAX_LINES)
         return;
-    if (col >= TEXT_W) {
+    if (col >= text_w) {
         if (cur >= MAX_LINES - 1)
             return; /* последняя строка заполнена — писать больше некуда */
         new_line();
-        if (col >= TEXT_W)
+        if (col >= text_w)
             return;
     }
     lines[cur][col++] = c;
@@ -954,7 +1322,7 @@ static void finish_link(void) {
     /* Ставим «[N]» сразу после текста ссылки, не разрывая слово: следующие
      * символы (точка и т.п.) остаются в том же слове и не получают пробел. */
     int start = line_used[cur] ? col + 1 : col;
-    if (cur >= MAX_LINES || (line_used[cur] && col + 1 + wl > TEXT_W)) {
+    if (cur >= MAX_LINES || (line_used[cur] && col + 1 + wl > text_w)) {
         flush_word();
         start = col;
     } else {
@@ -962,8 +1330,8 @@ static void finish_link(void) {
     }
     if (start < 0)
         start = 0;
-    if (start > TEXT_W)
-        start = TEXT_W;
+    if (start > text_w)
+        start = text_w;
     links[open_link].line = cur;
     links[open_link].col_mark = start;
     open_link = -1;
@@ -1158,6 +1526,10 @@ static int decode_entity(const unsigned char *b, int i, int n, char *out,
     return 0;
 }
 
+/* Текст заголовков ответа (show_headers = on). Заполняется в fetch() из
+ * rxbuf до того, как декодер chunked перезапишет его с начала. */
+static char hdr_text[2048];
+
 static void build_page(int body_start) {
     wl = 0;
     cur = 0;
@@ -1174,6 +1546,25 @@ static void build_page(int body_start) {
     col = 0;
     apply_indent();
     nlinks = 0;
+
+    /* show_headers: печатаем строку статуса и заголовки как обычный текст
+     * документа — они участвуют в нумерации строк и скролле, как в lynx. */
+    if (cfg.show_headers && hdr_text[0]) {
+        int hn = 0;
+        for (const char *p = hdr_text; *p && hn < 60; ) {
+            const char *e = p;
+            while (*e && *e != '\n')
+                e++;
+            for (const char *q = p; q < e; q++)
+                push_ch((unsigned char)*q);
+            flush_word();
+            if (col)
+                hard_break();
+            hn++;
+            p = *e ? e + 1 : e;
+        }
+        request_blank();
+    }
 
     int i = body_start;
     char href_buf[URL_MAX];
@@ -1239,7 +1630,7 @@ static void build_page(int body_start) {
                 } else if (tag_is(name, nl, "hr")) {
                     finish_link();
                     block_start();
-                    for (int k = indent; k < TEXT_W; k++)
+                    for (int k = indent; k < text_w; k++)
                         line_put('-');
                     hard_break();
                     request_blank();
@@ -1482,7 +1873,10 @@ static void build_page(int body_start) {
 
 /* ─── Экран ──────────────────────────────────────────────────────────────── */
 
-static int view_h(void) { return SCREEN_H - 1; }
+/* Высота документа: строка состояния (если включена) ею не делится. */
+static int view_h(void) {
+    return cfg.status_bar ? (int)g_screen_h - 1 : (int)g_screen_h;
+}
 
 static void renumber(int top) {
     for (int i = 0; i < nlinks; i++)
@@ -1500,35 +1894,35 @@ static void renumber(int top) {
 
 static void draw_line(int row, int doc_line) {
     const char *s = (doc_line >= 0 && doc_line < nlines) ? lines[doc_line] : "";
-    int attr = 0x0F;
+    int attr = att(0x0F);
     if (cur_link >= 0 && cur_link < nlinks && links[cur_link].line == doc_line)
-        attr = 0x1F; /* строка с курсорной ссылкой подсвечена */
+        attr = att(0x1F); /* строка с курсорной ссылкой подсвечена */
     int colc = 0;
-    fill_row(row, 0x0F); /* строка затирается целиком — иначе виден хвост */
+    fill_row(row, attr); /* строка затирается целиком — иначе виден хвост */
     /* Идём по символам строки, вставляя «[N]» в записанные колонки. */
-    for (int pos = 0; pos <= TEXT_W && colc < SCREEN_W; pos++) {
-        for (int i = 0; i < nlinks; i++) {
+    for (int pos = 0; pos <= text_w && colc < (int)g_screen_w; pos++) {
+        for (int i = 0; cfg.link_numbers && i < nlinks; i++) {
             if (links[i].line != doc_line || !vis_num[i] ||
                 links[i].col_mark != pos)
                 continue;
             int v = vis_num[i];
-            int mark = (i == cur_link) ? 0x1E : 0x0E;
-            if (colc < SCREEN_W)
+            int mark = att((i == cur_link) ? 0x1E : 0x0E);
+            if (colc < (int)g_screen_w)
                 put_ch(row, colc++, '[', mark);
-            if (v >= 100 && colc < SCREEN_W)
+            if (v >= 100 && colc < (int)g_screen_w)
                 put_ch(row, colc++, (char)('0' + (v / 100) % 10), mark);
-            if (v >= 10 && colc < SCREEN_W)
+            if (v >= 10 && colc < (int)g_screen_w)
                 put_ch(row, colc++, (char)('0' + (v / 10) % 10), mark);
-            if (colc < SCREEN_W)
+            if (colc < (int)g_screen_w)
                 put_ch(row, colc++, (char)('0' + v % 10), mark);
-            if (colc < SCREEN_W)
+            if (colc < (int)g_screen_w)
                 put_ch(row, colc++, ']', mark);
         }
-        if (pos >= TEXT_W)
+        if (pos >= text_w)
             break;
         if (!s[pos])
             break;
-        if (colc < SCREEN_W)
+        if (colc < (int)g_screen_w)
             put_ch(row, colc++, s[pos], attr);
     }
 }
@@ -1540,38 +1934,44 @@ static void draw_screen(int top) {
         if (doc < nlines)
             draw_line(r, doc);
         else
-            fill_row(r, 0x0F);
+            fill_row(r, att(0x0F));
     }
 }
 
 static void draw_status(int top, const char *msg) {
-    int row = SCREEN_H - 1;
-    fill_row(row, 0x0B);
+    int row = (int)g_screen_h - 1;
+    /* Выключена в конфиге: последняя строка принадлежит документу (view_h()
+     * == g_screen_h), затирать её нельзя — иначе «Ln 1/40» съедает последнюю
+     * строку текста при каждой перерисовке. */
+    if (!cfg.status_bar)
+        return;
+    unsigned char bar = att(0x0B);
+    fill_row(row, bar);
     int c = 0;
-    c = put_str(row, c, "Ln ", 0x0B);
-    c = put_num(row, c, top + 1, 0x0B);
-    c = put_str(row, c, "/", 0x0B);
-    c = put_num(row, c, nlines, 0x0B);
-    if (max_vis > 0) {
-        c = put_str(row, c, "  Lnk ", 0x0B);
+    c = put_str(row, c, "Ln ", bar);
+    c = put_num(row, c, top + 1, bar);
+    c = put_str(row, c, "/", bar);
+    c = put_num(row, c, nlines, bar);
+    if (max_vis > 0 && cfg.link_numbers) {
+        c = put_str(row, c, "  Lnk ", bar);
         if (cur_link >= 0 && cur_link < nlinks)
-            c = put_num(row, c, vis_num[cur_link], 0x0B);
+            c = put_num(row, c, vis_num[cur_link], bar);
         else
-            c = put_num(row, c, 0, 0x0B);
-        c = put_str(row, c, "/", 0x0B);
-        c = put_num(row, c, max_vis, 0x0B);
+            c = put_num(row, c, 0, bar);
+        c = put_str(row, c, "/", bar);
+        c = put_num(row, c, max_vis, bar);
     }
     if (msg && msg[0]) {
-        put_str(row, SCREEN_W - str_len(msg) - 1, msg, 0x1F);
-    } else if (cur_link >= 0 && cur_link < nlinks) {
+        put_str(row, (int)g_screen_w - str_len(msg) - 1, msg, att(0x1F));
+    } else if (cfg.show_url && cur_link >= 0 && cur_link < nlinks) {
         const char *u = links[cur_link].href;
         int maxw = 44;
-        int uc = SCREEN_W - str_len(u) - 1;
+        int uc = (int)g_screen_w - str_len(u) - 1;
         if (uc < 24)
             uc = 24;
         if (str_len(u) > maxw)
             u += str_len(u) - maxw; /* хвост URL важнее начала */
-        put_str(row, uc, u, 0x0E);
+        put_str(row, uc, u, att(0x0E));
     }
 }
 
@@ -1614,10 +2014,10 @@ static int next_link(int top, int dir) {
 /* ─── Ввод строки (для goto) ─────────────────────────────────────────────── */
 
 static int prompt_line(const char *prompt, char *out, int outsz) {
-    int row = SCREEN_H - 1;
-    fill_row(row, 0x1F);
+    int row = (int)g_screen_h - 1;
+    fill_row(row, att(0x1F));
     int c = 0;
-    c = put_str(row, c, prompt, 0x1F);
+    c = put_str(row, c, prompt, att(0x1F));
     int n = 0;
     out[0] = 0;
     while (1) {
@@ -1632,7 +2032,7 @@ static int prompt_line(const char *prompt, char *out, int outsz) {
             if (n > 0) {
                 n--;
                 c--;
-                put_ch(row, c, ' ', 0x1F);
+                put_ch(row, c, ' ', att(0x1F));
             }
             continue;
         }
@@ -1646,7 +2046,7 @@ static int prompt_line(const char *prompt, char *out, int outsz) {
         (void)is_shift;
         if (n < outsz - 2) {
             out[n++] = ch;
-            put_ch(row, c++, ch, 0x1F);
+            put_ch(row, c++, ch, att(0x1F));
         }
     }
 }
@@ -1665,7 +2065,7 @@ static int is_https_url(const char *u) {
 static int fetch(char *url, char *status, int statsz) {
     char host[HOST_MAX], path[PATH_MAX];
     int port;
-    for (int hops = 0; hops < 5; hops++) {
+    for (int hops = 0; hops < cfg.max_redirects; hops++) {
         if (parse_url(url, host, sizeof(host), path, sizeof(path), &port) < 0) {
             str_copy(status, "bad url", statsz);
             return 0;
@@ -1684,6 +2084,17 @@ static int fetch(char *url, char *status, int statsz) {
         char st[80], loc[URL_MAX];
         int body = parse_response(st, sizeof(st), loc, sizeof(loc));
         str_copy(status, st, statsz);
+        /* Копируем заголовки, пока они ещё в rxbuf: дальше декодер chunked
+         * сдвинет тело в начало и сотрёт их. */
+        hdr_text[0] = 0;
+        if (cfg.show_headers) {
+            int hn = 0;
+            for (int q = 0; q < body && hn < (int)sizeof(hdr_text) - 2; q++) {
+                /* CRLF -> LF: иначе каждая строка получит ведущий CR. */
+                hdr_text[hn++] = (rxbuf[q] == '\r') ? '\n' : (char)rxbuf[q];
+            }
+            hdr_text[hn] = 0;
+        }
         /* 3xx с Location -> следующий хоп. */
         if (st[9] == '3' && loc[0]) {
             char next[URL_MAX];
@@ -1700,11 +2111,100 @@ static int fetch(char *url, char *status, int statsz) {
 
 /* ─── main ───────────────────────────────────────────────────────────────── */
 
+/* Скролл вверх на n строк: под промптом места для справки не хватает, а
+ * писать за нижним краем нельзя. */
+static void scroll_up(int n) {
+    volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
+    for (int r = 0; r < (int)g_screen_h - n; r++)
+        for (int c = 0; c < (int)(g_screen_w * 2); c++)
+            vga[r * (int)(g_screen_w * 2) + c] =
+                vga[(r + n) * (int)(g_screen_w * 2) + c];
+    for (int r = (int)g_screen_h - n; r < (int)g_screen_h; r++)
+        fill_row(r, att(0x0F));
+}
+
+/* Справка по ключам конфига. Печатается с текущей строки и при нехватке
+ * места подтягивает экран вверх; промпт потом встаёт под последней строкой. */
+static void print_help(unsigned int vga_offset) {
+    static const char *const hl[] = {
+        "usage: web [-c PATH] [host [port [path]] | url]",
+        "  -c, --config PATH   конфиг (по умолчанию /etc/web.conf)",
+        "  -h, --help          эта справка",
+        "",
+        "ключи /etc/web.conf (ключ = значение, # и ; — комментарии):",
+        "  start_url       что открывать без аргументов",
+        "  width           ширина текста, 40..74",
+        "  user_agent      заголовок User-Agent",
+        "  accept          заголовок Accept",
+        "  accept_encoding Accept-Encoding; пусто = не слать",
+        "  default_port    порт, если в адресе схемы нет",
+        "  timeout_connect / timeout_send / timeout_recv  тики PIT, 100 Гц",
+        "  max_download    предел загрузки, байт; 0 = без предела",
+        "  max_redirects   сколько редиректов подряд",
+        "  history         глубина «назад», 0..12",
+        "  link_numbers    подписи [N] у ссылок",
+        "  status_bar      строка состояния внизу",
+        "  show_url        URL курсорной ссылки в строке состояния",
+        "  show_headers    печатать заголовки ответа",
+        "  color           off = монохром",
+        "  key_quit / key_back / key_goto  выход / назад / ввод адреса",
+        "",
+        "клавиши: стрелки скроллят, PgUp/PgDn/Home/End - экран,",
+        "  <-/-> и TAB - ссылка, Enter или номер - открыть,",
+        "  key_goto - адрес, key_back - история, key_quit - выход",
+    };
+    int r = (int)(vga_offset / (g_screen_w * 2));
+    if (r < 0 || r > (int)g_screen_h - 1)
+        r = 0;
+    for (int i = 0; i < (int)(sizeof(hl) / sizeof(hl[0])); i++) {
+        if (r > (int)g_screen_h - 1) {
+            scroll_up(1);
+            r = (int)g_screen_h - 1;
+        }
+        fill_row(r, att(0x0F));
+        put_str(r, 0, hl[i], att(0x0F));
+        r++;
+    }
+    /* Последняя строка справки может лечь на самый низ экрана, и тогда r
+     * равен g_screen_h - строке за экраном нет. Шелл берёт это число как
+     * позицию промпта и зажимает у себя, но полагаться на это не стоит:
+     * приписываем явно. */
+    *(volatile int *)EXIT_ROW_P = r < (int)g_screen_h ? r : (int)g_screen_h - 1;
+    *(volatile int *)EXIT_COL_P = 0;
+}
+
 void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
     char url[URL_MAX];
     char status[128];
 
-    /* Аргументы: [host [port [path]]] — поддерживаем и полный URL. */
+    vga_read_grid();
+    cfg_defaults();
+
+    /* Опции читаем первыми: `web -c /tmp/my.conf example.com`. */
+    const char *cfgpath = "/etc/web.conf";
+    unsigned long ai = 1;
+    while (ai < argc) {
+        const char *a = argv[ai];
+        if (a[0] == '-' && a[1]) {
+            if (str_ieq(a, "-c") || str_ieq(a, "--config")) {
+                if (ai + 1 < argc)
+                    cfgpath = argv[++ai];
+                ai++;
+                continue;
+            }
+            if (str_ieq(a, "-h") || str_ieq(a, "--help")) {
+                print_help(vga_offset);
+                return;
+            }
+        }
+        break;
+    }
+    load_config(cfgpath);
+    text_w = cfg.width;
+
+    /* Дальше argv — адрес: [host [port [path]]] или полный URL. */
+    argc -= ai - 1;
+    argv += ai - 1;
     url[0] = 0;
     if (argc >= 4) {
         int port = 0, any = 0;
@@ -1716,48 +2216,43 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
                 port = 65535;
             any = 1;
         }
-        make_url(url, sizeof(url), argv[1], any ? port : 80, argv[3]);
+        make_url(url, sizeof(url), argv[1], any ? port : cfg.default_port,
+                 argv[3]);
     } else if (argc >= 2) {
-        char host[HOST_MAX], path[PATH_MAX];
+        char host[HOST_MAX], path[PATH_MAX], sch[8];
         int port;
         if (parse_url(argv[1], host, sizeof(host), path, sizeof(path), &port) < 0) {
-            char msg[64];
-            str_copy(msg, "usage: web <host> [port] [path]", sizeof(msg));
-            int r = (int)(vga_offset / 160);
-            if (r < 0 || r > SCREEN_H - 2)
-                r = 0;
-            put_str(r, 0, msg, 0x0F);
-            *(volatile int *)EXIT_ROW_P = r + 1;
-            *(volatile int *)EXIT_COL_P = 40;
+            print_help(vga_offset);
             return;
         }
-        make_url(url, sizeof(url), host, port, path);
+        /* Схему из аргумента сохраняем: «https://h:8443/» иначе стал бы
+         * обычным HTTP на 8443. */
+        url_scheme(argv[1], sch, sizeof(sch));
+        make_url_sch(url, sizeof(url), sch, host, port, path);
+    } else if (cfg.start_url[0]) {
+        /* Без аргументов открываем домашнюю страницу из конфига. */
+        str_copy(url, cfg.start_url, sizeof(url));
     } else {
-        int r = (int)(vga_offset / 160);
-        if (r < 0 || r > SCREEN_H - 2)
-            r = 0;
-        put_str(r, 0, "usage: web <host> [port] [path]", 0x0F);
-        *(volatile int *)EXIT_ROW_P = r + 1;
-        *(volatile int *)EXIT_COL_P = 40;
+        print_help(vga_offset);
         return;
     }
 
-    for (int r = 0; r < SCREEN_H; r++)
-        fill_row(r, 0x0F);
+    for (int r = 0; r < (int)g_screen_h; r++)
+        fill_row(r, att(0x0F));
 
     int top = 0;
     str_copy(cur_url, url, sizeof(cur_url));
-    put_str(0, 0, "Loading ", 0x0B);
-    put_str(0, 8, cur_url, 0x0B);
+    put_str(0, 0, "Loading ", att(0x0B));
+    put_str(0, 8, cur_url, att(0x0B));
     str_copy(status, "", sizeof(status));
 
     if (!fetch(url, status, sizeof(status))) {
-        fill_row(0, 0x0F);
-        put_str(0, 0, "web: ", 0x0F);
-        put_str(0, 5, status, 0x0F);
+        fill_row(0, att(0x0F));
+        put_str(0, 0, "web: ", att(0x0F));
+        put_str(0, 5, status, att(0x0F));
         draw_status(0, "press any key");
         wait_key_any();
-        *(volatile int *)EXIT_ROW_P = SCREEN_H - 1;
+        *(volatile int *)EXIT_ROW_P = (int)g_screen_h - 1;
         *(volatile int *)EXIT_COL_P = 0;
         return;
     }
@@ -1771,6 +2266,11 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
         int sc = wait_key();
         char msg[64];
         msg[0] = 0;
+        /* Буквы сравниваем как символы, а не как скан-коды: key_quit/
+         * key_back/key_goto в конфиге заданы буквами. */
+        char kc = sc_to_char(sc, shift_down);
+        int is_cfg_key = (kc == cfg.key_quit || kc == cfg.key_back ||
+                          kc == cfg.key_goto);
 
         /* Цифра — накапливаем номер ссылки. Скан-коды 0x02..0x0B = «1»..«0». */
         if (sc >= 0x02 && sc <= 0x0B) {
@@ -1795,13 +2295,18 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
             while (dn > 0)
                 nb[p++] = dg[--dn];
             nb[p] = 0;
-            fill_row(SCREEN_H - 1, 0x1F);
-            put_str(SCREEN_H - 1, 0, nb, 0x1F);
+            /* Подсказка «#N» живёт на строке состояния. Если её выключили,
+             * места для подсказки нет — цифры просто копятся, курсорная
+             * ссылка и так подсвечена. */
+            if (cfg.status_bar) {
+                fill_row((int)g_screen_h - 1, att(0x1F));
+                put_str((int)g_screen_h - 1, 0, nb, att(0x1F));
+            }
             continue;
         }
 
         /* Enter или '.' — открыть ссылку. */
-        if (sc == SC_ENTER || sc == 0x34) {
+        if (sc == SC_ENTER || (kc == '.' && !is_cfg_key)) {
             int target = -1;
             if (numbuf > 0) {
                 for (int i = 0; i < nlinks; i++)
@@ -1821,20 +2326,20 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
             }
             numbuf = 0;
             if (target >= 0) {
-                if (nhist < MAX_HIST)
+                if (nhist < cfg.history)
                     str_copy(hist_url[nhist++], cur_url, URL_MAX);
                 char next[URL_MAX];
                 str_copy(next, links[target].href, URL_MAX);
                 str_copy(cur_url, next, sizeof(cur_url));
                 str_copy(url, next, sizeof(url));
-                for (int r = 0; r < SCREEN_H; r++)
-                    fill_row(r, 0x0F);
-                put_str(0, 0, "Loading ", 0x0B);
-                put_str(0, 8, cur_url, 0x0B);
+                for (int r = 0; r < (int)g_screen_h; r++)
+                    fill_row(r, att(0x0F));
+                put_str(0, 0, "Loading ", att(0x0B));
+                put_str(0, 8, cur_url, att(0x0B));
                 if (!fetch(url, status, sizeof(status))) {
-                    fill_row(0, 0x0F);
-                    put_str(0, 0, "web: ", 0x0F);
-                    put_str(0, 5, status, 0x0F);
+                    fill_row(0, att(0x0F));
+                    put_str(0, 0, "web: ", att(0x0F));
+                    put_str(0, 5, status, att(0x0F));
                     draw_status(0, "press any key");
                     wait_key_any();
                     /* возвращаемся на прошлую страницу. */
@@ -1842,8 +2347,8 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
                         nhist--;
                         str_copy(cur_url, hist_url[nhist], sizeof(cur_url));
                         str_copy(url, cur_url, sizeof(url));
-                        for (int r = 0; r < SCREEN_H; r++)
-                            fill_row(r, 0x0F);
+                        for (int r = 0; r < (int)g_screen_h; r++)
+                            fill_row(r, att(0x0F));
                         if (!fetch(url, status, sizeof(status))) {
                             draw_status(0, "load failed");
                             wait_key_any();
@@ -1863,23 +2368,23 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
             continue;
         }
 
-        /* q — выход. */
-        if (sc == 0x10)
+        /* key_quit (по умолчанию q) — выход. */
+        if (kc == cfg.key_quit)
             break;
 
-        /* h — назад. */
-        if (sc == 0x23 && nhist > 0) {
+        /* key_back (по умолчанию h) — назад. */
+        if (kc == cfg.key_back && nhist > 0) {
             nhist--;
             str_copy(cur_url, hist_url[nhist], sizeof(cur_url));
             str_copy(url, cur_url, sizeof(url));
-            for (int r = 0; r < SCREEN_H; r++)
-                fill_row(r, 0x0F);
-            put_str(0, 0, "Loading ", 0x0B);
-            put_str(0, 8, cur_url, 0x0B);
+            for (int r = 0; r < (int)g_screen_h; r++)
+                fill_row(r, att(0x0F));
+            put_str(0, 0, "Loading ", att(0x0B));
+            put_str(0, 8, cur_url, att(0x0B));
             if (!fetch(url, status, sizeof(status))) {
-                fill_row(0, 0x0F);
-                put_str(0, 0, "web: ", 0x0F);
-                put_str(0, 5, status, 0x0F);
+                fill_row(0, att(0x0F));
+                put_str(0, 0, "web: ", att(0x0F));
+                put_str(0, 5, status, att(0x0F));
                 draw_status(0, "press any key");
                 wait_key_any();
                 break;
@@ -1891,27 +2396,28 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
             continue;
         }
 
-        /* g — «го»: ввод адреса. */
-        if (sc == 0x22) {
+        /* key_goto (по умолчанию g) — «го»: ввод адреса. */
+        if (kc == cfg.key_goto) {
             char buf[URL_MAX];
             if (prompt_line("Go to: ", buf, sizeof(buf))) {
-                char h2[HOST_MAX], p2[PATH_MAX];
+                char h2[HOST_MAX], p2[PATH_MAX], s2[8];
                 int p2n;
                 if (parse_url(buf, h2, sizeof(h2), p2, sizeof(p2), &p2n) == 0) {
-                    if (nhist < MAX_HIST)
+                    if (nhist < cfg.history)
                         str_copy(hist_url[nhist++], cur_url, URL_MAX);
                     char next[URL_MAX];
-                    make_url(next, sizeof(next), h2, p2n, p2);
+                    url_scheme(buf, s2, sizeof(s2));
+                    make_url_sch(next, sizeof(next), s2, h2, p2n, p2);
                     str_copy(cur_url, next, sizeof(cur_url));
                     str_copy(url, next, sizeof(url));
-                    for (int r = 0; r < SCREEN_H; r++)
-                        fill_row(r, 0x0F);
-                    put_str(0, 0, "Loading ", 0x0B);
-                    put_str(0, 8, cur_url, 0x0B);
+                    for (int r = 0; r < (int)g_screen_h; r++)
+                        fill_row(r, att(0x0F));
+                    put_str(0, 0, "Loading ", att(0x0B));
+                    put_str(0, 8, cur_url, att(0x0B));
                     if (!fetch(url, status, sizeof(status))) {
-                        fill_row(0, 0x0F);
-                        put_str(0, 0, "web: ", 0x0F);
-                        put_str(0, 5, status, 0x0F);
+                        fill_row(0, att(0x0F));
+                        put_str(0, 0, "web: ", att(0x0F));
+                        put_str(0, 5, status, att(0x0F));
                         draw_status(0, "press any key");
                         wait_key_any();
                         break;
@@ -2002,6 +2508,6 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
         draw_status(top, NULL);
     }
 
-    *(volatile int *)EXIT_ROW_P = SCREEN_H - 1;
+    *(volatile int *)EXIT_ROW_P = (int)g_screen_h - 1;
     *(volatile int *)EXIT_COL_P = 0;
 }

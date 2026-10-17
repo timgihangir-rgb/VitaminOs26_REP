@@ -4,15 +4,19 @@
  *    run banner hello world
  *
  * Перенос: каждая буква 5 колонок + 1 зазор; помещается 13 букв в строку
- * (80 колонок), при большем количестве — перенос на следующий блок строк.
- * Под артом печатается исходная строка обычным текстом.
+ * (минимум 80 колонок по сетке), при большем количестве — перенос на
+ * следующий блок строк. Под артом печатается исходная строка обычным текстом.
  */
+
+#include "../common/vgasize.h"
 
 #define EXIT_ROW_P  0x708C
 #define EXIT_COL_P  0x7090
 
 /* Шрифт 5x5: 5 рядов по 5 бит (бит 4 = левая колонка). */
-static const unsigned char FONT[40][5] = {
+#define NGLYPHS 40
+
+static const unsigned char FONT[NGLYPHS][5] = {
     /* A */ {0x0E, 0x11, 0x11, 0x1F, 0x11},
     /* B */ {0x1E, 0x11, 0x1E, 0x11, 0x1E},
     /* C */ {0x0F, 0x10, 0x10, 0x10, 0x0F},
@@ -71,10 +75,10 @@ static void draw_glyph(int row, int col, int g, unsigned char attr) {
         unsigned char bits = FONT[g][r];
         for (int c = 0; c < 5; c++) {
             int on = (bits >> (4 - c)) & 1;
-            if (row + r >= 30 || row + r < 0) continue;
+            if ((unsigned)(row + r) >= g_screen_h || row + r < 0) continue;
             int x = col + c;
-            if (x >= 80) continue;
-            int off = ((row + r) * 80 + x) * 2;
+            if ((unsigned)x >= g_screen_w) continue;
+            int off = ((row + r) * (int)g_screen_w + x) * 2;
             vga[off] = on ? '#' : ' ';
             vga[off + 1] = attr;
         }
@@ -85,18 +89,31 @@ static void draw_glyph(int row, int col, int g, unsigned char attr) {
 static int draw_plain(int row, const char *s, unsigned char attr) {
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
     int col = 0;
-    while (*s && col < 79) {
-        vga[row * 160 + col * 2] = (unsigned char)*s++;
-        vga[row * 160 + col * 2 + 1] = attr;
+    while (*s && (unsigned)col < g_screen_w - 1) {
+        int off = row * (int)(g_screen_w * 2) + col * 2;
+        vga[off] = (unsigned char)*s++;
+        vga[off + 1] = attr;
         col++;
     }
     return col;
 }
 
 #define GLYPH_W 6 /* 5 колонок + зазор */
-#define GLYPHS_PER_ROW 13 /* 13 * 6 = 78 <= 80 */
+
+/* Сколько букв влезает в строку. Раньше было жёстко 13 (13 * 6 = 78 <= 80) -
+ * по минимальной сетке; на 120x33 влезет 19, и длинная строка в один блок
+ * уже не разваливается на три. */
+static int glyphs_per_row(void)
+{
+    int fit = ((int)g_screen_w - 1) / GLYPH_W;
+    if (fit < 1) fit = 1;
+    if (fit > NGLYPHS) fit = NGLYPHS; /* шрифт всё равно кончается на 40 глифах */
+    return fit;
+}
 
 void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
+    vga_read_grid();
+
     /* Собираем строку из argv[1..], разделяя аргументы пробелами. */
     char word[192];
     int n = 0;
@@ -121,14 +138,15 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
             glyphs[ng++] = g;
     }
 
-    int start_row = (int)(vga_offset / 160);
-    int block_rows = (ng + GLYPHS_PER_ROW - 1) / GLYPHS_PER_ROW;
+    int start_row = (int)(vga_offset / (g_screen_w * 2));
+    int per_row = glyphs_per_row();
+    int block_rows = (ng + per_row - 1) / per_row;
     int need = block_rows * 5 + 2; /* арт + строка текста */
-    int avail = 30 - start_row;
-    if (need > avail) start_row = 30 - need;
+    int avail = (int)g_screen_h - start_row;
+    if (need > avail) start_row = (int)g_screen_h - need;
     if (start_row < 0) start_row = 0;
     /* Крайний случай: очень длинная строка — рисуем сколько влезает. */
-    avail = 30 - start_row;
+    avail = (int)g_screen_h - start_row;
     if (avail >= 7) {
         int fit = (avail - 2) / 5;
         if (block_rows > fit)
@@ -139,15 +157,15 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
 
     for (int b = 0; b < block_rows; b++) {
         int row = start_row + b * 5;
-        for (int k = 0; k < GLYPHS_PER_ROW; k++) {
-            int gi = b * GLYPHS_PER_ROW + k;
+        for (int k = 0; k < per_row; k++) {
+            int gi = b * per_row + k;
             if (gi >= ng) break;
             draw_glyph(row, k * GLYPH_W, glyphs[gi], 0x0A); /* зелёный */
         }
     }
 
     int text_row = start_row + block_rows * 5;
-    if (text_row >= 30) text_row = 29;
+    if ((unsigned)text_row >= g_screen_h) text_row = (int)g_screen_h - 1;
     int end_col = draw_plain(text_row, word, 0x0F);
 
     *(volatile int *)EXIT_ROW_P = text_row;

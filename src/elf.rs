@@ -83,6 +83,15 @@ pub fn load_elf(space: &mut AddressSpace, data: &[u8]) -> Result<u64, ElfError> 
     }
 
     let entry = u64le(data, 24)?;
+    // e_entry - недоверенное поле файла, а scheduler::spawn_user пишет его
+    // прямо в слот rip первого входа в ring 3. Без проверки ELF с e_entry = 0
+    // (или с адресом ядра) даёт #PF при CPL=3: обработчик исключений работает
+    // в ring 0 и уходит в halt_loop() - то есть один битый файл в /bin
+    // намертво залипает ядро. Проверяем только попадание в user-диапазон;
+    // что страница реально отображена, проверяет map_segment ниже.
+    if entry < USER_START || entry >= USER_STACK_BASE {
+        return Err(ElfError::Malformed);
+    }
     let phoff = u64le(data, 32)? as usize;
     let phentsize = u16le(data, 54)? as usize;
     let phnum = u16le(data, 56)? as usize;
@@ -103,6 +112,12 @@ pub fn load_elf(space: &mut AddressSpace, data: &[u8]) -> Result<u64, ElfError> 
         let p_filesz = u64le(ph, 32)? as usize;
         let p_memsz = u64le(ph, 40)? as usize;
         map_segment(space, data, p_offset, p_vaddr, p_filesz, p_memsz)?;
+    }
+
+    // Точка входа обязана быть отображена ПОСЛЕ раскладки сегментов: иначе
+    // первый же переход CPL 3 → user rip упадёт в #PF.
+    if translate_addr(space, VirtAddr::new(entry)).is_none() {
+        return Err(ElfError::Malformed);
     }
 
     Ok(entry)

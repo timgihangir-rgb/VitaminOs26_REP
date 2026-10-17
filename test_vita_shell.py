@@ -89,10 +89,29 @@ def vga_addr():
     return m.group(1) if m else "0xb8000"
 
 
+def grid():
+    """Размер текстовой сетки в ячейках.
+
+    Сетку больше не 80x30 на все случаи: композитор выбирает её под
+    разрешение монитора (см. `fit_grid` в src/fb.rs), и на 1280x800 это
+    80x25 в масштабе 2x - буквы вдвое крупнее и занимают весь кадр. Ядро
+    печатает итог в serial строкой "[N] fb WxH scale=N grid=CxR", по ней и
+    читаем, сколько колонок и строк разбирать из дампа экрана. Нет такой
+    строки - композитор не включился, система в текстовом режиме, и сетка
+    историческая.
+    """
+    try:
+        log = open(SERIAL_LOG, errors="replace").read()
+    except OSError:
+        return 80, 30
+    m = re.search(r"grid=(\d+)x(\d+)", log)
+    return (int(m.group(1)), int(m.group(2))) if m else (80, 30)
+
+
 def dump_vga(s, path):
     """Dump physical VGA framebuffer to a file via HMP pmemsave."""
     # Quoted path: '/' is parsed as division by HMP's expression parser.
-    r = qmp_hmp(s, f'pmemsave {vga_addr()} 9600 "{path}"')
+    r = qmp_hmp(s, f'pmemsave {vga_addr()} 65536 "{path}"')
     time.sleep(0.4)
     return r
 
@@ -104,10 +123,11 @@ def vga_text(path):
     except FileNotFoundError:
         return []
     lines = []
-    for row in range(30):
+    cols, rows_ = grid()
+    for row in range(rows_):
         chars = []
-        for col in range(80):
-            ch = data[row * 160 + col * 2]
+        for col in range(cols):
+            ch = data[row * cols * 2 + col * 2]
             if 32 <= ch < 127:
                 chars.append(chr(ch))
             else:

@@ -1,5 +1,9 @@
-#define ROWS 30
-#define COLS 80
+#include "../common/vgasize.h"
+
+/* Сетка от ядра: справка занимает весь экран, и на жёстких 80x30 при
+ * 1280x800 она обрезалась снизу. */
+#define ROWS ((int)g_screen_h)
+#define COLS ((int)g_screen_w)
 
 #define PROGLIST ((volatile char *)0x608C)
 #define EXIT_ROW (*(volatile int *)0x708C)
@@ -39,6 +43,8 @@ static char prog_names[MAX_PROGS][PROG_NAME_LEN];
 static int prog_count;
 
 void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
+    vga_read_grid();
+
     (void)argc;
     (void)argv;
     (void)vga_offset;
@@ -95,6 +101,7 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
     wputs("Keys:\n", 0x0B);
     wputs("  Ctrl+C            interrupt the running program / cancel the line\n", 0x0F);
     wputs("  Ctrl+Shift+1..4    switch desktop (1-4) in the prompt\n", 0x0F);
+    wputs("  Ctrl+Alt+letter    switch layout US / Russian (YOUTU)\n", 0x0F);
 
     EXIT_ROW = r;
     EXIT_COL = c;

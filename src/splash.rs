@@ -1,5 +1,7 @@
 // src/splash.rs — загрузочный экран: ASCII-баннер + статусы подсистем.
-use crate::vga::{Writer, COLOR_LIGHT_CYAN, COLOR_LIGHT_GREEN, COLOR_LIGHT_RED, COLOR_WHITE, SCREEN_WIDTH};
+use crate::vga::{
+    screen_cols, Writer, COLOR_LIGHT_CYAN, COLOR_LIGHT_GREEN, COLOR_LIGHT_RED, COLOR_WHITE,
+};
 
 const BANNER: &[&str] = &[
     r" _   _ _ _                  _       _____       _____   ____ ",
@@ -27,6 +29,9 @@ pub fn draw(writer: &mut Writer) {
     writer.set_color(COLOR_WHITE);
     centered(writer, "booting subsystems...");
     writer.write_string("\n\n");
+    // Баннер рисуется целиком: пока он проявлялся построчно, загрузка
+    // выглядела как печать, а не как готовый экран.
+    writer.sync();
 }
 
 /// Строка статуса подсистемы: зелёный `[ OK ]` + имя, затем короткая пауза.
@@ -36,6 +41,9 @@ pub fn step(writer: &mut Writer, name: &str) {
     writer.set_color(COLOR_WHITE);
     writer.write_string(name);
     writer.write_string("\n");
+    // Загрузочный экран - единственное место, где построчное появление
+    // уместно: это прогресс, и пауза между строками его смысл.
+    writer.sync();
     pause();
 }
 
@@ -46,12 +54,14 @@ pub fn fail(writer: &mut Writer, name: &str) {
     writer.set_color(COLOR_WHITE);
     writer.write_string(name);
     writer.write_string("\n");
+    writer.sync();
 }
 
 /// Финал: очищаем экран — дальше начинается интерактивный шелл.
 pub fn finish(writer: &mut Writer) {
     writer.set_color(COLOR_WHITE);
     writer.clear_screen();
+    writer.sync();
 }
 
 /// Держит загрузочный экран на виду до нажатия Enter. Без этой паузы
@@ -77,7 +87,7 @@ pub fn wait_enter(writer: &mut Writer) {
 }
 
 fn centered(writer: &mut Writer, s: &str) {
-    let pad = SCREEN_WIDTH.saturating_sub(s.len()) / 2;
+    let pad = screen_cols().saturating_sub(s.len()) / 2;
     for _ in 0..pad {
         writer.write_string(" ");
     }

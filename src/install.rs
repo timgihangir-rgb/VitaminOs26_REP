@@ -70,6 +70,7 @@ pub fn install_to(
     drop_programs: &[String],
     account_name: &str,
     account_password: &str,
+    vfs: &mut crate::vfs::Vfs,
 ) -> Result<(), &'static str> {
     let live = blockdev::active();
     if live == target {
@@ -205,7 +206,7 @@ pub fn install_to(
         // Пишем прямо в иноды целевой ФС, пока смонтирована цель: VFS
         // сейчас смотрит на live-образ, а смены смонтированной ФС тут нет.
         crate::vitafs::idrop_all();
-        setup_account(&tsb, account_name, account_password);
+        setup_account(vfs, account_name, account_password);
         crate::vitafs::sync_all();
     } else {
         ser("warn: cannot mount target to finalize");
@@ -265,6 +266,9 @@ fn draw(writer: &mut Writer, menu: &Menu, disk_idx: usize, prog_idx: usize, focu
 
     writer.set_color(COLOR_WHITE);
     writer.write_string("\n  Enter - установить, Esc - отмена\n");
+    // Меню перерисовывается целиком на каждое нажатие: один кадр, без
+    // промежуточных состояний между очисткой и содержимым.
+    writer.sync();
 }
 
 /// Ждёт подтверждения Enter (да) или Esc (нет).
@@ -350,8 +354,8 @@ fn ask_account(writer: &mut Writer) -> Option<NewAccount> {
 
 /// Создаёт учётную запись и домашний каталог на смонтированной целевой ФС.
 /// Вызывается из `install_to`, пока цель смонтирована и текущий uid - root.
-fn setup_account(_sb: &crate::vitafs::Superblock, name: &str, password: &str) {
-    match crate::user::add_with_home(name, password) {
+fn setup_account(vfs: &mut crate::vfs::Vfs, name: &str, password: &str) {
+    match crate::user::add_with_home_vfs(vfs, name, password) {
         Ok(acc) => ser(&alloc::format!("account: created {} uid={}", acc.name, acc.uid)),
         Err(e) => ser(&alloc::format!("account: ERR {}", e)),
     }
@@ -452,7 +456,7 @@ pub fn run(writer: &mut Writer, vfs: &mut Vfs) -> bool {
                     name,
                     drop.len()
                 ));
-                match install_to(target, &drop, &account.name, &account.password) {
+                match install_to(target, &drop, &account.name, &account.password, vfs) {
                     Ok(()) => {
                         ser("install: OK");
                         writer.set_color(COLOR_LIGHT_GREEN);

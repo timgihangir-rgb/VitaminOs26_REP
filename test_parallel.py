@@ -87,7 +87,8 @@ def type_line(s, text):
         fast_sendkey(s, KEY_MAP.get(ch, ch))
     time.sleep(0.2)
     fast_sendkey(s, "ret")
-    time.sleep(0.9)
+    time.sleep(0.3)
+    wait_stable(s)
 
 
 SERIAL_LOG = "/tmp/par_serial.log"
@@ -109,8 +110,27 @@ def vga_addr():
     return m.group(1) if m else "0xb8000"
 
 
+def grid():
+    """Размер текстовой сетки в ячейках.
+
+    Сетку больше не 80x30 на все случаи: композитор выбирает её под
+    разрешение монитора (см. `fit_grid` в src/fb.rs), и на 1280x800 это
+    80x25 в масштабе 2x - буквы вдвое крупнее и занимают весь кадр. Ядро
+    печатает итог в serial строкой "[N] fb WxH scale=N grid=CxR", по ней и
+    читаем, сколько колонок и строк разбирать из дампа экрана. Нет такой
+    строки - композитор не включился, система в текстовом режиме, и сетка
+    историческая.
+    """
+    try:
+        log = open(SERIAL_LOG, errors="replace").read()
+    except OSError:
+        return 80, 30
+    m = re.search(r"grid=(\d+)x(\d+)", log)
+    return (int(m.group(1)), int(m.group(2))) if m else (80, 30)
+
+
 def dump_vga(s):
-    qmp_hmp(s, f'pmemsave {vga_addr()} 9600 "{VGA_DUMP}"')
+    qmp_hmp(s, f'pmemsave {vga_addr()} 65536 "{VGA_DUMP}"')
     time.sleep(0.4)
 
 
@@ -120,10 +140,11 @@ def vga_text():
     except FileNotFoundError:
         return []
     lines = []
-    for row in range(30):
+    cols, rows_ = grid()
+    for row in range(rows_):
         chars = []
-        for col in range(80):
-            ch = data[row * 160 + col * 2]
+        for col in range(cols):
+            ch = data[row * cols * 2 + col * 2]
             chars.append(chr(ch) if 32 <= ch < 127 else " ")
         lines.append("".join(chars))
     return lines
@@ -131,6 +152,26 @@ def vga_text():
 
 def screen_text():
     return "\n".join(vga_text())
+
+def wait_stable(s, quiet_reads=2, timeout=15.0):
+    """Ждёт, пока экран перестанет меняться.
+
+    Фиксированная пауза после Enter (0.9 c) не гарантирует, что вывод
+    команды уже нарисован: холодный bcache и PIO ATA дают до 1.3 c на
+    `ls /bin`, и дамп попадал на середину списка - проверка падала. Теперь
+    ждём тишины: два чтения экрана подряд совпали.
+    """
+    deadline = time.time() + timeout
+    same = 0
+    prev = None
+    while time.time() < deadline:
+        dump_vga(s)
+        cur = screen_text()
+        same = same + 1 if cur == prev else 0
+        if same >= quiet_reads:
+            return True
+        prev = cur
+    return False
 
 
 def clear_and_run(s, command):

@@ -1,7 +1,14 @@
+#include "../common/vgasize.h"
+
 #define MAX_LINES 500
 #define MAX_FILE 4096
-#define TEXT_ROWS 28
-#define COLS 80
+
+/* Сетку берём у ядра: редактор занимает весь экран целиком (строка 0 -
+ * статус, последняя - подсказка, между ними текст файла), и на 1280x800
+ * жёсткие 80x28 оставили бы две строки файла незанятыми. */
+static int cols(void) { return (int)g_screen_w; }
+/* Строки под текст файла: всё, кроме верхнего статуса и нижней подсказки. */
+static int text_rows(void) { int n = (int)g_screen_h - 2; return n < 1 ? 1 : n; }
 
 #define DIRTY      (*(volatile unsigned int *)0x6000)
 #define FILE_SIZE  (*(volatile unsigned int *)0x6004)
@@ -64,6 +71,7 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
     (void)vga_offset;
     int i;
 
+    vga_read_grid();
     rebuild();
 
     cur_line = 0;
@@ -82,7 +90,7 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
         {
             int col = 7;
             const volatile char *fn = FILENAME;
-            while (*fn && col < COLS - 20) {
+            while (*fn && col < cols() - 20) {
                 draw_char(0, col, *fn, 0x30);
                 col++; fn++;
             }
@@ -94,7 +102,7 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
             int ri = 0;
             if (tmp == 0) rev[ri++] = '0';
             while (tmp > 0) { rev[ri++] = '0' + (tmp % 10); tmp /= 10; }
-            int lx = COLS - 16;
+            int lx = cols() - 16;
             draw_str(0, lx, "Ln ", 0x30);
             for (i = 0; i < ri; i++)
                 draw_char(0, lx + 3 + i, rev[ri - 1 - i], 0x30);
@@ -107,23 +115,24 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
                 draw_char(0, lx + 4 + ri + i, rev[ri - 1 - i], 0x30);
         }
 
-        for (int r = 0; r < TEXT_ROWS; r++) {
+        for (int r = 0; r < text_rows(); r++) {
             int file_idx = scroll + r;
             if (file_idx < nlines) {
                 int off = line_off[file_idx];
                 int len = line_len[file_idx];
-                if (len > COLS) len = COLS;
+                if (len > cols()) len = cols();
                 draw_str_n(r + 1, 0, (const char *)(FILEDATA + off), len, 0x0F);
-                for (int c = len; c < COLS; c++) draw_char(r + 1, c, ' ', 0x0F);
+                for (int c = len; c < cols(); c++) draw_char(r + 1, c, ' ', 0x0F);
             } else {
                 fill_row(r + 1, 0x0F);
             }
         }
 
-        fill_row(29, 0x07);
-        draw_str(29, 0, " Ctrl+Q Quit  Ctrl+S Save  Tab=4 AutoIndent ", 0x0E);
+        int bottom = (int)g_screen_h - 1;
+        fill_row(bottom, 0x07);
+        draw_str(bottom, 0, " Ctrl+Q Quit  Ctrl+S Save  Tab=4 AutoIndent ", 0x0E);
 
-        set_cursor(cur_line - scroll + 1, cur_col < COLS ? cur_col : COLS - 1);
+        set_cursor(cur_line - scroll + 1, cur_col < cols() ? cur_col : cols() - 1);
 
         unsigned char sc;
         for (;;) {
@@ -152,11 +161,11 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
                     case 0x47: /* Home */ cur_col = 0; break;
                     case 0x4F: /* End */ cur_col = line_len[cur_line]; break;
                     case 0x49: /* PgUp */
-                        if (cur_line >= TEXT_ROWS) cur_line -= TEXT_ROWS;
+                        if (cur_line >= text_rows()) cur_line -= text_rows();
                         else cur_line = 0;
                         break;
                     case 0x51: /* PgDn */
-                        cur_line += TEXT_ROWS;
+                        cur_line += text_rows();
                         if (cur_line >= nlines) cur_line = nlines - 1;
                         break;
                     case 0x53: /* Delete */
@@ -373,8 +382,8 @@ static void ensure_visible(void) {
     if (cur_line >= nlines) cur_line = nlines - 1;
     if (cur_line < scroll)
         scroll = cur_line;
-    else if (cur_line >= scroll + TEXT_ROWS)
-        scroll = cur_line - TEXT_ROWS + 1;
+    else if (cur_line >= scroll + text_rows())
+        scroll = cur_line - text_rows() + 1;
     int max_col = line_len[cur_line];
     if (cur_col > max_col) cur_col = max_col;
     if (cur_col < 0) cur_col = 0;
@@ -386,10 +395,10 @@ static void outb(unsigned short port, unsigned char val) {
 
 static void set_cursor(int row, int col) {
     if (row < 0) row = 0;
-    if (row > 29) row = 29;
+    if (row > (int)g_screen_h - 1) row = (int)g_screen_h - 1;
     if (col < 0) col = 0;
-    if (col > COLS - 1) col = COLS - 1;
-    int pos = row * 80 + col;
+    if (col > cols() - 1) col = cols() - 1;
+    int pos = row * cols() + col;
     outb(0x3D4, 0x0F);
     outb(0x3D5, pos & 0xFF);
     outb(0x3D4, 0x0E);
@@ -409,20 +418,22 @@ static void cursor_shape(void) {
 
 static void clear_screen(void) {
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
-    for (int i = 0; i < 80 * 30 * 2; i++)
+    /* Вся сетка, а не исторические 80x30: на 120x33 остаток экрана иначе
+     * остался бы от предыдущей программы. */
+    for (int i = 0; i < (int)(g_screen_w * g_screen_h) * 2; i++)
         vga[i] = (i & 1) ? 0x0F : ' ';
 }
 
 static void draw_char(int row, int col, unsigned char ch, unsigned char attr) {
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
-    int idx = (row * 80 + col) * 2;
+    int idx = (row * cols() + col) * 2;
     vga[idx] = ch;
     vga[idx + 1] = attr;
 }
 
 static void draw_str(int row, int col, const char *s, unsigned char attr) {
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
-    int idx = (row * 80 + col) * 2;
+    int idx = (row * cols() + col) * 2;
     while (*s) {
         vga[idx] = *s++;
         vga[idx + 1] = attr;
@@ -432,7 +443,7 @@ static void draw_str(int row, int col, const char *s, unsigned char attr) {
 
 static void draw_str_n(int row, int col, const char *s, int n, unsigned char attr) {
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
-    int idx = (row * 80 + col) * 2;
+    int idx = (row * cols() + col) * 2;
     for (int i = 0; i < n; i++) {
         unsigned char c = (unsigned char)s[i];
         if (c < 32 || c == 127) c = '.';
@@ -444,8 +455,8 @@ static void draw_str_n(int row, int col, const char *s, int n, unsigned char att
 
 static void fill_row(int row, unsigned char attr) {
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
-    int idx = row * 80 * 2;
-    for (int c = 0; c < 80; c++) {
+    int idx = row * cols() * 2;
+    for (int c = 0; c < cols(); c++) {
         vga[idx] = ' ';
         vga[idx + 1] = attr;
         idx += 2;

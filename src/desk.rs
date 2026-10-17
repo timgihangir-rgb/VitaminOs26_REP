@@ -98,7 +98,7 @@ pub fn wait_while_inactive() {
 }
 
 fn new_desk(shell: usize, cwd: String) -> Desk {
-    let mut screen = alloc::vec![0u8; vga::SCREEN_BYTES].into_boxed_slice();
+    let mut screen = alloc::vec![0u8; vga::screen_bytes()].into_boxed_slice();
     vga::screen_blank(&mut screen);
     Desk {
         screen,

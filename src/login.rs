@@ -50,6 +50,7 @@ pub fn login(writer: &mut Writer) -> Outcome {
         writer.set_color(COLOR_WHITE);
         write_prompt(writer, "VitaminOS26 login");
         writer.write_string("  login: ");
+        writer.sync();
         let name = read_line(writer, true);
 
         if name.is_empty() {
@@ -61,6 +62,7 @@ pub fn login(writer: &mut Writer) -> Outcome {
             writer.set_color(COLOR_LIGHT_RED);
             writer.write_string("root may not log in on the console; use sudo\n");
             writer.set_color(COLOR_WHITE);
+            writer.sync();
             continue;
         }
 
@@ -81,6 +83,7 @@ pub fn login(writer: &mut Writer) -> Outcome {
                     writer.set_color(COLOR_LIGHT_RED);
                     writer.write_string("account record is broken\n");
                     writer.set_color(COLOR_WHITE);
+                    writer.sync();
                     continue;
                 }
             };
@@ -90,6 +93,7 @@ pub fn login(writer: &mut Writer) -> Outcome {
             writer.write_string(&account.name);
             writer.write_string(".\n\n");
             writer.set_color(COLOR_WHITE);
+            writer.sync();
             return Outcome::LoggedIn(account);
         }
 
@@ -102,12 +106,13 @@ pub fn login(writer: &mut Writer) -> Outcome {
             writer.write_string("Too many attempts\n");
             writer.set_color(COLOR_WHITE);
         }
+        writer.sync();
     }
     Outcome::Failed
 }
 
 fn write_prompt(writer: &mut Writer, text: &str) {
-    let pad = crate::vga::SCREEN_WIDTH.saturating_sub(text.len()) / 2;
+    let pad = crate::vga::screen_cols().saturating_sub(text.len()) / 2;
     for _ in 0..pad {
         writer.write_string(" ");
     }

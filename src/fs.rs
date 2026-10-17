@@ -33,9 +33,10 @@ pub fn list_files(writer: &mut Writer, vfs: &Vfs, path: &str) {
 pub fn read_file(writer: &mut Writer, vfs: &Vfs, filename: &str) {
     match vfs.cat(filename) {
         Some(data) => {
-            for byte in data {
-                writer.write_byte(byte);
-            }
+            // Не побайтово: файл может быть в UTF-8, и русская буква -
+            // два байта. `write_raw_text` разбирает UTF-8, а невалидные
+            // байты (то есть легаси-CP1251) выводит как кодовую страницу.
+            writer.write_raw_text(&data);
         }
         None => {
             writer.write_string("File not found: ");

@@ -5,12 +5,13 @@
 // backspace'ом и не печатать пароль.
 //
 // Ввод идёт по одному символу через keyboard::read_key, поэтому работает и
-// с PS/2, и с USB-клавиатуры одинаково.
+// с PS/2, и с USB-клавиатуры одинаково. Символ приходит Unicode'ом (в
+// ЙЦУКЕН это кириллица), в строку складывается UTF-8, в ячейку экрана
+// уходит байт кодовой страницы через `vga::code_page`.
 
 use alloc::string::String;
-use alloc::vec::Vec;
 
-use crate::vga::Writer;
+use crate::vga::{self, Writer};
 
 /// Больше символов не набираем: всё, что длиннее, - опечатка, а не пароль.
 pub const LINE_MAX: usize = 64;
@@ -29,7 +30,7 @@ pub fn read_line_cancelable(writer: &mut Writer, echo: bool) -> Option<String> {
 }
 
 fn read_line_inner(writer: &mut Writer, echo: bool) -> Option<String> {
-    let mut out: Vec<u8> = Vec::with_capacity(LINE_MAX);
+    let mut out = String::new();
     loop {
         match crate::keyboard::read_key() {
             crate::keyboard::Key::Enter => {
@@ -51,30 +52,40 @@ fn read_line_inner(writer: &mut Writer, echo: bool) -> Option<String> {
                 continue;
             }
             // 0x08 = Backspace: убираем символ и затираем его на экране.
-            crate::keyboard::Key::Char(0x08) => {
+            crate::keyboard::Key::Char('\u{8}') => {
                 if out.pop().is_some() && echo {
                     writer.write_string("\x08 \x08");
                 }
             }
             crate::keyboard::Key::Char(c) => {
-                if out.len() < LINE_MAX && is_usable(c) {
+                // Предел считаем в символах: кириллица в UTF-8 - два байта,
+                // и байтовый счётчик обрезал бы строку вдвое раньше.
+                if out.chars().count() < LINE_MAX && is_usable(c) {
                     out.push(c);
                     if echo {
-                        writer.write_byte(c);
+                        writer.write_char(c);
                     }
                 }
             }
             _ => {}
         }
+        // Эхо ввода показываем сразу: это отклик на клавишу, а не вывод
+        // команды. `read_line` вызывается из local-ветки ядра и установщика,
+        // там же экран не перерисовывает больше никто.
+        writer.sync();
     }
-    Some(String::from_utf8_lossy(&out).into_owned())
+    Some(out)
 }
 
-/// Печатный ASCII без управляющих символов и пробела: имена и пароли набираются
-/// латиницей (кириллица в них не предусмотрена), пробел - завершающий символ
-/// строки и путать его с содержимым нельзя.
-fn is_usable(c: u8) -> bool {
-    (0x21..0x7f).contains(&c)
+/// Печатный символ без управляющих и пробела: пробел завершает строку и
+/// путать его с содержимым нельзя.
+///
+/// Кириллицу пропускаем - но не потому, что она «неправильная», а потому,
+/// что эта строка идёт в имя пользователя и пароль, а `valid_user_name`
+/// допускает только латиницу. Набирать можно всё, что напечатается; отказ
+// придёт позже и с внятным сообщением.
+fn is_usable(c: char) -> bool {
+    (0x21..0x7f).contains(&(c as u32)) || vga::code_page(c) >= 0xA0
 }
 
 /// Допустимое имя пользователя: латинская буква, дальше буквы, цифры, дефис

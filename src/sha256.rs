@@ -68,35 +68,77 @@ fn compress(h: &mut [u32; 8], block: &[u8; BLOCK]) {
     h[7] = h[7].wrapping_add(hh);
 }
 
+/// Состояние потокового SHA-256 (то же, что hashlib.sha256).
+///
+///`hash` выше годится на один вызов, а PBKDF2-HMAC строит тысячи
+/// хешей подряд на одной и той же ключевой подушке. Держать поток
+/// в структуре = без новых Vec на каждом раунде.
+pub struct Sha256State {
+    h: [u32; 8],
+    buf: [u8; BLOCK],
+    buf_len: usize,
+    total_len: u64,
+}
+
+impl Sha256State {
+    pub fn new() -> Self {
+        Sha256State { h: H0, buf: [0; BLOCK], buf_len: 0, total_len: 0 }
+    }
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let need = BLOCK - self.buf_len;
+            let take = need.min(data.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
+            self.buf_len += take;
+            data = &data[take..];
+            if self.buf_len == BLOCK {
+                let b = core::mem::replace(&mut self.buf, [0u8; BLOCK]);
+                compress(&mut self.h, &b);
+                self.buf_len = 0;
+            }
+        }
+        while data.len() >= BLOCK {
+            let mut b = [0u8; BLOCK];
+            b.copy_from_slice(&data[..BLOCK]);
+            compress(&mut self.h, &b);
+            data = &data[BLOCK..];
+        }
+        if !data.is_empty() {
+            self.buf[..data.len()].copy_from_slice(data);
+            self.buf_len = data.len();
+        }
+    }
+
+    pub fn finalize(mut self) -> [u8; DIGEST] {
+        let bits = self.total_len.wrapping_mul(8);
+        self.buf[self.buf_len] = 0x80;
+        self.buf_len += 1;
+        if self.buf_len > BLOCK - 8 {
+            for i in self.buf_len..BLOCK { self.buf[i] = 0; }
+            let b = core::mem::replace(&mut self.buf, [0u8; BLOCK]);
+            compress(&mut self.h, &b);
+            self.buf_len = 0;
+        }
+        for i in self.buf_len..BLOCK - 8 { self.buf[i] = 0; }
+        self.buf[BLOCK - 8..].copy_from_slice(&bits.to_be_bytes());
+        let b = core::mem::replace(&mut self.buf, [0u8; BLOCK]);
+        compress(&mut self.h, &b);
+
+        let mut out = [0u8; DIGEST];
+        for i in 0..8 {
+            out[i * 4..i * 4 + 4].copy_from_slice(&self.h[i].to_be_bytes());
+        }
+        out
+    }
+}
+
 /// Хеш строки. Возвращает 32 байта.
 pub fn hash(data: &[u8]) -> [u8; DIGEST] {
-    let mut h = H0;
-    let mut i = 0;
-    while i + BLOCK <= data.len() {
-        let mut b = [0u8; BLOCK];
-        b.copy_from_slice(&data[i..i + BLOCK]);
-        compress(&mut h, &b);
-        i += BLOCK;
-    }
-    let rem = data.len() - i;
-    let mut tail = [0u8; BLOCK * 2];
-    tail[..rem].copy_from_slice(&data[i..]);
-    tail[rem] = 0x80;
-    let bits = (data.len() as u64).wrapping_mul(8);
-    let tail_len = if rem + 1 + 8 <= BLOCK { BLOCK } else { BLOCK * 2 };
-    tail[tail_len - 8..tail_len].copy_from_slice(&bits.to_be_bytes());
-    let mut b = [0u8; BLOCK];
-    b.copy_from_slice(&tail[..BLOCK]);
-    compress(&mut h, &b);
-    if tail_len == BLOCK * 2 {
-        b.copy_from_slice(&tail[BLOCK..BLOCK * 2]);
-        compress(&mut h, &b);
-    }
-    let mut out = [0u8; DIGEST];
-    for i in 0..8 {
-        out[i * 4..i * 4 + 4].copy_from_slice(&h[i].to_be_bytes());
-    }
-    out
+    let mut st = Sha256State::new();
+    st.update(data);
+    st.finalize()
 }
 
 pub fn hex(d: &[u8]) -> alloc::string::String {

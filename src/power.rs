@@ -59,6 +59,9 @@ fn under_hypervisor() -> bool {
 /// Выключение питания.
 pub fn shutdown(writer: &mut Writer) -> ! {
     writer.write_string("Shutting down...\n");
+    // Дальше машина может остановиться мгновенно, поэтому сообщение должно
+    // оказаться на экране до выключения, а не после.
+    writer.sync();
     crate::vga::serial_write_atomic("[P] shutdown requested\n");
     settle();
     freeze();
@@ -87,6 +90,7 @@ pub fn shutdown(writer: &mut Writer) -> ! {
     // 4. Ничего не сработало. Прерывания уже выключены, так что hlt больше
     //    не разбудит процессор и система гарантированно замирает.
     writer.write_string("shutdown: no power-off path available, CPU halted\n");
+    writer.sync();
     crate::vga::serial_write_atomic("[P] halted\n");
     halt();
 }
@@ -94,6 +98,7 @@ pub fn shutdown(writer: &mut Writer) -> ! {
 /// Перезагрузка.
 pub fn reboot(writer: &mut Writer) -> ! {
     writer.write_string("Rebooting...\n");
+    writer.sync();
     crate::vga::serial_write_atomic("[P] reboot requested\n");
     settle();
     freeze();
@@ -121,6 +126,7 @@ pub fn reboot(writer: &mut Writer) -> ! {
     }
 
     writer.write_string("reboot: no reset path available, CPU halted\n");
+    writer.sync();
     crate::vga::serial_write_atomic("[P] reboot halted\n");
     halt();
 }

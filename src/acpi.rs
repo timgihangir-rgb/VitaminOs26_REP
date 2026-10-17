@@ -387,6 +387,17 @@ pub fn reset() -> bool {
     true
 }
 
+/// Короткая метка состояния ACPI для sysinfo/fetch: что именно нашлось и
+/// доступно ли выключение питания. `describe()` даёт длинную строку для
+/// splash, здесь нужен вариант, который влезает в поле SysInfo.
+pub fn status() -> &'static str {
+    match fadt() {
+        Some(f) if f.pm1a_block != 0 => "FADT+PM1a",
+        Some(_) => "FADT",
+        None => "none",
+    }
+}
+
 /// Диагностика для splash: короткая строка о том, что нашлось.
 pub fn describe() -> &'static str {
     match fadt() {

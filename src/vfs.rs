@@ -517,6 +517,58 @@ impl Vfs {
         })
     }
 
+    /// Читает диапазон байт из файла: работает с любым размером файла,
+    /// потому что не строит Vec на весь файл (только нужные блоки).
+    pub fn read_range(&self, path: &str, offset: u64, buf: &mut [u8]) -> Result<usize, ()> {
+        clear_denied();
+        let sb = vitafs::mounted_sb().ok_or(())?;
+        let (ino, name) = self.resolve_named(path).ok_or(())?;
+        let node = vitafs::iget(sb, ino).ok_or(())?;
+        if !check(&node, crate::user::current_uid(), P_R) {
+            return Err(());
+        }
+        match node.itype {
+            vitafs::TYPE_FILE => vitafs::file_read_range(sb, ino, offset, buf).ok_or(()),
+            vitafs::TYPE_CHARDEV => {
+                let data = crate::devices::dev_read(&name).ok_or(())?;
+                let n = core::cmp::min(buf.len(), data.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                Ok(n)
+            }
+            _ => Err(()),
+        }
+    }
+
+    /// Диапазонная запись: работает с файлом любого размера, без того,
+    /// чтобы читать/переписывать его целиком.
+    pub fn write_range(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<usize, ()> {
+        clear_denied();
+        let mut result = Ok(0usize);
+        wal_txn(|| {
+            let sb = vitafs::mounted_sb().ok_or(())?;
+            let (ino, name) = self.resolve_named(path).ok_or(())?;
+            let node = vitafs::iget(sb, ino).ok_or(())?;
+            if !check(&node, crate::user::current_uid(), P_W) {
+                return Err(());
+            }
+            match node.itype {
+                vitafs::TYPE_FILE => {
+                    result = vitafs::file_write_range(sb, ino, offset, data).ok_or(());
+                    Ok(())
+                }
+                vitafs::TYPE_CHARDEV => {
+                    if !crate::devices::dev_write(&name, data) {
+                        return Err(());
+                    }
+                    result = Ok(data.len());
+                    Ok(())
+                }
+                _ => Err(()),
+            }
+        })?;
+        result
+    }
+
     pub fn cat(&self, path: &str) -> Option<Vec<u8>> {
         clear_denied();
         let sb = vitafs::mounted_sb()?;
@@ -578,12 +630,24 @@ impl Vfs {
     pub fn append(&mut self, path: &str, data: &[u8]) -> Result<(), ()> {
         clear_denied();
         wal_txn(|| {
-            let mut existing = self.cat(path).unwrap_or_default();
-            if permission_denied() && self.resolve(path).is_some() {
+            let sb = vitafs::mounted_sb().ok_or(())?;
+            let (parent, name) = self.split_parent(path).ok_or(())?;
+            if !check_dir_writable(sb, parent, crate::user::current_uid()) {
                 return Err(());
             }
-            existing.extend_from_slice(data);
-            self.write_file(path, &existing)
+            let ino = match vitafs::dir_lookup(sb, parent, &name) {
+                Some(existing) => existing,
+                None => vitafs::create_node(sb, parent, &name, vitafs::TYPE_FILE)
+                    .ok_or(())?,
+            };
+            let node = vitafs::iget(sb, ino).ok_or(())?;
+            if !check(&node, crate::user::current_uid(), P_W) {
+                return Err(());
+            }
+            // Пишем в конец, без чтения всего файла.
+            let at = node.size as u64;
+            vitafs::file_write_range(sb, ino, at, data).ok_or(())?;
+            Ok(())
         })
     }
 

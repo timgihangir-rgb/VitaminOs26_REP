@@ -100,10 +100,29 @@ def vga_addr(serial_log):
     return m.group(1) if m else "0xb8000"
 
 
+def grid(serial_log=SERIAL1):
+    """Размер текстовой сетки в ячейках.
+
+    Сетку больше не 80x30 на все случаи: композитор выбирает её под
+    разрешение монитора (см. `fit_grid` в src/fb.rs), и на 1280x800 это
+    80x25 в масштабе 2x - буквы вдвое крупнее и занимают весь кадр. Ядро
+    печатает итог в serial строкой "[N] fb WxH scale=N grid=CxR", по ней и
+    читаем, сколько колонок и строк разбирать из дампа экрана. Нет такой
+    строки - композитор не включился, система в текстовом режиме, и сетка
+    историческая.
+    """
+    try:
+        log = open(serial_log, errors="replace").read()
+    except OSError:
+        return 80, 30
+    m = re.search(r"grid=(\d+)x(\d+)", log)
+    return (int(m.group(1)), int(m.group(2))) if m else (80, 30)
+
+
 def dump_vga(s, serial_log=SERIAL1):
     s.send((json.dumps({
         "execute": "human-monitor-command",
-        "arguments": {"command-line": f'pmemsave {vga_addr(serial_log)} 9600 "{VGA_DUMP}"'},
+        "arguments": {"command-line": f'pmemsave {vga_addr(serial_log)} 65536 "{VGA_DUMP}"'},
     }) + "\n").encode())
     time.sleep(0.35)
     try:
@@ -118,10 +137,11 @@ def screen_text():
     except FileNotFoundError:
         return ""
     rows = []
-    for row in range(30):
+    cols, rows_ = grid()
+    for row in range(rows_):
         chars = []
-        for col in range(80):
-            ch = data[row * 160 + col * 2]
+        for col in range(cols):
+            ch = data[row * cols * 2 + col * 2]
             chars.append(chr(ch) if 32 <= ch < 127 else " ")
         rows.append("".join(chars))
     return "\n".join(rows)
@@ -132,7 +152,11 @@ def wait_for_prompt(s, attempts=40, serial_log=SERIAL1):
     дальше обычный опрос промпта."""
     for i in range(attempts):
         time.sleep(1)
-        dump_vga(s, SERIAL2)
+        # Именно serial_log, а не константа: адрес тени 0xB8000 печатается в
+        # лог ТЕКУЩЕГО boot. С SERIAL2 на boot1pmemsave читал настоящую
+        # видеопамять вместо тени, экран был пустым, и проверка промпта
+        # падала (а за ней и все проверки файлов).
+        dump_vga(s, serial_log)
         t = screen_text()
         # Меню GRUB и загрузочный экран ядра оба содержат "press Enter",
         # поэтому жмём Enter, пока строка не исчезнет.
@@ -205,7 +229,9 @@ def run_and_check(cmd, needle, msg):
     time.sleep(0.4)
     type_line(s2, cmd)
     time.sleep(1.0)
-    dump_vga(s2)
+    # Тень boot2 живёт в SERIAL2; дефолт SERIAL1 указывал на адрес тени
+    # прошлой загрузки (см. комментарий в wait_for_prompt).
+    dump_vga(s2, SERIAL2)
     check(needle in screen_text(), msg)
 
 run_and_check("cat /home/crash/a.txt", "VitaminOS26", "a.txt цел после краша")
@@ -223,7 +249,7 @@ for name in visible[:5]:
     time.sleep(0.3)
     type_line(s2, f"cat /home/crash/{name}")
     time.sleep(1.0)
-    dump_vga(s2)
+    dump_vga(s2, SERIAL2)
     checked += 1
     if "VitaminOS26" not in screen_text():
         bad += 1

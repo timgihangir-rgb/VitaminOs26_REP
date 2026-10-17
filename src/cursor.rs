@@ -14,7 +14,7 @@ const CRTC_DATA: u16 = 0x3D5;
 pub const UNDERLINE: (u8, u8) = (13, 15);
 
 pub fn set_position(row: usize, col: usize) {
-    let pos = ((row as u16) * crate::vga::SCREEN_WIDTH as u16 + col as u16) as u16;
+    let pos = ((row as u16) * crate::vga::screen_cols() as u16 + col as u16) as u16;
     set_raw(pos);
 }
 

@@ -38,30 +38,42 @@ fn identity_flags() -> PageTableFlags {
     PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::HUGE_PAGE
 }
 
-// Тень текстового экрана VGA: два 4 КиБ кадра, отображаемые на VA 0xB8000.
-// Экран 80x30x2 = 4800 байт, то есть страницы 0xB8000 и 0xB9000. Нужна потому,
-// что в графическом (VBE) режиме физический 0xB8000 — видеопамять, которая
-// текст не хранит: всё, что пишется в 0xB8000, должно попадать в RAM, а
-// композитор fb рисует из неё в линейный фреймбуфер.
-static mut VGA_SHADOW: Option<(u64, u64)> = None;
+// Тень текстового экрана VGA: RAM-кадры, отображаемые на VA 0xB8000 и дальше.
+// Нужна потому, что в графическом (VBE) режиме физический 0xB8000 —
+// видеопамять, которая текст не хранит: всё, что пишется в 0xB8000, должно
+// попадать в RAM, а композитор fb рисует из неё в линейный фреймбуфер.
+//
+// Сколько именно страниц отображать, решает вызывающий: `fb::init` к этому
+// моменту уже знает сетку. Раньше тут стояло жёстко `(u64, u64)` — две
+// страницы, которых хватало ровно на исторический экран 80x30 (4800 байт).
+// Сетка по монитору бывает и 160x45 (12800 байт) — это уже восемь страниц,
+// а писать за пределы тени нельзя: ring 3-программа поверх текста заделала
+// бы чужие данные.
+static mut VGA_SHADOW: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
 
-pub fn vga_shadow() -> Option<(u64, u64)> {
-    unsafe { VGA_SHADOW }
+/// Физические адреса страниц тени по 4 КиБ, начиная с отображённой на
+/// 0xB8000. Пустой срез — тени нет, система работает в текстовом режиме.
+pub fn vga_shadow() -> &'static [u64] {
+    unsafe { &*core::ptr::addr_of!(VGA_SHADOW) }
 }
 
 /// Разбивает huge-страницу ядра 0..2 МиБ на 4 КиБ записи и подменяет текстовый
-/// экран 0xB8000/0xB9000 на свежие RAM-кадры. Возвращает их физические адреса.
-/// Вызывать один раз, до создания адресных пространств задач.
-pub unsafe fn install_vga_shadow() -> Option<(u64, u64)> {
+/// экран на `pages` свежих RAM-кадров, отображаемых подряд с 0xB8000.
+/// Возвращает их физические адреса. Вызывать один раз, до создания адресных
+/// пространств задач: страницы тени копируются в каждое из них.
+pub unsafe fn install_vga_shadow(pages: usize) -> Option<&'static [u64]> {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        if let Some(s) = VGA_SHADOW {
-            return Some(s);
+        if !VGA_SHADOW.is_empty() {
+            return Some(vga_shadow());
         }
+        let pages = pages.max(1);
         let alloc = &mut FRAME_ALLOC;
-        let f0 = alloc.allocate_frame()?;
-        let f1 = alloc.allocate_frame()?;
-        zero_frame(f0);
-        zero_frame(f1);
+        let mut frames = alloc::vec::Vec::with_capacity(pages);
+        for _ in 0..pages {
+            let f = alloc.allocate_frame()?;
+            zero_frame(f);
+            frames.push(f.start_address().as_u64());
+        }
 
         let root = active_level_4_table();
         let pdp0 = root[0].frame().ok()?;
@@ -82,14 +94,14 @@ pub unsafe fn install_vga_shadow() -> Option<(u64, u64)> {
         }
         let pt_frame = pd0_t[0].frame().ok()?;
         let pt = table_of(pt_frame);
-        let s0 = f0.start_address().as_u64();
-        let s1 = f1.start_address().as_u64();
-        pt[0xB8].set_addr(PhysAddr::new(s0), shadow_leaf_flags());
-        pt[0xB9].set_addr(PhysAddr::new(s1), shadow_leaf_flags());
-        VGA_SHADOW = Some((s0, s1));
-        x86_64::instructions::tlb::flush(VirtAddr::new(0xB8000));
-        x86_64::instructions::tlb::flush(VirtAddr::new(0xB9000));
-        Some((s0, s1))
+        for (i, phys) in frames.iter().enumerate() {
+            pt[0xB8 + i].set_addr(PhysAddr::new(*phys), shadow_leaf_flags());
+        }
+        VGA_SHADOW = frames;
+        for i in 0..pages {
+            x86_64::instructions::tlb::flush(VirtAddr::new(0xB8000 + (i * 0x1000) as u64));
+        }
+        Some(vga_shadow())
     })
 }
 
@@ -173,10 +185,11 @@ pub fn create_address_space() -> Option<AddressSpace> {
         // из ring 3 запрещена. Иначе любая сбойная user-программа (crashy!)
         // затирает ядро нулями и указателями - случайная порча статики.
         // Низ 0..2 МиБ: если активна тень экрана, это обычная 4 КиБ таблица
-        // (identity, но 0xB8000/0xB9000 смотрят в RAM-тень), иначе — одна
+        // (identity, но страницы тени смотрят в RAM), иначе — одна
         // huge-страница. 4 КиБ вариант нужен, чтобы ring3-программы,
         // жёстко зашитые на 0xB8000, писали в ту же тень, что и ядро.
-        if let Some((s0, s1)) = vga_shadow() {
+        let shadow = vga_shadow();
+        if !shadow.is_empty() {
             let pt_frame = alloc.allocate_frame()?;
             let pt = table_of(pt_frame);
             pt.zero();
@@ -189,14 +202,12 @@ pub fn create_address_space() -> Option<AddressSpace> {
                         | PageTableFlags::USER_ACCESSIBLE,
                 );
             }
-            pt[0xB8].set_addr(
-                PhysAddr::new(s0),
-                shadow_leaf_flags() | PageTableFlags::USER_ACCESSIBLE,
-            );
-            pt[0xB9].set_addr(
-                PhysAddr::new(s1),
-                shadow_leaf_flags() | PageTableFlags::USER_ACCESSIBLE,
-            );
+            for (i, phys) in shadow.iter().enumerate() {
+                pt[0xB8 + i].set_addr(
+                    PhysAddr::new(*phys),
+                    shadow_leaf_flags() | PageTableFlags::USER_ACCESSIBLE,
+                );
+            }
             pd0[0].set_frame(pt_frame, table_flags() | PageTableFlags::USER_ACCESSIBLE);
         } else {
             pd0[0].set_addr(PhysAddr::new(0x0), identity_flags() | PageTableFlags::USER_ACCESSIBLE);
@@ -236,9 +247,9 @@ pub fn destroy_address_space(space: &mut AddressSpace) {
                     if e.flags().contains(PageTableFlags::HUGE_PAGE) {
                         continue; // shared identity mapping, not owned
                     }
-                    if i == 0 && vga_shadow().is_some() {
-                        // Низ 0..2 МиБ с тенью экрана: записи — identity и два
-                        // общих кадра тени, они не принадлежат пространству.
+                    if i == 0 && !vga_shadow().is_empty() {
+                        // Низ 0..2 МиБ с тенью экрана: записи — identity и
+                        // общие кадры тени, они не принадлежат пространству.
                         // Освобождаем только саму таблицу страниц.
                         if let Ok(pt) = e.frame() {
                             alloc.deallocate_frame(pt);
@@ -297,7 +308,7 @@ pub fn copy_address_space(src: &AddressSpace) -> Option<AddressSpace> {
                 dst_pd_t[pd_idx].set_addr(s_pd_e.addr(), s_pd_e.flags());
                 continue;
             }
-            if pd_idx == 0 && vga_shadow().is_some() {
+            if pd_idx == 0 && !vga_shadow().is_empty() {
                 // Тень экрана общая: копируем записи по ссылке в таблицу,
                 // которую уже выделил create_address_space.
                 let src_pt = s_pd_e.frame().ok()?;

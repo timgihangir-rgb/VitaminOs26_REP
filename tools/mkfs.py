@@ -53,6 +53,96 @@ TYPE_DIR = 2
 # задач под вытеснением (см. bigtodo, блокер zero-ctx). Вернуть после фикса.
 RC_CONF = "# VitaminOS26 init services\nticker builtin respawn\n"
 
+# Конфиг fetch: какие строки сводки показывать и в каком порядке.
+# Одна строка = один ключ; порядок строк = порядок вывода. Строки с '=' —
+# параметры рисунка и цвета. Полный список ключей: `fetch --list`.
+#
+# Держим в одном списке с DEFAULT_KEYS в programs/fetch/main.rs: если там
+# добавится новый пункт, дефолтный вывод без конфига не изменится, а с этим
+# файлом — да, и это будет заметно в тестах.
+FETCH_CONF = """\
+# /etc/fetch.conf - что показывает команда `fetch`.
+#
+# Строка без '=' добавляет пункт в вывод (порядок строк = порядок вывода).
+# Строка с '=' задаёт параметр: art, color.
+#
+# art   = capsule | pill | vcircle | none
+# color = on | off
+
+os
+kernel
+host
+cpu
+cores
+memory
+disk
+fs
+net
+display
+input
+tasks
+uptime
+shell
+
+art = pill
+color = on
+"""
+
+# Конфиг web: lynx-подобного браузера. Формат `ключ = значение`,
+# `#` и `;` — комментарии. Полный список: `web --help`.
+#
+# Почти всё здесь необязательно: без файла web работает как раньше, с
+# заводскими значениями. В частности, start_url пуст — тогда `web` без
+# аргументов печатает справку, а не лезет в сеть сам.
+WEB_CONF = """\
+# /etc/web.conf - настройки мини-браузера `web`.
+#
+#   web                      открыть start_url (пусто = показать справку)
+#   web [-c PATH] host [port [path]] | url
+#
+# Аргументы командной строки перекрывают файл.
+
+; Сеть -----------------------------------------------------------------
+# Что открывать без аргументов. Пусто = показывать справку.
+start_url =
+# Заголовки запроса. accept_encoding пуст не по недосмотру: распаковки
+# gzip в браузере нет, а объявить кодировку = получить битый текст.
+user_agent = VitaminOS-web/1.0
+accept = text/html
+accept_encoding =
+# Порт, если в адресе схемы нет. Полезно для своего сервера на 8080:
+# достаточно набрать `web 10.0.2.2` вместо `web 10.0.2.2 8080 /`.
+default_port = 80
+# Таймауты в тиках PIT (100 Гц): connect / send / recv.
+timeout_connect = 800
+timeout_send = 800
+timeout_recv = 4000
+# Предел загрузки в байтах; 0 = сколько влезет в буфер (96 КБ).
+max_download = 0
+max_redirects = 5
+
+# Экран ----------------------------------------------------------------
+# Ширина текста, 40..74. Меньше — уже, но 74 это потолок.
+width = 74
+# Подписи [N] у ссылок и строка состояния внизу (Ln/ Lnk / URL).
+link_numbers = on
+status_bar = on
+show_url = on
+# Печатать строку статуса и заголовки ответа перед текстом страницы.
+show_headers = off
+# off = монохром (весь интерфейс серым).
+color = on
+
+# Поведение ------------------------------------------------------------
+# Глубина кнопки «назад», 0..12. history = 0 — без истории.
+history = 12
+
+# Клавиши --------------------------------------------------------------
+key_quit = q
+key_back = h
+key_goto = g
+"""
+
 now = 0
 
 
@@ -199,6 +289,10 @@ def build_image(img_path, programs, size=IMG_SIZE, kernel=None, installer=False,
     if installer:
         ino_marker = nxt
         nxt += 1
+    ino_fetchconf = nxt
+    nxt += 1
+    ino_webconf = nxt
+    nxt += 1
 
     bin_entries = []
     for k, (name, path) in enumerate(programs):
@@ -210,15 +304,16 @@ def build_image(img_path, programs, size=IMG_SIZE, kernel=None, installer=False,
                                                  ino=ino_elf_first + k)))
 
     # Учётные записи: /etc/passwd и /etc/shadow плюс домашний каталог с
-    # владельцем. Формат ровно тот, что читает user.rs: sha256(salt+пароль).
+    # владельцем. Формат совпадает с user.rs: pbkdf2-sha256(salt, пароль, N).
     passwd_lines, shadow_lines, home_entries = [], [], []
     fsb.next_inode = nxt
     for i, (uname, upass) in enumerate(users or []):
         uid = FIRST_UID + i
         salt = os.urandom(16).hex()
-        digest = hashlib.sha256((salt + upass).encode()).hexdigest()
+        iters = 100_000
+        digest = hashlib.pbkdf2_hmac("sha256", upass.encode(), salt.encode(), iters).hexdigest()
         passwd_lines.append(f"{uname}:{uid}:/home/{uname}\n")
-        shadow_lines.append(f"{uname}:{salt}:{digest}\n")
+        shadow_lines.append(f"{uname}:pbkdf2-sha256:{iters}:{salt}:{digest}\n")
         home_entries.append((uname, fsb.alloc_inode(TYPE_DIR, 0, uid=uid)))
 
     fsb.write_file("passwd", "".join(passwd_lines).encode(), ino=ino_passwd)
@@ -230,6 +325,10 @@ def build_image(img_path, programs, size=IMG_SIZE, kernel=None, installer=False,
 
     etc_entries = [("passwd", ino_passwd), ("shadow", ino_shadow),
                    ("hostname", ino_hostname), ("rc.conf", ino_rcconf)]
+    fsb.write_file("fetch.conf", FETCH_CONF.encode(), ino=ino_fetchconf)
+    etc_entries.append(("fetch.conf", ino_fetchconf))
+    fsb.write_file("web.conf", WEB_CONF.encode(), ino=ino_webconf)
+    etc_entries.append(("web.conf", ino_webconf))
     if installer:
         fsb.write_file("installer", b"1\n", ino=ino_marker)
         etc_entries.append(("installer", ino_marker))

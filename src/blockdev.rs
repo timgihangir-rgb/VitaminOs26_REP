@@ -41,6 +41,9 @@ const ATA_CMD_IDENTIFY: u8 = 0xEC;
 /// None - ещё не снята. Сбрасывается при смене устройства.
 static mut CAPACITY_BLOCKS: Option<u32> = None;
 
+/// Модель активного диска (IDENTIFY), кэш для sysinfo/fetch.
+static mut ACTIVE_MODEL: Option<alloc::string::String> = None;
+
 /// Идентификатор блочного устройства. AHCI - номер порта контроллера,
 /// ATA PIO - 0 (primary master) или 1 (primary slave).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -288,6 +291,28 @@ pub fn active_name() -> alloc::string::String {
     device_name(active())
 }
 
+/// Модель активного диска из IDENTIFY, кэшируется после первого запроса.
+/// Нужен sysinfo/fetch: без него ring 3 не знает, что за диск под системой.
+/// Для ATA PIO первый вызов делает реальный IDENTIFY (PIO, единицы мс), дальше
+/// отдаётся кэш — иначе каждая ring3-программа платила бы за запрос к диску.
+pub fn active_model() -> alloc::string::String {
+    unsafe {
+        if let Some(ref m) = ACTIVE_MODEL {
+            return m.clone();
+        }
+        let m = match (BACKEND, ACTIVE) {
+            (Backend::Ahci, _) => crate::ahci::model(),
+            (Backend::AtaPio, DeviceId::AtaPio(drive)) => match ata_identify(drive) {
+                Some((_sectors, model, _serial)) => model,
+                None => alloc::string::String::new(),
+            },
+            _ => alloc::string::String::new(),
+        };
+        ACTIVE_MODEL = Some(m.clone());
+        m
+    }
+}
+
 /// Переключает активное устройство. false - такого диска нет. Сбрасывает
 /// кэш ёмкости и смещение ФС: вызывающий обязан сам сбросить bcache/inode-кэш.
 pub fn select(id: DeviceId) -> bool {
@@ -307,6 +332,7 @@ pub fn select(id: DeviceId) -> bool {
         }
         ACTIVE = id;
         CAPACITY_BLOCKS = None;
+        ACTIVE_MODEL = None;
         BLOCK_OFFSET = 0;
         true
     }

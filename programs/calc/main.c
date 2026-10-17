@@ -9,6 +9,8 @@
  * Вывод — прямо в VGA с позиции vga_offset (как clock), курсор в EXIT_ROW.
  */
 
+#include "../common/vgasize.h"
+
 #define EXIT_ROW_P  0x708C
 #define EXIT_COL_P  0x7090
 
@@ -87,20 +89,25 @@ static num_t factor(void) {
 static void print_result(unsigned int vga_offset, const char *msg, int n) {
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
     int off = (int)vga_offset;
-    for (int i = 0; i < n && off + 2 * i < 4800; i++) {
+    /* Граница экрана - по сетке: исторические 4800 байт это ровно 80x30,
+     * на 120x33 результат помещался бы, а на 80x25 - залезал за экран. */
+    int screen_end = (int)(g_screen_w * g_screen_h) * 2;
+    for (int i = 0; i < n && off + 2 * i < screen_end; i++) {
         vga[off + 2 * i] = (unsigned char)msg[i];
         vga[off + 2 * i + 1] = 0x0F;
     }
-    int start_row = (int)(vga_offset / 160);
-    int start_col = (int)((vga_offset % 160) / 2);
+    int start_row = (int)(vga_offset / (g_screen_w * 2));
+    int start_col = (int)((vga_offset % (g_screen_w * 2)) / 2);
     int end_col = start_col + n;
-    if (end_col > 79)
-        end_col = 79;
+    if (end_col > (int)g_screen_w - 1)
+        end_col = (int)g_screen_w - 1;
     *(volatile int *)EXIT_ROW_P = start_row;
     *(volatile int *)EXIT_COL_P = end_col;
 }
 
 void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
+    vga_read_grid();
+
     char text[256];
     int n = 0;
     for (unsigned long i = 1; i < argc; i++) {

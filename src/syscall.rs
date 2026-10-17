@@ -77,6 +77,14 @@ pub const SYS_USERDEL: usize = 18;
 pub const SYS_EXEC: usize = 19;
 /// wait(pid) -> 0. Блокируется до завершения задачи pid.
 pub const SYS_WAIT: usize = 20;
+/// ioperm(port, count, enable) → 0/-1.
+///
+/// Разрешает (или запрещает) доступ к I/O-портам из ring 3. Только root.
+/// Траплен в программе выходит через SYS_IOPERM (программа вызывает его
+/// номер 33 напрямую, либо через ABI-трамплин в progabi - пока не добавлен,
+/// al вынужден сочинять вызов `int 80h` + rax=33).
+pub const SYS_IOPERM: usize = 33;
+pub const SYS_NET_STATE: usize = 34;
 
 global_asm!(
     ".global int80_entry",
@@ -420,7 +428,7 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) -> usize {
         SYS_IOCTL => {
             let cmd = unsafe { *regs.add(10) };
             let arg = unsafe { *regs.add(11) };
-            use crate::vga::{SCREEN_HEIGHT, SCREEN_WIDTH};
+            use crate::vga::{screen_cols, screen_rows};
             let r = match cmd {
                 1 => {
                     let (row, col) = crate::vga::hw_cursor_pos();
@@ -435,7 +443,7 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) -> usize {
                     w.clear_screen();
                     0
                 }
-                4 => ((SCREEN_HEIGHT << 16) | SCREEN_WIDTH) as i64,
+                4 => ((screen_rows() << 16) | screen_cols()) as i64,
                 5 => {
                     if crate::keyboard::echo_get() {
                         1
@@ -482,32 +490,43 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) -> usize {
                 0
             }
         }
+        SYS_NET_STATE => {
+            let sid = unsafe { *regs.add(10) } as usize;
+            match crate::net::tcp_state(sid) {
+                Ok(state) => set_result(regs, state as i64 as u64),
+                Err(()) => set_result(regs, -1i64 as u64),
+            }
+            0
+        }
         SYS_NET_SEND => {
-            let buf = unsafe { *regs.add(10) };
-            let len = (unsafe { *regs.add(11) }).min(1400) as usize;
+            let sid = unsafe { *regs.add(10) } as usize;
+            let buf = unsafe { *regs.add(11) };
+            let len = (unsafe { *regs.add(12) }).min(1400) as usize;
             if !user_ptr_ok(buf) {
                 set_result(regs, -1i64 as u64);
             } else {
                 let data = unsafe { core::slice::from_raw_parts(buf as *const u8, len) };
-                let r = crate::net::tcp_send(data);
+                let r = crate::net::tcp_send(sid, data);
                 set_result(regs, r as u64);
             }
             0
         }
         SYS_NET_RECV => {
-            let buf = unsafe { *regs.add(10) };
-            let max = (unsafe { *regs.add(11) }).min(16384) as usize;
+            let sid = unsafe { *regs.add(10) } as usize;
+            let buf = unsafe { *regs.add(11) };
+            let max = (unsafe { *regs.add(12) }).min(16384) as usize;
             if !user_ptr_ok(buf) {
                 set_result(regs, -1i64 as u64);
             } else {
                 let out = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, max) };
-                let r = crate::net::tcp_recv(out);
+                let r = crate::net::tcp_recv(sid, out);
                 set_result(regs, r as u64);
             }
             0
         }
         SYS_NET_CLOSE => {
-            let r = crate::net::tcp_close();
+            let sid = unsafe { *regs.add(10) } as usize;
+            let r = crate::net::tcp_close(sid);
             set_result(regs, r as u64);
             0
         }
@@ -598,6 +617,26 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) -> usize {
             set_result(regs, 0);
             // Ждали внутри вызова: задача уходит в Blocked, asm переключится.
             1
+        }
+        SYS_IOPERM => {
+            let r = if crate::user::current_uid() != crate::user::ROOT_UID {
+                -1i64 as u64
+            } else {
+                let port = unsafe { *regs.add(10) } as u16;
+                let count = unsafe { *regs.add(11) } as u16;
+                let enable = unsafe { *regs.add(12) } != 0;
+                let end = (port as u32).saturating_add(count as u32);
+                if end > 65536 {
+                    -1i64 as u64
+                } else {
+                    unsafe {
+                        crate::interrupts::io_bitmap_set(port as u32, end, enable);
+                    }
+                    0
+                }
+            };
+            set_result(regs, r);
+            0
         }
         SYS_EXIT => {
             crate::scheduler::exit_current();

@@ -11,6 +11,8 @@ static int next_food(int *fx, int *fy, const int *sx, const int *sy, int len,
                      int rows, int cols);
 static unsigned int rand_state;
 
+#include "../common/vgasize.h"
+
 #define STEP_MS 180
 
 void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
@@ -18,14 +20,24 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
     (void)argv;
     rand_state = vga_offset + 12345;
 
+    vga_read_grid();
     clear_screen();
 
-    /* Малое поле в левой части экрана 80x30: стены на строках 0/21 и
-     * колонках 0/61, игровая область - строки 1..20 x колонки 1..60.
-     * Свободное место справа (колонки 63..79) отведено под счёт очков,
-     * внизу (строки 22..29) - сообщение об окончании игры. */
-    int rows = 20;
-    int cols = 60;
+    /* Игровое поле занимает левую часть экрана, а справа и снизу остаётся
+     * место под счёт очков и сообщение об окончании игры. Размер поля
+     * считается от СЕТКИ, а не от исторических 80x30: на 1280x800 сетка
+     * становится 80x25, и поле 20x60 с сообщением внизу уже не поместилось
+     * бы - игра уезжала бы за нижнюю границу.
+     *
+     * Ширина поля ограничена колонкой счёта (63), высота - так, чтобы под
+     * полем остались минимум 3 строки под сообщение. */
+    int score_col = 63;
+    int cols = (score_col - 3) - 1;
+    if (cols > 60) cols = 60;
+    if (cols < 10) cols = 10;
+    int rows = (int)g_screen_h - 7;
+    if (rows > 20) rows = 20;
+    if (rows < 6) rows = 6;
     int top = 1;
     int left = 1;
     int bottom = top + rows - 1;
@@ -147,8 +159,13 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
         }
     }
 
+    /* Нижние строки экрана: чем ниже сетка, тем ниже они. Раньше было
+     * жёстко 23, и на сетке 80x25 (1280x800) это была предпоследняя
+     * строка - «вроде помещается», но поле уезжало на последнюю. */
+    int msg_row = (int)g_screen_h - 2;
+
     if (game_over)
-        draw_str(23, 0, "Game Over!", 0x0C);
+        draw_str(msg_row, 0, "Game Over!", 0x0C);
 
     char score_str[30];
     int si = 0;
@@ -160,9 +177,9 @@ void _start(unsigned long argc, char **argv, unsigned int vga_offset) {
     while (ri > 0) score_str[si++] = rev[--ri];
     score_str[si] = '\0';
 
-    draw_str(23, 12, "Score: ", 0x0F);
-    draw_str(23, 19, score_str, 0x0F);
-    draw_str(23, 26, "Press Q to quit", 0x07);
+    draw_str(msg_row, 12, "Score: ", 0x0F);
+    draw_str(msg_row, 19, score_str, 0x0F);
+    draw_str(msg_row, 26, "Press Q to quit", 0x07);
 
     while (1) {
         if (kb_hit() && kb_read() == 0x10) break;
@@ -195,20 +212,21 @@ static unsigned int pit_now(void) {
 
 static void clear_screen(void) {
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
-    for (int i = 0; i < 80 * 30 * 2; i++)
+    int cells = (int)(g_screen_w * g_screen_h);
+    for (int i = 0; i < cells * 2; i++)
         vga[i] = (i & 1) ? 0x0F : ' ';
 }
 
 static void draw_char(int row, int col, unsigned char ch, unsigned char attr) {
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
-    int idx = (row * 80 + col) * 2;
+    int idx = (row * (int)g_screen_w + col) * 2;
     vga[idx] = ch;
     vga[idx + 1] = attr;
 }
 
 static void draw_str(int row, int col, const char *s, unsigned char attr) {
     volatile unsigned char *vga = (volatile unsigned char *)0xB8000;
-    int idx = (row * 80 + col) * 2;
+    int idx = (row * (int)g_screen_w + col) * 2;
     while (*s) {
         vga[idx] = *s++;
         vga[idx + 1] = attr;

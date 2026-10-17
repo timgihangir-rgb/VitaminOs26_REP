@@ -26,6 +26,33 @@ pub struct SysInfo {
     // смещения прежних полей (fetch читает только старые).
     pub used_kb: u32,
     pub proc_count: u32,
+
+    // ─── Драйверы и устройства ────────────────────────────────────────────
+    // Добавлены 2026-10-05 вместе с переработкой fetch. Прежний fetch знал
+    // только про CPU и память, хотя к этому моменту в ядре были сетевой
+    // драйвер (rtl8139), USB-HID, AHCI/ATA, ACPI, RTC и композитор
+    // линейного кадрового буфера. Порядок полей менять нельзя: адрес блока
+    // 0x5000 общий для всех программ, и каждая ring3-программа (meminfo,
+    // fetch) держит свою копию раскладки.
+    pub fs_type: [u8; 16],
+    pub net_driver: [u8; 16],
+    pub net_mac: [u8; 6],
+    pub net_ip: [u8; 4],
+    pub net_up: u8,
+    pub disk_dev: [u8; 12],
+    pub disk_model: [u8; 48],
+    pub disk_blocks: u32,
+    pub block_backend: [u8; 12],
+    pub fb_width: u32,
+    pub fb_height: u32,
+    pub fb_bpp: u8,
+    pub fb_scale: u8,
+    pub fb_on: u8,
+    pub usb_kbd: u8,
+    pub usb_reports: u32,
+    pub input_ps2: u8,
+    pub acpi: [u8; 16],
+    pub rtc_unix: u32,
 }
 
 fn str_to_fixed<const N: usize>(s: &str) -> [u8; N] {
@@ -36,6 +63,53 @@ fn str_to_fixed<const N: usize>(s: &str) -> [u8; N] {
     buf
 }
 
+/// Модель диска из IDENTIFY часто содержит непечатные байты и двойные
+/// пробелы (спецификация ATA требует именно так их хранить). Для вывода
+/// приводим к читаемому виду, иначе в поле SysInfo попадёт мусор.
+fn clean_model(s: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::new();
+    let mut space = false;
+    for &b in s.as_bytes() {
+        if (0x20..0x7F).contains(&b) {
+            if space && !out.is_empty() {
+                out.push(' ');
+            }
+            out.push(b as char);
+            space = false;
+        } else {
+            space = true;
+        }
+    }
+    out
+}
+
+/// Дисплей для sysinfo: с линейным кадровым буфером разрешение и терминал
+/// разные вещи (на 1280x800 сетка текста становится 80x25 в масштабе 2x),
+/// поэтому строка собирается из обоих, а не из Constants VGA. Обе строки
+/// должны влезать в 16 байт поля SysInfo вместе с NUL.
+fn display_strings(fb_w: u32, fb_h: u32, fb_bpp: u8, fb_scale: u8) -> ([u8; 16], [u8; 16]) {
+    if fb_w == 0 {
+        return (
+            str_to_fixed(&alloc::format!(
+                "{}x{} VGA",
+                crate::vga::screen_cols(),
+                crate::vga::screen_rows()
+            )),
+            str_to_fixed("VGA text mode"),
+        );
+    }
+    let scale = if fb_scale < 1 { 1 } else { fb_scale };
+    (
+        str_to_fixed(&alloc::format!("{}x{} {}bpp", fb_w, fb_h, fb_bpp)),
+        str_to_fixed(&alloc::format!(
+            "text {}x{} @{}x",
+            crate::vga::screen_cols(),
+            crate::vga::screen_rows(),
+            scale
+        )),
+    )
+}
+
 impl SysInfo {
     pub fn fill(cpu: &CpuInfo, mem: MemInfo) -> Self {
         let mut flags = 0u8;
@@ -43,6 +117,19 @@ impl SysInfo {
         if cpu.has_sse2 { flags |= 1 << 1; }
         if cpu.has_avx { flags |= 1 << 2; }
         if cpu.has_rdrand { flags |= 1 << 3; }
+
+        // Состояние драйверов на момент запуска программы. Всё это — простые
+        // чтения глобалов и кэшей; единственное исключение — модель диска
+        // (blockdev кэширует её после первого IDENTIFY) и кадровый буфер.
+        let (fb_w, fb_h, fb_bpp, fb_scale, fb_on) = crate::fb::info();
+        let (resolution, terminal) = display_strings(fb_w, fb_h, fb_bpp, fb_scale);
+        let net_mac = crate::net::mac();
+        let net_up = crate::net::ready();
+        let disk_name = crate::blockdev::active_name();
+        let disk_model = clean_model(&crate::blockdev::active_model());
+        let usb_kbd = crate::usb::owns_keyboard();
+        let acpi = crate::acpi::status();
+        let disk_blocks = crate::blockdev::capacity_blocks().unwrap_or(0);
 
         SysInfo {
             total_kb: (mem.total_usable / 1024) as u32,
@@ -60,12 +147,38 @@ impl SysInfo {
             shell_name: str_to_fixed("VitaminShell"),
             shell_version: str_to_fixed("0.1.0"),
             bootloader_version: str_to_fixed("GRUB"),
-            resolution: str_to_fixed("80x30 VGA"),
-            terminal: str_to_fixed("VGA text mode"),
+            resolution,
+            terminal,
             used_kb: (crate::memory::ALLOCATED_FRAMES.load(
                 core::sync::atomic::Ordering::SeqCst,
             ) * 4) as u32, // 1 фрейм = 4 КиБ -> КБ
             proc_count: crate::scheduler::task_count() as u32,
+
+            fs_type: str_to_fixed("VITAFS+WAL"),
+            net_driver: str_to_fixed(if net_up { "rtl8139" } else { "none" }),
+            net_mac: {
+                let mut m = [0u8; 6];
+                if let Some(src) = net_mac {
+                    m.copy_from_slice(&src);
+                }
+                m
+            },
+            net_ip: crate::net::OWN_IP,
+            net_up: net_up as u8,
+            disk_dev: str_to_fixed(&disk_name),
+            disk_model: str_to_fixed(&disk_model),
+            disk_blocks,
+            block_backend: str_to_fixed(crate::blockdev::backend_name()),
+            fb_width: fb_w,
+            fb_height: fb_h,
+            fb_bpp: fb_bpp,
+            fb_scale: fb_scale,
+            fb_on: fb_on as u8,
+            usb_kbd: usb_kbd as u8,
+            usb_reports: crate::usb::reports() as u32,
+            input_ps2: (!usb_kbd) as u8,
+            acpi: str_to_fixed(acpi),
+            rtc_unix: crate::rtc::now_unix() as u32,
         }
     }
 
