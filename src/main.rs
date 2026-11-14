@@ -18,6 +18,7 @@ mod elf;
 mod exec;
 mod fb;
 mod fs;
+mod halt;
 mod init;
 mod install;
 mod interrupts;
@@ -210,7 +211,7 @@ pub extern "C" fn kernel_main(_magic: u64, mb_info_ptr: u64) -> ! {
 
 fn halt_loop() -> ! {
     loop {
-        x86_64::instructions::hlt();
+        crate::halt::hlt();
     }
 }
 

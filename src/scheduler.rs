@@ -223,6 +223,17 @@ global_asm!(
     "out 0x20, al",
     "mov rax, [rip + CURRENT_SAVE_SLOT]",
     "mov [rax], rsp",
+    // Выравниваем стек перед вызовом Rust-функции: по SysV на входе в
+    // schedule должен быть rsp ≡ 8 (mod 16). CPU при прерывании в том же
+    // кольце стек не выравнивает (в отличие от перехода ring3->ring0, где он
+    // выравнивает сам), так что после 15 пушей выравнивание произвольное.
+    // При opt-level >= 1 компилятор раскладывает локалы по movaps, и без
+    // этого schedule падает на первом же кадре.
+    //
+    // Двигать rsp можно свободно: сохранён он выше, а ниже он всё равно
+    // подставляется из rax по возврату schedule.
+    "sub rsp, 8",
+    "and rsp, -16",
     "call schedule",
     "mov rsp, rax",
     "pop r15",
@@ -339,7 +350,7 @@ pub fn wait_for(pid: usize) {
         let target = TICKS.load(Ordering::SeqCst) + 1;
         block_until_tick(target);
         while TICKS.load(Ordering::SeqCst) < target {
-            x86_64::instructions::hlt();
+            crate::halt::hlt();
         }
     }
 }
@@ -381,7 +392,7 @@ fn vfs_lock_yield() -> VfsLockGuard<'static> {
         }
         // hlt до следующего тика: планировщик ротируется, держатель лока
         // завершает критическую секцию. ВЫЗЫВАТЬ ТОЛЬКО С IF=1.
-        x86_64::instructions::hlt();
+        crate::halt::hlt();
     }
 }
 
@@ -445,7 +456,17 @@ fn spawn_inner(name: &str, entry: Box<dyn FnOnce()>, suspended: bool) -> Option<
     {
         let base = stack.as_mut_ptr() as usize;
         let top = base + STACK_SIZE;
-        let saved_rsp = top - CONTEXT_SIZE;
+        // Входной rsp задачи обязан быть ≡ 8 (mod 16): task_start - обычная
+        // extern "C" функция, а значит получает стек ровно таким, каким его
+        // оставил бы `call` (8 mod 16 после возврата адреса). Раньше здесь
+        // писался просто `top`, а он кратен 16 - задача стартовала со стеком,
+        // смещённым на 8 байт от того, о котором компилятор думает. При
+        // opt-level = 0 это не проявлялось, при opt-level >= 1 компилятор
+        // начинает класть локалы через movaps/movdqa, и они падают на
+        // невыровненном стеке: задача (первой была композитор) уходит в
+        // мусорный адрес, система виснет. Подробности - в docs/abi.md.
+        let entry_rsp = ((top & !0xF) - 8) as usize;
+        let saved_rsp = entry_rsp - CONTEXT_SIZE;
         let p = saved_rsp as *mut u64;
         // Регистры (порядок pop в asm): r15..rax, rdi на позиции 10.
         for k in 0..15 {
@@ -456,7 +477,7 @@ fn spawn_inner(name: &str, entry: Box<dyn FnOnce()>, suspended: bool) -> Option<
             p.add(15).write(task_start as usize as u64); // rip
             p.add(16).write(KERNEL_CS as u64);        // cs
             p.add(17).write(0x202u64);                // rflags: IF=1
-            p.add(18).write(top as u64);              // rsp
+            p.add(18).write(entry_rsp as u64);        // rsp
             p.add(19).write(KERNEL_DS as u64);        // ss
         }
         debug_assert!(saved_rsp >= base);
@@ -468,7 +489,8 @@ fn spawn_inner(name: &str, entry: Box<dyn FnOnce()>, suspended: bool) -> Option<
         state: TaskState::Ready,
         ticks: 0,
         last_tick: TICKS.load(Ordering::SeqCst),
-        saved_rsp: (stack.as_ptr() as usize + STACK_SIZE) - CONTEXT_SIZE,
+        // Тот же кадр, что собран выше: entry_rsp - CONTEXT_SIZE.
+        saved_rsp: ((stack.as_ptr() as usize + STACK_SIZE) & !0xF) - 8 - CONTEXT_SIZE,
         kernel_stack_top,
         cr3: 0,
         space: None,
@@ -535,7 +557,10 @@ fn spawn_user_inner(
     {
         let base = stack.as_mut_ptr() as usize;
         let top = base + STACK_SIZE;
-        let saved_rsp = top - CONTEXT_SIZE;
+        // Тот же кадр, что и в Task::saved_rsp ниже: смещение на 8 байт
+        // обязано совпадать, иначе планировщик восстановит контекст не с
+        // того адреса, куда его записали (rip читается как 0 -> ZERO-WRITER).
+        let saved_rsp = ((top & !0xF) - 8) - CONTEXT_SIZE;
         let p = saved_rsp as *mut u64;
         for k in 0..15 {
             unsafe { p.add(k).write(0); }
@@ -567,7 +592,8 @@ fn spawn_user_inner(
         state: TaskState::Ready,
         ticks: 0,
         last_tick: TICKS.load(Ordering::SeqCst),
-        saved_rsp: (stack.as_ptr() as usize + STACK_SIZE) - CONTEXT_SIZE,
+        // Кадр собран выше: ((top & !0xF) - 8) - CONTEXT_SIZE.
+        saved_rsp: ((stack.as_ptr() as usize + STACK_SIZE) & !0xF) - 8 - CONTEXT_SIZE,
         kernel_stack_top,
         cr3: root,
         space: Some(space),
@@ -721,7 +747,7 @@ pub fn wait_for_polled(pid: usize, poll: fn(usize) -> bool) -> bool {
         let target = TICKS.load(Ordering::SeqCst) + 1;
         block_until_tick(target);
         while TICKS.load(Ordering::SeqCst) < target {
-            x86_64::instructions::hlt();
+            crate::halt::hlt();
         }
     }
     interrupted
@@ -799,7 +825,7 @@ pub fn block_until_tick(target: u64) {
 pub fn sleep_until(target: u64) {
     while crate::scheduler::ticks() < target {
         block_until_tick(target);
-        x86_64::instructions::hlt();
+        crate::halt::hlt();
     }
 }
 
@@ -949,7 +975,7 @@ extern "C" fn schedule() -> usize {
                     }
                     crate::vga::serial_write_atomic("[sched] ALL slots dead, hlt-loop\n");
                     loop {
-                        x86_64::instructions::hlt()
+                        crate::halt::hlt()
                     }
                 }
             }
@@ -1008,10 +1034,10 @@ extern "C" fn schedule() -> usize {
 
         CURRENT.store(next, Ordering::SeqCst);
         let t = TASKS[next].as_mut().unwrap();
-        // ДЕТЕКТОР zero-writer: у готовой задачи rip-слот контекста обязан
-        // быть ненулевым, а яд 0xBE сразу ПОД контекстом - не тронутым.
-        // Нули там = чужая запись. Печатаем адрес жертвы и встаём на int3:
-        // под gdb это останов с полным контекстом, без gdb - видный сбой.
+        // ДЕТЕКТОР zero-writer: у готовой задачи rip-слот контекста обязан быть
+        // ненулевым. Ноль там = контекст затёрт чужой записью. Печатаем адрес
+        // жертвы и встаём на int3: под gdb это останов с полным контекстом,
+        // без gdb - видный сбой вместо тихого ухода в мусорный адрес.
         {
             // Границы проверяем через checked_sub/checked_add: условие
             // rsp >= base позволяло прочитать 8 байт ПЕРЕД выделением
@@ -1019,13 +1045,15 @@ extern "C" fn schedule() -> usize {
             // проверку на битом saved_rsp - детектор, который должен спасать
             // от падения, сам мог его вызвать.
             //
-            // Само значение poison оставлено как есть (== 0) НАМЕРЕННО: ядро
-            // 0xBE имеет смысл только у СВЕЖЕГО, сконструированного spawn_inner
-            // контекста. После первого же тика таймер перезаписывает контекст
-            // по ЖИВОМУ rsp задачи, и восемь байт под ним - обычная локальная
-            // переменная, а не 0xBE. Проверка poison != 0xBEBEBEBEBEBEBEBE
-            // срабатывала на ticker при первой же переключении и роняла
-            // систему через int3 -> #DB -> halt_loop.
+            // Проверяется ТОЛЬКО rip-слот (rsp + 120), лежащий внутри
+            // выделенного стека. Раньше здесь читался ещё и байт ПОД
+            // контекстом (rsp - 8) и требовался ненулевым - но это красная
+            // зона стека: по ABI там лежит временный хлам функции
+            // (красная зона не охраняется и не сохраняется при прерывании),
+            // там законно стоит ноль. При opt-level = 0 компилятор туда
+            // попадал случайными байтами и детектор молчал; при opt-level >= 1
+            // слот оказался нулевым, и ДЕТЕКТОР САМ ронял систему через
+            // int3 -> #DB -> halt_loop на первой же переключении.
             let base = t.stack.as_ptr() as usize;
             let len = t.stack.len();
             let rsp = t.saved_rsp;
@@ -1036,17 +1064,12 @@ extern "C" fn schedule() -> usize {
             if in_range {
                 unsafe {
                     let rip = *((rsp + 120) as *const u64);
-                    let poison = *((rsp - 8) as *const u64);
-                    if rip == 0 || poison == 0 {
+                    if rip == 0 {
                         crate::vga::serial_write_atomic("[ZERO-WRITER] pid=");
                         crate::vga::serial_u64(next as u64);
                         crate::vga::serial_write_atomic(" rsp=");
                         crate::vga::serial_u64(rsp as u64);
-                        crate::vga::serial_write_atomic(" rip=");
-                        crate::vga::serial_u64(rip);
-                        crate::vga::serial_write_atomic(" poison=");
-                        crate::vga::serial_u64(poison);
-                        crate::vga::serial_write_atomic("\n");
+                        crate::vga::serial_write_atomic(" rip=0\n");
                         core::arch::asm!("int3", options(nomem));
                     }
                 }
@@ -1108,6 +1131,6 @@ extern "C" fn task_start(ptr: usize) {
         }
     });
     loop {
-        x86_64::instructions::hlt();
+        crate::halt::hlt();
     }
 }

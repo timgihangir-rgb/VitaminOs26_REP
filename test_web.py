@@ -9,6 +9,10 @@ import os
 import shutil
 import socket
 import re
+
+# Промпт шелла "[3] tim@/home/tim$". Префикс "vitamin_os26" из промпта
+# удалён, поэтому ждём приглашение по этой форме.
+PROMPT_RE = re.compile(r"\[\d+\]\s+[\w.-]+@[\w./-]*\$")
 import subprocess
 import sys
 import time
@@ -207,7 +211,7 @@ def main():
             if "press Enter" in t:
                 sendkey(s, "ret")
                 continue
-            if "vitamin_os26" in t:
+            if PROMPT_RE.search(t):
                 booted = True
                 print(f"  shell ready at t={i+1}s")
                 break

@@ -398,14 +398,14 @@ pub extern "C" fn syscall_dispatch(regs: *mut u64) -> usize {
             // hlt() (IF=1) подстраховывает случай, когда других Ready-задач нет
             // и планировщик вернул бы нас сразу же (задачи не должны жечь CPU).
             crate::scheduler::block_until_tick(crate::scheduler::ticks() + 1);
-            x86_64::instructions::hlt();
+            crate::halt::hlt();
             set_result(regs, 0);
             1
         }
         SYS_SLEEP => {
             let target = unsafe { *regs.add(10) };
             crate::scheduler::block_until_tick(target);
-            x86_64::instructions::hlt();
+            crate::halt::hlt();
             set_result(regs, 0);
             1
         }

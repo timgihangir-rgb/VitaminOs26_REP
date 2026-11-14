@@ -82,7 +82,7 @@ pub fn wait_enter(writer: &mut Writer) {
                 break;
             }
         }
-        x86_64::instructions::hlt();
+        crate::halt::hlt();
     }
 }
 

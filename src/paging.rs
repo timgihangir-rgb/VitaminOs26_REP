@@ -566,7 +566,12 @@ pub fn setup_user_stack(
     let top = USER_STACK_TOP;
     let strings_top = top - 8 - 8 * (n as u64 + 2);
     let strings_bottom = strings_top - strings_size as u64;
-    let entry_rsp = strings_bottom - STACK_ARGS_GAP;
+    // Входной rsp user-программы обязан быть ≡ 8 (mod 16): `_start` - обычная
+    // функция, и компилятор ждёт ровно такое выравнивание (после возврата
+    // адреса из `call`). Без этого при opt-level >= 1 программы падают на
+    // movaps по своему же первому же локалу. Округляем вниз до кратного 16 и
+    // возвращаем младший бит: зазор STACK_ARGS_GAP это переживает с запасом.
+    let entry_rsp = ((strings_bottom - STACK_ARGS_GAP) & !0xF) | 8;
 
     let mut buf = vec![0u8; (top - 8 - strings_bottom) as usize];
     let mut off = 0usize;

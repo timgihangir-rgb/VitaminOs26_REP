@@ -311,7 +311,11 @@ def build_image(img_path, programs, size=IMG_SIZE, kernel=None, installer=False,
         uid = FIRST_UID + i
         salt = os.urandom(16).hex()
         iters = 100_000
-        digest = hashlib.pbkdf2_hmac("sha256", upass.encode(), salt.encode(), iters).hexdigest()
+        # pbkdf2_hmac возвращает bytes; .hexdigest() есть только у объекта
+        # hashlib, а не у результата, - образ падал при зашивке учётных записей.
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", upass.encode(), salt.encode(), iters
+        ).hex()
         passwd_lines.append(f"{uname}:{uid}:/home/{uname}\n")
         shadow_lines.append(f"{uname}:pbkdf2-sha256:{iters}:{salt}:{digest}\n")
         home_entries.append((uname, fsb.alloc_inode(TYPE_DIR, 0, uid=uid)))

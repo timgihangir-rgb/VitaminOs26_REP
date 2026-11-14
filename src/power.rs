@@ -166,6 +166,6 @@ fn keyboard_controller_reset() {
 /// Окончательная остановка: прерывания выключены, hlt не будит процессор.
 fn halt() -> ! {
     loop {
-        x86_64::instructions::hlt();
+        crate::halt::hlt();
     }
 }

@@ -8,6 +8,10 @@ Verifies via the VGA framebuffer (pmemsave) that:
   4. Ctrl+Q -> n quits back to the shell.
 """
 import re
+
+# Промпт шелла "[3] tim@/home/tim$". Префикс "vitamin_os26" из промпта
+# удалён, поэтому ждём приглашение по этой форме.
+PROMPT_RE = re.compile(r"\[\d+\]\s+[\w.-]+@[\w./-]*\$")
 import subprocess
 import time
 import os
@@ -185,7 +189,7 @@ try:
         # Загрузочный экран держится до Enter: без нажатия приглашения не будет.
         if any("press Enter" in ln for ln in lines):
             qmp_sendkey(s, "ret")
-        if any("vitamin_os26" in ln for ln in lines):
+        if any(PROMPT_RE.search(ln) for ln in lines):
             print(f"  t={i+1}s: shell prompt found")
             shell_ready = True
             break
@@ -283,7 +287,7 @@ try:
             if not qemu_alive(qemu):
                 return False
             dump_vga(s, VGA_DUMP1)
-            if any("vitamin_os26" in ln for ln in vga_text(VGA_DUMP1)):
+            if any(PROMPT_RE.search(ln) for ln in vga_text(VGA_DUMP1)):
                 return True
         return False
 
@@ -357,7 +361,7 @@ try:
     check("aaa" in text and "bbb" in text and "ccc" in text,
           "file content aaa/bbb/ccc intact after navigation")
 
-    check(any("vitamin_os26" in ln for ln in lines), "shell prompt visible again after vita exited")
+    check(any(PROMPT_RE.search(ln) for ln in lines), "shell prompt visible again after vita exited")
 
     s.close()
 except Exception as e:

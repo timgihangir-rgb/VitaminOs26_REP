@@ -272,7 +272,7 @@ pub fn init() {
 
 pub fn halt_loop() -> ! {
     loop {
-        x86_64::instructions::hlt();
+        crate::halt::hlt();
     }
 }
 

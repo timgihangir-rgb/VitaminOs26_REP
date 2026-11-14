@@ -10,6 +10,10 @@
 import json
 import os
 import re
+
+# Промпт шелла "[3] tim@/home/tim$". Префикс "vitamin_os26" из промпта
+# удалён, поэтому ждём приглашение по этой форме.
+PROMPT_RE = re.compile(r"\[\d+\]\s+[\w.-]+@[\w./-]*\$")
 import random
 import shutil
 import socket
@@ -162,7 +166,7 @@ def wait_for_prompt(s, attempts=40, serial_log=SERIAL1):
         # поэтому жмём Enter, пока строка не исчезнет.
         if "press Enter" in t:
             fast_sendkey(s, "ret")
-        if "vitamin_os26" in t:
+        if PROMPT_RE.search(t):
             print(f"  t={i + 1}s: shell ready")
             return True
     return False

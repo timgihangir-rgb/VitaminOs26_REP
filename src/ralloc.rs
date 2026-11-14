@@ -66,7 +66,7 @@ fn fail(msg: &str, ptr: usize, size: usize) -> ! {
     crate::vga::serial_u64(size as u64);
     crate::vga::serial_write_atomic("\n");
     loop {
-        x86_64::instructions::hlt();
+        crate::halt::hlt();
     }
 }
 

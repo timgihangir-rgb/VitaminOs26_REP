@@ -17,6 +17,11 @@ import subprocess
 import sys
 import time
 
+# Промпт шелла вида "[3] tim@/home/tim$": номер стола (рабочего стола),
+# имя пользователя, текущий каталог и знак доллара. Префикс "vitamin_os26"
+# из промпта удалён, поэтому ждём промпт по этой форме, а не по нему.
+PROMPT_RE = re.compile(r"\[\d+\]\s+[\w.-]+@[\w./-]*\$")
+
 QMP_PORT = 4447
 VGA_DUMP = "/tmp/users_vga.bin"
 SERIAL_LOG = "/tmp/users_serial.log"
@@ -207,7 +212,7 @@ def wait_for_login(s):
             continue
         if "login:" in scr:
             return True
-        if "vitamin_os26:" in scr:
+        if PROMPT_RE.search(scr):
             return False
     return False
 
@@ -327,6 +332,11 @@ def main():
         send_text(s, "carolpass\n")
         time.sleep(2.5)
         scr = screen(s)
+        if "user carol created" not in scr:
+            print("--- экран после sudo adduser ---")
+            print("\n".join(ln for ln in scr.splitlines() if ln.strip())[:800])
+            print("--- serial хвост ---")
+            print("\n".join(serial().splitlines()[-10:]))
         check("user carol created" in scr, "sudo adduser создал запись")
         type_line(s, "cat /etc/passwd")
         scr = screen(s)
@@ -405,7 +415,7 @@ def main():
               "три раза показано 'Login incorrect'")
         check("Too many attempts" in scr, "после трёх попыток вход закрыт")
         check("System halted" in scr, "система остановлена")
-        check("vitamin_os26:" not in scr, "шелл не запущен")
+        check(not PROMPT_RE.search(scr), "шелл не запущен")
         check(serial().count("auth FAILED") == 3,
               "в serial три неудачные проверки пароля")
     finally:

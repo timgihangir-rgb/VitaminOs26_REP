@@ -18,6 +18,10 @@ comes from the grid the compositor picked (see `grid`).
 import json
 import os
 import re
+
+# Промпт шелла "[3] tim@/home/tim$". Префикс "vitamin_os26" из промпта
+# удалён, поэтому ждём приглашение по этой форме.
+PROMPT_RE = re.compile(r"\[\d+\]\s+[\w.-]+@[\w./-]*\$")
 import shutil
 import socket
 import subprocess
@@ -357,7 +361,7 @@ try:
             raw_type_line(s, "root")
             ready = True
             break
-        if "vitamin_os26" in screen_ascii():
+        if PROMPT_RE.search(screen_ascii()):
             ready = True
             break
     check(ready, "system reached a prompt")

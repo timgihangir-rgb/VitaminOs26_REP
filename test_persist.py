@@ -5,6 +5,10 @@ Keyboard has no shift support, so '_' and '>' are avoided. File content is
 taken from /etc/hostname ("VitaminOS26") via cp.
 """
 import re
+
+# Промпт шелла "[3] tim@/home/tim$". Префикс "vitamin_os26" из промпта
+# удалён, поэтому ждём приглашение по этой форме.
+PROMPT_RE = re.compile(r"\[\d+\]\s+[\w.-]+@[\w./-]*\$")
 import subprocess
 import time
 import os
@@ -192,7 +196,7 @@ def wait_for_prompt(s, attempts=20):
         if "press Enter" in t:
             print(f"  t={i + 1}s: splash, pressing Enter")
             fast_sendkey(s, "ret")
-        if "vitamin_os26" in t:
+        if PROMPT_RE.search(t):
             print(f"  t={i + 1}s: shell ready")
             return True
     return False

@@ -256,7 +256,7 @@ fn holdlock() {
     crate::vga::serial_u64(crate::scheduler::current_pid() as u64);
     crate::vga::serial_write_atomic(" acquired VFS_LOCK forever\n");
     loop {
-        x86_64::instructions::hlt();
+        crate::halt::hlt();
     }
 }
 

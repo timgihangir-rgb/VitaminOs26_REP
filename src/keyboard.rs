@@ -255,7 +255,7 @@ pub fn read_key() -> Key {
         let sc = match x86_64::instructions::interrupts::without_interrupts(pop_scancode) {
             Some(s) => s,
             None => {
-                x86_64::instructions::hlt();
+                crate::halt::hlt();
                 continue;
             }
         };
@@ -708,7 +708,7 @@ pub fn read_line(writer: &mut Writer, history: &mut History) -> String {
         let scancode = match pop_scancode() {
             Some(sc) => sc,
             None => {
-                x86_64::instructions::hlt();
+                crate::halt::hlt();
                 continue;
             }
         };

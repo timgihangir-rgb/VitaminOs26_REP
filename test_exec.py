@@ -7,6 +7,10 @@ Boot 2 (empty disk): proves binaries are NOT embedded in the kernel -
 /bin has no programs and unknown commands fail.
 """
 import re
+
+# Промпт шелла "[3] tim@/home/tim$". Префикс "vitamin_os26" из промпта
+# удалён, поэтому ждём приглашение по этой форме.
+PROMPT_RE = re.compile(r"\[\d+\]\s+[\w.-]+@[\w./-]*\$")
 import subprocess
 import time
 import os
@@ -191,7 +195,7 @@ def wait_for_prompt(s, tag):
         # будет, сколько бы тест ни ждал.
         if "press Enter" in screen_text():
             fast_sendkey(s, "ret")
-        if "vitamin_os26" in screen_text():
+        if PROMPT_RE.search(screen_text()):
             print(f"  t={i+1}s: shell ready ({tag})")
             break
     else:
@@ -324,8 +328,10 @@ try:
     # На пустом диске ФС создаётся заново: mkfs заносит только служебные
     # каталоги, /bin остаётся без программ.
     check("(empty)" in t or "No such" in t, "/bin has no programs on blank disk")
-    # "vitamin_os26" в промпте содержит подстроку "vita" - вырезаем промпт.
-    body = t.replace("vitamin_os26", "")
+    # Промпт содержит имя пользователя "vita" - вырезаем сами строки
+    # промпта, иначе проверка "vita не установлена" врала бы.
+    body = "\n".join(ln for ln in t.splitlines()
+                      if not PROMPT_RE.search(ln))
     for prog in ("clock", "echoargs", "example", "fetch", "help", "snake", "vita"):
         check(prog not in body, f"{prog} not auto-installed")
 
